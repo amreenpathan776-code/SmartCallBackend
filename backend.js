@@ -263,7 +263,7 @@ const query = `
     R.firstname,
     R.loanAccountNumber,
     R.mobileNumber,
-    R.currentOutstandingBalance,
+R.OVERDUEAMT AS overdueAmount,
     R.dpdQueue,
 
     -- ✅ EXTRA: STATUS FLAGS
@@ -610,22 +610,30 @@ app.post("/api/npa/dpd-summary-v2", async (req, res) => {
   }
 });
 // =====================================================================
-// HOME → MEMBERS SUMMARY V3 (Members + NPA + Marketing + Welcome)
+// HOME → MEMBERS SUMMARY V4 (Correct Separation)
+// NPA & Welcome → Recovery Tables
+// Marketing → Leads_Data Table
 // =====================================================================
 app.post("/api/home/members-summary-v3", async (req, res) => {
   const { userId } = req.body;
-  if (!userId) return res.status(400).json({ message: "userId required" });
+
+  if (!userId) {
+    return res.status(400).json({ message: "userId required" });
+  }
 
   try {
     const pool = await poolPromise;
 
-    const result = await pool.request()
+    // =====================================================
+    // 1️⃣ RECOVERY SUMMARY (NPA + WELCOME)
+    // =====================================================
+    const recoveryResult = await pool.request()
       .input("UserId", sql.VarChar(50), String(userId))
       .query(`
         ;WITH Assigned AS (
           SELECT 
             A.LoanAccountNumber,
-            RIGHT('00' + ISNULL(R.dpdQueue,''), 2) AS dpdQueue
+            RIGHT('00' + LTRIM(RTRIM(CAST(R.dpdQueue AS VARCHAR(5)))), 2) AS dpdQueue
           FROM Account_Assignments A
           INNER JOIN Recovery_Raw_Data R
             ON R.loanAccountNumber = A.LoanAccountNumber
@@ -634,26 +642,7 @@ app.post("/api/home/members-summary-v3", async (req, res) => {
         )
 
         SELECT
-          -- ===========================
-          -- MEMBERS (ALL ASSIGNED)
-          -- ===========================
-          SUM(CASE 
-                WHEN ISNULL(CRS.InProcessFlag,0)=0 
-                 AND ISNULL(CRS.CompleteFlag,0)=0 
-              THEN 1 ELSE 0 END) AS members_pending,
-
-          SUM(CASE 
-                WHEN ISNULL(CRS.InProcessFlag,0)=1 
-                 AND ISNULL(CRS.CompleteFlag,0)=0
-              THEN 1 ELSE 0 END) AS members_inprocess,
-
-          SUM(CASE 
-                WHEN ISNULL(CRS.CompleteFlag,0)=1 
-              THEN 1 ELSE 0 END) AS members_completed,
-
-          -- ===========================
-          -- NPA (01 to 07)
-          -- ===========================
+          -- NPA (01–07)
           SUM(CASE 
                 WHEN A.dpdQueue IN ('01','02','03','04','05','06','07')
                  AND ISNULL(CRS.InProcessFlag,0)=0
@@ -671,29 +660,7 @@ app.post("/api/home/members-summary-v3", async (req, res) => {
                  AND ISNULL(CRS.CompleteFlag,0)=1
               THEN 1 ELSE 0 END) AS npa_completed,
 
-          -- ===========================
-          -- MARKETING (00)
-          -- ===========================
-          SUM(CASE 
-                WHEN A.dpdQueue='00'
-                 AND ISNULL(CRS.InProcessFlag,0)=0
-                 AND ISNULL(CRS.CompleteFlag,0)=0
-              THEN 1 ELSE 0 END) AS marketing_pending,
-
-          SUM(CASE 
-                WHEN A.dpdQueue='00'
-                 AND ISNULL(CRS.InProcessFlag,0)=1
-                 AND ISNULL(CRS.CompleteFlag,0)=0
-              THEN 1 ELSE 0 END) AS marketing_inprocess,
-
-          SUM(CASE 
-                WHEN A.dpdQueue='00'
-                 AND ISNULL(CRS.CompleteFlag,0)=1
-              THEN 1 ELSE 0 END) AS marketing_completed,
-
-          -- ===========================
-          -- WELCOME (NULL / Empty dpdQueue)
-          -- ===========================
+          -- WELCOME (NULL/EMPTY)
           SUM(CASE 
                 WHEN (A.dpdQueue IS NULL OR A.dpdQueue = '')
                  AND ISNULL(CRS.InProcessFlag,0)=0
@@ -717,38 +684,69 @@ app.post("/api/home/members-summary-v3", async (req, res) => {
          AND CRS.UserId = @UserId
       `);
 
-    const row = result.recordset[0] || {};
+    const r = recoveryResult.recordset[0] || {};
 
+    // =====================================================
+    // 2️⃣ MARKETING SUMMARY (From Leads_Data)
+    // =====================================================
+    const marketingResult = await pool.request()
+      .input("UserId", sql.VarChar(50), String(userId))
+      .query(`
+        SELECT
+          SUM(CASE WHEN SelectLeadType IS NOT NULL THEN 1 ELSE 0 END) AS marketing_pending
+        FROM Leads_Data
+        WHERE UserID = @UserId
+      `);
+
+    const m = marketingResult.recordset[0] || {};
+
+    // Since Leads don't have InProcess/Completed flags yet,
+    // we treat all as pending for now.
+    const marketingPending = m.marketing_pending || 0;
+
+    // =====================================================
+    // FINAL RESPONSE
+    // =====================================================
     return res.json({
       members: {
-        pending: row.members_pending || 0,
-        inProcess: row.members_inprocess || 0,
-        completed: row.members_completed || 0,
+        pending:
+          (r.npa_pending || 0) +
+          (r.welcome_pending || 0) +
+          marketingPending,
+
+        inProcess:
+          (r.npa_inprocess || 0) +
+          (r.welcome_inprocess || 0),
+
+        completed:
+          (r.npa_completed || 0) +
+          (r.welcome_completed || 0),
       },
+
       npa: {
-        pending: row.npa_pending || 0,
-        inProcess: row.npa_inprocess || 0,
-        completed: row.npa_completed || 0,
+        pending: r.npa_pending || 0,
+        inProcess: r.npa_inprocess || 0,
+        completed: r.npa_completed || 0,
       },
+
       marketing: {
-        pending: row.marketing_pending || 0,
-        inProcess: row.marketing_inprocess || 0,
-        completed: row.marketing_completed || 0,
+        pending: marketingPending,
+        inProcess: 0,
+        completed: 0,
       },
+
       welcome: {
-        pending: row.welcome_pending || 0,
-        inProcess: row.welcome_inprocess || 0,
-        completed: row.welcome_completed || 0,
-      },
+        pending: r.welcome_pending || 0,
+        inProcess: r.welcome_inprocess || 0,
+        completed: r.welcome_completed || 0,
+      }
     });
 
   } catch (err) {
-    console.error("❌ members-summary-v3 error:", err);
+    console.error("❌ members-summary error:", err);
     return res.status(500).json({ message: "Server error" });
   }
 });
-
-
 // =====================================================================
 // UPDATE ACCOUNT STATUS → IN PROCESS (WHEN USER SCHEDULES CALL / VISIT)
 // =====================================================================
@@ -862,11 +860,10 @@ app.post("/api/home/schedule-summary", async (req, res) => {
 
 
 // =====================================================================
-// HOME → SCHEDULE FOR THE DAY → TODAY LIST (CALL/VISIT)
+// HOME → SCHEDULE FOR THE DAY → TODAY + PAST (CALL / VISIT)
 // =====================================================================
 app.post("/api/home/schedule-today-list", async (req, res) => {
-  const { userId, type } = req.body;
-  // type = "CALL" or "VISIT"
+  const { userId, type } = req.body; // type = "CALL" or "VISIT"
 
   if (!userId || !type) {
     return res.status(400).json({ message: "userId and type are required" });
@@ -878,129 +875,106 @@ app.post("/api/home/schedule-today-list", async (req, res) => {
     const query =
       type === "CALL"
         ? `
-          SELECT
-            CRS.LoanAccountNumber,
-            R.firstname,
-            R.mobileNumber,
-            R.currentOutstandingBalance,
-            R.dpdQueue,
+        SELECT
+          CRS.LoanAccountNumber,
+          R.firstname,
+          R.mobileNumber,
+          R.currentOutstandingBalance AS overdueAmount,
+          R.dpdQueue,
 
-            -- ✅ MAIN STATUS FLAGS
-            ISNULL(CRS.PendingFlag,0)   AS PendingFlag,
-            ISNULL(CRS.InProcessFlag,0) AS InProcessFlag,
-            ISNULL(CRS.CompleteFlag,0)  AS CompleteFlag,
+          ISNULL(CRS.ScheduleCallPendingFlag,0)   AS ScheduleCallPendingFlag,
+          ISNULL(CRS.ScheduleCallCompletedFlag,0) AS ScheduleCallCompletedFlag,
 
-            -- ✅ SCHEDULE FLAGS
-            ISNULL(CRS.ScheduleCallPendingFlag,0)   AS ScheduleCallPendingFlag,
-            ISNULL(CRS.ScheduleCallCompletedFlag,0) AS ScheduleCallCompletedFlag,
+          CRS.ScheduleCallTimestamp,
+          CRS.UpdatedAt
 
-            CRS.ScheduleCallTimestamp,
-            CRS.UpdatedAt,
+        FROM dbo.CallRecovery_Status CRS
+        INNER JOIN dbo.Recovery_Raw_Data R
+          ON R.loanAccountNumber = CRS.LoanAccountNumber
 
-            -- ✅ FINAL ACCOUNT STATUS
-            CASE
-              WHEN ISNULL(CRS.CompleteFlag,0) = 1 THEN 'COMPLETED'
-
-              WHEN ISNULL(CRS.InProcessFlag,0) = 1
-                OR ISNULL(CRS.ScheduleCallPendingFlag,0) = 1
-                OR ISNULL(CRS.ScheduleVisitPendingFlag,0) = 1
-              THEN 'IN PROCESS'
-
-              ELSE 'PENDING'
-            END AS AccountStatus
-
-          FROM dbo.CallRecovery_Status CRS
-          INNER JOIN dbo.Recovery_Raw_Data R
-            ON R.loanAccountNumber = CRS.LoanAccountNumber
-
-          WHERE CRS.UserId = @UserId
-            AND (
-              -- ✅ 1) PENDING CALLS WHICH ARE SCHEDULED TODAY
+        WHERE CRS.UserId = @UserId
+        AND (
+              -- 🔵 TODAY CALL PENDING
               (
                 ISNULL(CRS.ScheduleCallPendingFlag,0) = 1
                 AND CRS.ScheduleCallTimestamp IS NOT NULL
-                AND CAST(CRS.ScheduleCallTimestamp AS DATE) = CAST(GETDATE() AS DATE)
+                AND CONVERT(date, CRS.ScheduleCallTimestamp) = CONVERT(date, GETDATE())
               )
 
               OR
 
-              -- ✅ 2) COMPLETED CALLS WHICH WERE COMPLETED TODAY
+              -- 🟡 PAST CALL PENDING (Carry Forward)
+              (
+                ISNULL(CRS.ScheduleCallPendingFlag,0) = 1
+                AND CRS.ScheduleCallTimestamp IS NOT NULL
+                AND CONVERT(date, CRS.ScheduleCallTimestamp) < CONVERT(date, GETDATE())
+              )
+
+              OR
+
+              -- 🟢 CALL COMPLETED TODAY ONLY
               (
                 ISNULL(CRS.ScheduleCallCompletedFlag,0) = 1
-                AND CAST(CRS.UpdatedAt AS DATE) = CAST(GETDATE() AS DATE)
+                AND CONVERT(date, CRS.UpdatedAt) = CONVERT(date, GETDATE())
               )
-            )
+        )
 
-          ORDER BY
-            CASE
-              WHEN ISNULL(CRS.ScheduleCallPendingFlag,0) = 1 THEN 1
-              ELSE 2
-            END,
-            CRS.UpdatedAt DESC
+        ORDER BY
+          CONVERT(date, CRS.ScheduleCallTimestamp) DESC,
+          CRS.ScheduleCallTimestamp DESC
         `
         : `
-          SELECT
-            CRS.LoanAccountNumber,
-            R.firstname,
-            R.mobileNumber,
-            R.currentOutstandingBalance,
-            R.dpdQueue,
+        SELECT
+          CRS.LoanAccountNumber,
+          R.firstname,
+          R.mobileNumber,
+          R.OVERDUEAMT AS overdueAmount,
+          R.dpdQueue,
 
-            -- ✅ MAIN STATUS FLAGS
-            ISNULL(CRS.PendingFlag,0)   AS PendingFlag,
-            ISNULL(CRS.InProcessFlag,0) AS InProcessFlag,
-            ISNULL(CRS.CompleteFlag,0)  AS CompleteFlag,
+          ISNULL(CRS.ScheduleVisitPendingFlag,0)   AS ScheduleVisitPendingFlag,
+          ISNULL(CRS.ScheduleVisitCompletedFlag,0) AS ScheduleVisitCompletedFlag,
 
-            -- ✅ SCHEDULE FLAGS
-            ISNULL(CRS.ScheduleVisitPendingFlag,0)   AS ScheduleVisitPendingFlag,
-            ISNULL(CRS.ScheduleVisitCompletedFlag,0) AS ScheduleVisitCompletedFlag,
+          CRS.ScheduleVisitTimestamp,
+          CRS.UpdatedAt
 
-            CRS.ScheduleVisitTimestamp,
-            CRS.UpdatedAt,
+        FROM dbo.CallRecovery_Status CRS
+        INNER JOIN dbo.Recovery_Raw_Data R
+          ON R.loanAccountNumber = CRS.LoanAccountNumber
 
-            -- ✅ FINAL ACCOUNT STATUS
-            CASE
-              WHEN ISNULL(CRS.CompleteFlag,0) = 1 THEN 'COMPLETED'
-
-              WHEN ISNULL(CRS.InProcessFlag,0) = 1
-                OR ISNULL(CRS.ScheduleCallPendingFlag,0) = 1
-                OR ISNULL(CRS.ScheduleVisitPendingFlag,0) = 1
-              THEN 'IN PROCESS'
-
-              ELSE 'PENDING'
-            END AS AccountStatus
-
-          FROM dbo.CallRecovery_Status CRS
-          INNER JOIN dbo.Recovery_Raw_Data R
-            ON R.loanAccountNumber = CRS.LoanAccountNumber
-
-          WHERE CRS.UserId = @UserId
-            AND (
-              -- ✅ 1) PENDING VISITS WHICH ARE SCHEDULED TODAY
+        WHERE CRS.UserId = @UserId
+        AND (
+              -- 🔵 TODAY VISIT PENDING
               (
                 ISNULL(CRS.ScheduleVisitPendingFlag,0) = 1
                 AND CRS.ScheduleVisitTimestamp IS NOT NULL
-                AND CAST(CRS.ScheduleVisitTimestamp AS DATE) = CAST(GETDATE() AS DATE)
+                AND CONVERT(date, CRS.ScheduleVisitTimestamp) = CONVERT(date, GETDATE())
               )
 
               OR
 
-              -- ✅ 2) COMPLETED VISITS WHICH WERE COMPLETED TODAY
+              -- 🟡 PAST VISIT PENDING (Carry Forward)
+              (
+                ISNULL(CRS.ScheduleVisitPendingFlag,0) = 1
+                AND CRS.ScheduleVisitTimestamp IS NOT NULL
+                AND CONVERT(date, CRS.ScheduleVisitTimestamp) < CONVERT(date, GETDATE())
+              )
+
+              OR
+
+              -- 🟢 VISIT COMPLETED TODAY ONLY
               (
                 ISNULL(CRS.ScheduleVisitCompletedFlag,0) = 1
-                AND CAST(CRS.UpdatedAt AS DATE) = CAST(GETDATE() AS DATE)
+                AND CONVERT(date, CRS.UpdatedAt) = CONVERT(date, GETDATE())
               )
-            )
+        )
 
-          ORDER BY
-            CASE
-              WHEN ISNULL(CRS.ScheduleVisitPendingFlag,0) = 1 THEN 1
-              ELSE 2
-            END,
-            CRS.UpdatedAt DESC
+        ORDER BY
+          CONVERT(date, CRS.ScheduleVisitTimestamp) DESC,
+          CRS.ScheduleVisitTimestamp DESC
         `;
 
-    const result = await pool.request()
+    const result = await pool
+      .request()
       .input("UserId", sql.VarChar(50), String(userId))
       .query(query);
 
@@ -1011,10 +985,9 @@ app.post("/api/home/schedule-today-list", async (req, res) => {
 
   } catch (err) {
     console.error("❌ schedule-today-list error:", err);
-    return res.status(500).json({ message: "Failed to load today schedules" });
+    return res.status(500).json({ message: "Failed to load schedule list" });
   }
 });
-
 
 // =====================================================================
 // FIELD VISIT
@@ -1042,18 +1015,19 @@ app.post("/api/field-visit/start", async (req, res) => {
   // ===============================
   // VALIDATION
   // ===============================
-  if (
-    !userId ||
-    !userName ||
-    !accountNo ||
-    !customerName ||
-    !startLat ||
-    !startLng ||
-    !startAddress ||
-    !customerLat ||
-    !customerLng ||
-    !customerAddress
-  ) {
+if (
+  !userId ||
+  !userName ||
+  !accountNo ||
+  !customerName ||
+  startLat === undefined ||
+  startLng === undefined ||
+  !startAddress ||
+  customerLat === undefined ||
+  customerLng === undefined ||
+  !customerAddress
+)
+{
     return res.status(400).json({ message: "Missing required fields" });
   }
 
@@ -1200,7 +1174,362 @@ app.post("/api/field-visit/stop", async (req, res) => {
   }
 });
 
+// =====================================
+// SAVE LEAD API (CORRECTED)
+// =====================================
+app.post("/api/saveLead", async (req, res) => {
+  try {
+    let {
+      BranchCode,
+      BranchName,
+      UserID,
+      UserName,
+      ClusterName,
+      LeadCategory,
+      FullName,
+      MobileNumber,
+      Address,
+      PinCode,
+      DOB,
+      ProductCategory,
+      SelectProduct,
+      SelectLeadType
+    } = req.body;
 
+    // =====================================
+    // CLEAN & NORMALIZE DATA
+    // =====================================
+    LeadCategory = LeadCategory?.trim();
+    ProductCategory = ProductCategory?.trim();
+    SelectProduct = SelectProduct?.trim();
+    SelectLeadType = SelectLeadType?.trim();
+
+    Address = Address || "";
+    PinCode = PinCode || "";
+    DOB = DOB || "";
+
+    // 🔥 NORMALIZE ProductCategory TO MATCH DB
+    if (ProductCategory === "Loans") {
+      ProductCategory = "Loan";   // DB expects singular
+    }
+
+    if (ProductCategory === "Deposits") {
+      ProductCategory = "Deposits";
+    }
+
+    // =====================================
+    // VALIDATION
+    // =====================================
+    if (!FullName || !MobileNumber || !ProductCategory || !SelectProduct || !SelectLeadType) {
+      return res.status(400).json({
+        success: false,
+        message: "Mandatory fields missing"
+      });
+    }
+
+    // Optional safety validation
+    if (!["Deposits", "Loan"].includes(ProductCategory)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid Product Category"
+      });
+    }
+
+    const pool = await poolPromise;
+
+    // =====================================
+    // INSERT INTO Leads_Data
+    // =====================================
+    await pool.request()
+      .input("BranchCode", sql.VarChar(50), BranchCode)
+      .input("BranchName", sql.VarChar(150), BranchName)
+      .input("UserID", sql.VarChar(50), UserID)
+      .input("UserName", sql.VarChar(150), UserName)
+      .input("ClusterName", sql.VarChar(150), ClusterName)
+      .input("LeadCategory", sql.VarChar(50), LeadCategory)
+      .input("FullName", sql.VarChar(200), FullName)
+      .input("MobileNumber", sql.VarChar(20), MobileNumber)
+      .input("Address", sql.VarChar(500), Address)
+      .input("PinCode", sql.VarChar(10), PinCode)
+      .input("DOB", sql.VarChar(20), DOB)
+      .input("ProductCategory", sql.VarChar(100), ProductCategory)
+      .input("SelectProduct", sql.VarChar(150), SelectProduct)
+      .input("SelectLeadType", sql.VarChar(100), SelectLeadType)
+      .query(`
+        INSERT INTO Leads_Data
+        (
+          BranchCode,
+          BranchName,
+          UserID,
+          UserName,
+          LeadCategory,
+          FullName,
+          MobileNumber,
+          Address,
+          PinCode,
+          DOB,
+          ProductCategory,
+          SelectProduct,
+          SelectLeadType,
+          ClusterName,
+          TimeStamp
+        )
+        VALUES
+        (
+          @BranchCode,
+          @BranchName,
+          @UserID,
+          @UserName,
+          @LeadCategory,
+          @FullName,
+          @MobileNumber,
+          @Address,
+          @PinCode,
+          @DOB,
+          @ProductCategory,
+          @SelectProduct,
+          @SelectLeadType,
+          @ClusterName,
+          GETDATE()
+        )
+      `);
+
+    // =====================================
+    // SUCCESS RESPONSE
+    // =====================================
+    return res.json({
+      success: true,
+      message: "Lead saved successfully"
+    });
+
+  } catch (err) {
+    console.log("SAVE LEAD ERROR:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Server error while saving lead"
+    });
+  }
+});
+// ================= GET LEADS FOR LOGGED USER =================
+app.get("/api/getMyLeads/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    const pool = await sql.connect(dbConfig);
+
+    const result = await pool.request()
+      .input("UserID", sql.VarChar, userId)
+      .query(`
+        SELECT 
+          SNo,
+          FullName,
+          MobileNumber,
+          PinCode,
+          SelectLeadType,
+          LeadCategory,
+          TimeStamp
+        FROM Leads_Data
+        WHERE UserID = @UserID
+        ORDER BY TimeStamp DESC
+      `);
+
+    res.json({
+      success: true,
+      leads: result.recordset
+    });
+
+  } catch (err) {
+    console.log("GET LEADS ERROR", err);
+    res.json({ success: false });
+  }
+});
+
+// ================= GET FULL LEAD DETAILS BY SNo =================
+app.get("/api/getLeadDetails/:sno", async (req, res) => {
+  try {
+    const { sno } = req.params;
+
+    const pool = await sql.connect(dbConfig);
+
+    const result = await pool.request()
+      .input("SNo", sql.Int, sno)
+      .query(`
+        SELECT *
+        FROM Leads_Data
+        WHERE SNo = @SNo
+      `);
+
+    if (result.recordset.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Lead not found"
+      });
+    }
+
+    res.json({
+      success: true,
+      lead: result.recordset[0]
+    });
+
+  } catch (err) {
+    console.log("GET LEAD DETAILS ERROR", err);
+    res.status(500).json({
+      success: false,
+      message: "Server error"
+    });
+  }
+});
+// =========================================================
+// ACTIVITY HISTORY OVERVIEW
+// =========================================================
+
+app.post("/api/activity/history", async (req, res) => {
+  try {
+    const { userId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ message: "userId required" });
+    }
+
+    const pool = await poolPromise;
+
+    const result = await pool
+      .request()
+      .input("UserId", sql.VarChar(50), String(userId))
+      .query(`
+        ;WITH LatestAction AS (
+          SELECT
+            s.LoanAccountNumber,
+            MAX(l.CreatedAt) AS LatestTime
+          FROM smart_call.dbo.Activity_Sessions s
+          INNER JOIN smart_call.dbo.Activity_Logs l
+            ON s.SessionId = l.SessionId
+          WHERE s.StartedByUserId = @UserId
+          GROUP BY s.LoanAccountNumber
+        )
+
+        SELECT
+          s.SessionId,
+          s.LoanAccountNumber,
+          r.firstname AS CustomerName,
+          s.SessionType,
+          l.ActionLabel,
+
+          -- ✅ Proper formatted time (IST safe)
+          FORMAT(l.CreatedAt, 'dd/MM/yyyy hh:mm tt') AS FormattedTime,
+
+          -- ✅ Raw flags (kept for debugging if needed)
+          ISNULL(cr.PendingFlag,0) AS PendingFlag,
+          ISNULL(cr.InProcessFlag,0) AS InProcessFlag,
+          ISNULL(cr.CompleteFlag,0) AS CompleteFlag,
+          ISNULL(cr.ScheduleCallPendingFlag,0) AS ScheduleCallPendingFlag,
+          ISNULL(cr.ScheduleCallCompletedFlag,0) AS ScheduleCallCompletedFlag,
+          ISNULL(cr.ScheduleVisitPendingFlag,0) AS ScheduleVisitPendingFlag,
+          ISNULL(cr.ScheduleVisitCompletedFlag,0) AS ScheduleVisitCompletedFlag,
+
+          -- 🔥 FINAL DERIVED STATUS
+          CASE
+            WHEN ISNULL(cr.CompleteFlag,0) = 1
+              OR ISNULL(cr.ScheduleCallCompletedFlag,0) = 1
+              OR ISNULL(cr.ScheduleVisitCompletedFlag,0) = 1
+              THEN 'COMPLETED'
+
+            WHEN ISNULL(cr.InProcessFlag,0) = 1
+              OR ISNULL(cr.ScheduleCallPendingFlag,0) = 1
+              OR ISNULL(cr.ScheduleVisitPendingFlag,0) = 1
+              THEN 'IN PROCESS'
+
+            WHEN ISNULL(cr.PendingFlag,0) = 1
+              THEN 'PENDING'
+
+            ELSE 'PENDING'
+          END AS AccountStatus
+
+        FROM LatestAction LA
+        INNER JOIN smart_call.dbo.Activity_Sessions s
+          ON s.LoanAccountNumber = LA.LoanAccountNumber
+
+        INNER JOIN smart_call.dbo.Activity_Logs l
+          ON l.SessionId = s.SessionId
+         AND l.CreatedAt = LA.LatestTime
+
+        LEFT JOIN smart_call.dbo.Recovery_Raw_Data r
+          ON r.loanAccountNumber = s.LoanAccountNumber
+
+        LEFT JOIN smart_call.dbo.CallRecovery_Status cr
+          ON cr.LoanAccountNumber = s.LoanAccountNumber
+         AND cr.UserId = @UserId
+
+        ORDER BY l.CreatedAt DESC
+      `);
+
+    return res.status(200).json({
+      success: true,
+      records: result.recordset,
+    });
+
+  } catch (err) {
+    console.error("History overview error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "History fetch failed",
+    });
+  }
+});
+
+// =========================================================
+// ACTIVITY HISTORY DETAILS
+// Returns ALL actions for one LoanAccountNumber
+// Includes formatted schedule timestamps
+// =========================================================
+
+app.post("/api/activity/history-details", async (req, res) => {
+  try {
+    const { loanAccountNumber } = req.body;
+
+    if (!loanAccountNumber) {
+      return res.status(400).json({ message: "LoanAccountNumber required" });
+    }
+
+    const pool = await poolPromise;
+
+    const result = await pool.request()
+      .input("LoanAccountNumber", sql.VarChar(50), String(loanAccountNumber))
+      .query(`
+        SELECT
+          s.SessionType,
+          l.ActionLabel,
+
+          -- 🔥 Main Action Time (Formatted)
+          FORMAT(l.CreatedAt, 'dd/MM/yyyy hh:mm tt') AS FormattedTime,
+
+          -- 🔥 Scheduled Call Time (Formatted)
+          FORMAT(cr.ScheduleCallTimestamp, 'dd/MM/yyyy hh:mm tt') 
+            AS FormattedCallSchedule,
+
+          -- 🔥 Scheduled Visit Time (Formatted)
+          FORMAT(cr.ScheduleVisitTimestamp, 'dd/MM/yyyy hh:mm tt') 
+            AS FormattedVisitSchedule
+
+        FROM smart_call.dbo.Activity_Sessions s
+        INNER JOIN smart_call.dbo.Activity_Logs l
+          ON s.SessionId = l.SessionId
+
+        LEFT JOIN smart_call.dbo.CallRecovery_Status cr
+          ON cr.LoanAccountNumber = s.LoanAccountNumber
+
+        WHERE s.LoanAccountNumber = @LoanAccountNumber
+
+        ORDER BY l.CreatedAt DESC
+      `);
+
+    res.json({ records: result.recordset });
+
+  } catch (err) {
+    console.error("History details error:", err);
+    res.status(500).json({ message: "Details fetch failed" });
+  }
+});
 //==================================================================================================================================================================================
 //                                                                         --------------------------------------------------------------------
 //==================================================================================================================================================================================
@@ -1276,7 +1605,7 @@ app.get("/api/branches/:clusterName", async (req, res) => {
 });
 
 //============================================================================================
-//                                PSV FILE DATA UPLOAD + DAILY COMPARISON
+//                                CSV FILE DATA UPLOAD + DAILY COMPARISON
 //============================================================================================
 app.post("/api/recovery-upload", async (req, res) => {
   const { records } = req.body;
@@ -1380,29 +1709,67 @@ app.post("/api/recovery-upload", async (req, res) => {
     });
 
     await pool.request().bulk(table);
+	
+// ------------------------------------------------------------------
+// STEP 4 — Also store NEW upload into History table
+// ------------------------------------------------------------------
+await pool.request().query(`
+  INSERT INTO Recovery_Raw_Data_history (
+    firstname, dob, gender, religion, socialcategory, voterId,
+    drivingLicense, rationCard, pancard, gp, pincode, village,
+    branchCode, branchName, fathersName, product, mobileNumber,
+    loanAccountNumber, dpdQueue, currentOutstandingBalance,
+    principleDue, interestDue, interestRate, lastInterestAppliedDate,
+    npaDate, EMIAMOUNT, OVERDUEAMT, extra, uploadtimestamp
+  )
+  SELECT firstname, dob, gender, religion, socialcategory, voterId,
+    drivingLicense, rationCard, pancard, gp, pincode, village,
+    branchCode, branchName, fathersName, product, mobileNumber,
+    loanAccountNumber, dpdQueue, currentOutstandingBalance,
+    principleDue, interestDue, interestRate, lastInterestAppliedDate,
+    npaDate, EMIAMOUNT, OVERDUEAMT, extra, GETDATE()
+  FROM Recovery_Raw_Data
+`);
 
     // ------------------------------------------------------------------
-    // STEP 4 — Store TODAY count in log table
-    // ------------------------------------------------------------------
-    await pool.request()
-      .input("cnt", sql.Int, todayCount)
-      .query(`
-        IF NOT EXISTS (
-          SELECT 1 FROM Recovery_Upload_Log
-          WHERE upload_date = CAST(GETDATE() AS DATE)
-        )
-        INSERT INTO Recovery_Upload_Log (upload_date, record_count)
-        VALUES (CAST(GETDATE() AS DATE), @cnt)
-      `);
+// STEP 5 — Insert EVERY upload into log table
+// ------------------------------------------------------------------
+await pool.request()
+  .input("cnt", sql.Int, todayCount)
+  .query(`
+    INSERT INTO Recovery_Upload_Log 
+    (upload_date, record_count, uploaded_at)
+    VALUES 
+    (CAST(GETDATE() AS DATE), @cnt, GETDATE())
+  `);
 
-    // ------------------------------------------------------------------
-    // STEP 5 — Calculate DAILY differences
-    // ------------------------------------------------------------------
-    const archived =
-      todayCount < yesterdayCount ? yesterdayCount - todayCount : 0;
+// ------------------------------------------------------------------
+// STEP 6 — Get YESTERDAY latest upload
+// ------------------------------------------------------------------
+const yesterdayLatestRes = await pool.request().query(`
+  SELECT TOP 1 record_count
+  FROM Recovery_Upload_Log
+  WHERE upload_date = CAST(DATEADD(DAY, -1, GETDATE()) AS DATE)
+  ORDER BY uploaded_at DESC
+`);
 
-    const newRecords =
-      todayCount > yesterdayCount ? todayCount - yesterdayCount : 0;
+const yesterdayLatestCount = 
+  yesterdayLatestRes.recordset.length
+  ? yesterdayLatestRes.recordset[0].record_count
+  : 0;
+
+// ------------------------------------------------------------------
+// STEP 7 — Calculate difference (Yesterday latest vs Today latest)
+// ------------------------------------------------------------------
+const archived =
+  todayCount < yesterdayLatestCount
+    ? yesterdayLatestCount - todayCount
+    : 0;
+
+const newRecords =
+  todayCount > yesterdayLatestCount
+    ? todayCount - yesterdayLatestCount
+    : 0;
 
     // ------------------------------------------------------------------
     // FINAL RESPONSE (USED BY FRONTEND MODAL)
@@ -1429,27 +1796,35 @@ app.get("/api/recovery-upload-status", async (req, res) => {
   try {
     const pool = await poolPromise;
 
-    const todayRes = await pool.request().query(`
-      SELECT record_count
-      FROM Recovery_Upload_Log
-      WHERE upload_date = CAST(GETDATE() AS DATE)
-    `);
+// Today latest
+const todayRes = await pool.request().query(`
+  SELECT TOP 1 record_count
+  FROM Recovery_Upload_Log
+  WHERE upload_date = CAST(GETDATE() AS DATE)
+  ORDER BY uploaded_at DESC
+`);
 
-    const yesterdayRes = await pool.request().query(`
-      SELECT TOP 1 record_count
-      FROM Recovery_Upload_Log
-      WHERE upload_date < CAST(GETDATE() AS DATE)
-      ORDER BY upload_date DESC
-    `);
+// Yesterday latest
+const yesterdayRes = await pool.request().query(`
+  SELECT TOP 1 record_count
+  FROM Recovery_Upload_Log
+  WHERE upload_date = CAST(DATEADD(DAY, -1, GETDATE()) AS DATE)
+  ORDER BY uploaded_at DESC
+`);
 
-    const today = todayRes.recordset.length ? todayRes.recordset[0].record_count : 0;
-    const yesterday = yesterdayRes.recordset.length ? yesterdayRes.recordset[0].record_count : 0;
+const today = todayRes.recordset.length
+  ? todayRes.recordset[0].record_count
+  : 0;
 
-    res.json({
-      archived: today < yesterday ? yesterday - today : 0,
-      uploaded: today > yesterday ? today - yesterday : 0,
-      history_total: today
-    });
+const yesterday = yesterdayRes.recordset.length
+  ? yesterdayRes.recordset[0].record_count
+  : 0;
+
+res.json({
+  archived: today < yesterday ? yesterday - today : 0,
+  uploaded: today > yesterday ? today - yesterday : 0,
+  history_total: today
+});
 
   } catch (err) {
     console.error("❌ STATUS ERROR:", err);
@@ -1516,7 +1891,7 @@ const isDirectSearch =
     }
 
     if (branchName) {
-       query += ` AND branchName LIKE @branchName`;
+   query += ` AND R.branchName LIKE @branchName`;
        request.input("branchName", sql.VarChar, `%${branchName}%`);
     }
 
@@ -1533,6 +1908,11 @@ const isDirectSearch =
     if (memberName && memberName.trim() !== "") {
   query += ` AND R.firstname LIKE @memberName`;
   request.input("memberName", sql.VarChar, `%${memberName.trim()}%`);
+}
+
+// ================= Queue Filter =================
+if (queue === "NPA") {
+  query += ` AND R.dpdQueue >= '04'`;
 }
 
     if (dpdQueue) {
@@ -1573,13 +1953,13 @@ else if (!isDirectSearch) {
 
     // 🌟 Cluster filter works through branch master mapping
     if (cluster && cluster !== "Corporate Office") {
-      query += ` AND branchCode IN (
-        SELECT branch_code
-        FROM Branch_Cluster_Master
-        WHERE cluster_name = @cluster
-      )`;
-      request.input("cluster", sql.VarChar, cluster);
-    }
+  query += ` AND R.branchName IN (
+    SELECT branch_name
+    FROM Branch_Cluster_Master
+    WHERE cluster_name = @cluster
+  )`;
+  request.input("cluster", sql.VarChar, cluster);
+}
 
     const result = await request.query(query);
 
@@ -1877,11 +2257,11 @@ app.get("/api/transaction/details/:loanAccountNumber", async (req, res) => {
 
 
 // ============================================================
-// TRANSACTION → EXPORT PDF (SELECTED ROWS ONLY)
+// TRANSACTION → EXPORT PDF (FINAL CLEAN STABLE VERSION)
 // ============================================================
 
 app.post("/api/transaction/export-pdf", async (req, res) => {
-  const { selectedIds, columns, fileName } = req.body;
+  const { selectedIds, columns, fileName, serialData } = req.body;
 
   if (!selectedIds || selectedIds.length === 0) {
     return res.status(400).json({ message: "No records selected" });
@@ -1893,32 +2273,66 @@ app.post("/api/transaction/export-pdf", async (req, res) => {
 
   try {
     const pool = await poolPromise;
-
     const request = pool.request();
 
+    // Bind parameters safely
     selectedIds.forEach((id, index) => {
       request.input(`id${index}`, sql.VarChar, id);
     });
 
+    // Preserve exact selected order
+    const orderCase = selectedIds
+      .map((id, index) => `WHEN R.loanAccountNumber = @id${index} THEN ${index}`)
+      .join(" ");
+
     const result = await request.query(`
-      SELECT
-        firstname AS firstName,
-        loanAccountNumber AS accountNumber,
-        product,
-        mobileNumber,
-        branchName AS branch
-      FROM Recovery_Raw_Data
-      WHERE loanAccountNumber IN (${selectedIds.map((_, i) => `@id${i}`).join(",")})
+      SELECT 
+        R.firstname AS firstName,
+        R.loanAccountNumber AS accountNumber,
+        R.product,
+        R.mobileNumber,
+        R.branchName AS branch,
+        CASE 
+          WHEN EXISTS (
+            SELECT 1 
+            FROM Account_Assignments A
+            WHERE A.LoanAccountNumber = R.loanAccountNumber
+              AND A.AssignmentStatus = 'Assigned'
+          ) THEN 'Assigned'
+          ELSE 'Not Assigned'
+        END AS status
+      FROM dbo.Recovery_Raw_Data R
+      WHERE R.loanAccountNumber IN (${selectedIds.map((_, i) => `@id${i}`).join(",")})
+      ORDER BY CASE ${orderCase} END
     `);
 
     const data = result.recordset || [];
+	
+	// 🔴 If somehow no data found, stop PDF generation
+if (data.length === 0) {
+  return res.status(400).json({ message: "No records found for PDF" });
+}
+	
+	// Attach serial numbers from frontend
+if (serialData && Array.isArray(serialData)) {
+
+  // Convert to map for fast lookup
+  const serialMap = {};
+  serialData.forEach(item => {
+    serialMap[item.accountNumber] = item.serialNumber;
+  });
+
+  data.forEach(row => {
+    row.serialNumber = serialMap[row.accountNumber] || "";
+  });
+}
 
     const PDFDocument = require("pdfkit");
 
     const doc = new PDFDocument({
       size: "A4",
       layout: "landscape",
-      margin: 30
+      margin: 40
     });
 
     const safeName = (fileName || "Transaction_Report").replace(/\s+/g, "_");
@@ -1932,64 +2346,129 @@ app.post("/api/transaction/export-pdf", async (req, res) => {
     doc.pipe(res);
 
     // ================= TITLE =================
-    doc.font("Helvetica-Bold").fontSize(14).text("Transaction Report", {
-      align: "center"
-    });
+    doc.font("Helvetica-Bold")
+       .fontSize(16)
+       .text("Transaction Report", { align: "center" });
 
     doc.moveDown(1);
 
-    const COLUMN_LABELS = {
-      firstName: "First Name",
-      accountNumber: "Account Number",
-      product: "Product",
-      mobileNumber: "Mobile Number",
-      branch: "Branch"
-    };
-
+    // ================= TABLE SETUP =================
     const pageWidth =
       doc.page.width - doc.page.margins.left - doc.page.margins.right;
 
-    const colWidth = pageWidth / columns.length;
-    const rowHeight = 25;
+    // Define custom column widths
+const columnWidths = {};
 
-    let x = doc.page.margins.left;
+columns.forEach(col => {
+  if (col === "serialNumber") {
+    columnWidths[col] = 50; // 👈 small width for S. No.
+  } else {
+    columnWidths[col] = null; // calculate later
+  }
+});
+
+// Calculate remaining width
+const usedWidth = Object.values(columnWidths)
+  .filter(w => w !== null)
+  .reduce((a, b) => a + b, 0);
+
+const remainingCols = columns.filter(col => columnWidths[col] === null);
+const remainingWidth = pageWidth - usedWidth;
+const equalWidth = remainingWidth / remainingCols.length;
+
+remainingCols.forEach(col => {
+  columnWidths[col] = equalWidth;
+});
+
+    const rowHeight = 22;
+
+    const COLUMN_LABELS = {
+  serialNumber: "S. No.",
+  firstName: "First Name",
+  accountNumber: "Account Number",
+  product: "Product",
+  mobileNumber: "Mobile Number",
+  branch: "Branch",
+  status: "Status"
+};
+
     let y = doc.y;
 
-    // ================= HEADER =================
-    doc.font("Helvetica-Bold").fontSize(10);
+    // ================= DRAW HEADER =================
+    const drawHeader = () => {
+      let x = doc.page.margins.left;
 
-    columns.forEach(col => {
-      doc.rect(x, y, colWidth, rowHeight).fillAndStroke("#e5e7eb", "#000");
-      doc.fillColor("#000").text(COLUMN_LABELS[col], x + 5, y + 7, {
-        width: colWidth - 10,
-        align: "center"
-      });
-      x += colWidth;
-    });
-
-    y += rowHeight;
-    doc.font("Helvetica").fontSize(9);
-
-    // ================= ROWS =================
-    data.forEach(row => {
-      x = doc.page.margins.left;
+      doc.font("Helvetica-Bold").fontSize(10);
 
       columns.forEach(col => {
-        doc.rect(x, y, colWidth, rowHeight).stroke();
-        doc.text(String(row[col] ?? ""), x + 5, y + 7, {
-          width: colWidth - 10,
-          align: "center"
-        });
-        x += colWidth;
+        doc.rect(x, y, columnWidths[col], rowHeight)
+           .fillAndStroke("#e2e8f0", "#94a3b8");
+
+        doc.fillColor("#000")
+           .text(COLUMN_LABELS[col], x + 5, y + 6, {
+             width: columnWidths[col] - 10,
+             align: "center"
+           });
+
+        x += columnWidths[col];
       });
 
       y += rowHeight;
+      doc.font("Helvetica").fontSize(9);
+    };
 
-      if (y + rowHeight > doc.page.height - doc.page.margins.bottom) {
-        doc.addPage({ layout: "landscape" });
-        y = doc.page.margins.top;
-      }
+    drawHeader();
+
+    // ================= ROWS =================
+    data.forEach((row, index) => {
+
+  let x = doc.page.margins.left;
+
+  // 🔥 STEP 1: Calculate dynamic row height
+  let dynamicHeight = 20;
+
+  columns.forEach(col => {
+    const text = String(row[col] ?? "");
+    const textHeight = doc.heightOfString(text, {
+      width: columnWidths[col] - 10
     });
+
+    dynamicHeight = Math.max(dynamicHeight, textHeight + 10);
+  });
+
+  // 🔥 STEP 2: Page break check
+  if (y + dynamicHeight > doc.page.height - 40) {
+    doc.addPage({
+      size: "A4",
+      layout: "landscape",
+      margin: 40
+    });
+    y = doc.page.margins.top;
+    drawHeader();
+  }
+
+  // 🔥 STEP 3: Alternate row shading
+  if (index % 2 === 0) {
+    doc.rect(x, y, pageWidth, dynamicHeight)
+       .fill("#f8fafc");
+  }
+
+  // 🔥 STEP 4: Draw each cell
+  columns.forEach(col => {
+
+    doc.rect(x, y, columnWidths[col], dynamicHeight).stroke();
+
+    doc.fillColor("#000")
+       .text(String(row[col] ?? ""), x + 5, y + 5, {
+         width: columnWidths[col] - 10,
+         align: "center"
+       });
+
+    x += columnWidths[col];
+  });
+
+  y += dynamicHeight;
+});
 
     doc.end();
 
@@ -2028,7 +2507,7 @@ app.post("/api/assignUsers", async (req, res) => {
         Role AS role,
         BranchCode AS branchCode
       FROM UsersInfo
-      WHERE Role IN ('ADMIN','BM','CRO')  -- Shows Admins also
+      WHERE Role IN ('Admin','Branch Manager','Calling Agent', 'Regional Manager')  -- Shows Admins also
     `;
 
     const request = pool.request();
@@ -2142,7 +2621,7 @@ app.post("/api/users", async (req, res) => {
     userId,
     userName,
     branchName,
-    role,
+    roles,
     dateOfBirth,
     mobileNumber,
     validFrom,
@@ -2176,7 +2655,6 @@ app.post("/api/users", async (req, res) => {
   await pool.request()
     .input("UserId", userId)
     .input("UserName", userName)
-    .input("Role", role)
     .input("BranchName", branchName)
     .input("BranchCode", sql.Int, branch_code)
     .input("ClusterName", sql.VarChar, cluster_name)
@@ -2187,15 +2665,50 @@ app.post("/api/users", async (req, res) => {
 
     .query(`
       INSERT INTO UsersInfo (
-        UserId, UserName, Role,
+        UserId, UserName,
         BranchName, BranchCode, ClusterName,
         MobileNumber, DateOfBirth, ValidFrom, ValidUntil, CreatedAt
       ) VALUES (
-        @UserId, @UserName, @Role,
+        @UserId, @UserName,
         @BranchName, @BranchCode, @ClusterName,
         @MobileNumber, @DateOfBirth, @ValidFrom, @ValidUntil, GETDATE()
       )
     `);
+	
+	// Insert roles into mapping table
+if (roles && roles.length > 0) {
+  for (const roleId of roles) {
+    await pool.request()
+      .input("UserId", sql.VarChar, userId)
+      .input("RoleId", sql.Int, roleId)
+      .query(`
+        INSERT INTO UserRoles (UserId, RoleId)
+        VALUES (@UserId, @RoleId)
+      `);
+  }
+}
+
+// Get role names as comma-separated string
+const roleNamesRes = await pool.request()
+  .input("UserId", sql.VarChar, userId)
+  .query(`
+    SELECT STRING_AGG(R.RoleName, ',') AS roleNames
+    FROM UserRoles UR
+    INNER JOIN Roles R ON UR.RoleId = R.RoleId
+    WHERE UR.UserId = @UserId
+  `);
+
+const roleNames = roleNamesRes.recordset[0].roleNames || "";
+
+// Update UsersInfo.Role column
+await pool.request()
+  .input("UserId", sql.VarChar, userId)
+  .input("Role", sql.VarChar, roleNames)
+  .query(`
+    UPDATE UsersInfo
+    SET Role = @Role
+    WHERE UserId = @UserId
+  `);
 
   res.json({ message: "User created successfully" });
 });
@@ -2207,7 +2720,7 @@ app.put("/api/users/:userId", async (req, res) => {
   const {
     userName,
     branchName,
-    role,
+    roles,
     mobileNumber,
     dateOfBirth,
     validFrom,
@@ -2251,7 +2764,6 @@ app.put("/api/users/:userId", async (req, res) => {
     await pool.request()
       .input("UserId", sql.VarChar, userId)
       .input("UserName", sql.VarChar, userName)
-      .input("Role", sql.VarChar, role)
       .input("BranchName", sql.VarChar, branchName)
       .input("BranchCode", sql.Int, branch_code)
       .input("ClusterName", sql.VarChar, cluster_name)
@@ -2262,7 +2774,6 @@ app.put("/api/users/:userId", async (req, res) => {
       .query(`
         UPDATE UsersInfo SET
           UserName = @UserName,
-          Role = @Role,
           BranchName = @BranchName,
           BranchCode = @BranchCode,
           ClusterName = @ClusterName,
@@ -2273,7 +2784,47 @@ app.put("/api/users/:userId", async (req, res) => {
           UpdatedAt = GETDATE()
         WHERE UserId = @UserId
       `);
+	  
+	  // Delete old roles
+await pool.request()
+  .input("UserId", sql.VarChar, userId)
+  .query(`DELETE FROM UserRoles WHERE UserId=@UserId`);
 
+// Insert new roles
+if (roles && roles.length > 0) {
+  for (const roleId of roles) {
+    await pool.request()
+      .input("UserId", sql.VarChar, userId)
+      .input("RoleId", sql.Int, roleId)
+      .query(`
+        INSERT INTO UserRoles (UserId, RoleId)
+        VALUES (@UserId, @RoleId)
+      `);
+  }
+}
+
+// Get updated role names
+const roleNamesRes = await pool.request()
+  .input("UserId", sql.VarChar, userId)
+  .query(`
+    SELECT STRING_AGG(R.RoleName, ',') AS roleNames
+    FROM UserRoles UR
+    INNER JOIN Roles R ON UR.RoleId = R.RoleId
+    WHERE UR.UserId = @UserId
+  `);
+
+const roleNames = roleNamesRes.recordset[0].roleNames || "";
+
+// Update UsersInfo.Role column
+await pool.request()
+  .input("UserId", sql.VarChar, userId)
+  .input("Role", sql.VarChar, roleNames)
+  .query(`
+    UPDATE UsersInfo
+    SET Role = @Role
+    WHERE UserId = @UserId
+  `);
+  
     return res.json({ message: "User updated successfully" });
 
   } catch (err) {
@@ -2287,11 +2838,19 @@ app.delete("/api/users/:userId", async (req, res) => {
 
   try {
     const pool = await poolPromise;
+
+    // Delete roles first
+    await pool.request()
+      .input("UserId", userId)
+      .query(`DELETE FROM UserRoles WHERE UserId=@UserId`);
+
+    // Delete user
     await pool.request()
       .input("UserId", userId)
       .query(`DELETE FROM UsersInfo WHERE UserId=@UserId`);
 
     res.json({ message: "User deleted successfully" });
+
   } catch (err) {
     console.error("DELETE ERROR:", err);
     res.status(500).json({ message: "Failed to delete user" });
@@ -2306,7 +2865,8 @@ app.post("/api/users/list", async (req, res) => {
     page = 1,
     pageSize = 15,
     name = "",
-    branch = ""
+    branch = "",
+	cluster = "" 
   } = req.body;
 
   const offset = (page - 1) * pageSize;
@@ -2321,7 +2881,22 @@ app.post("/api/users/list", async (req, res) => {
         BranchName   AS branchName,
         BranchCode   AS branchCode,
         ClusterName  AS clusterName,
-        Role         AS role,
+		
+        ISNULL(STUFF((
+    SELECT ',' + R.RoleName
+    FROM UserRoles UR
+    INNER JOIN Roles R ON UR.RoleId = R.RoleId
+    WHERE UR.UserId = UsersInfo.UserId
+    FOR XML PATH('')
+),1,1,''),'') AS role,
+
+ISNULL((
+    SELECT STRING_AGG(CAST(UR.RoleId AS VARCHAR), ',')
+    FROM UserRoles UR
+    WHERE UR.UserId = UsersInfo.UserId
+),'') AS roleIds,
+
+
         MobileNumber AS mobileNumber,
         DateOfBirth  AS dateOfBirth,
         ValidFrom    AS validFrom,
@@ -2331,7 +2906,8 @@ app.post("/api/users/list", async (req, res) => {
       WHERE
         (@name = '' OR UserName LIKE '%' + @name + '%')
         AND (@branch = '' OR BranchName = @branch)
-      ORDER BY CreatedAt DESC
+		AND (@cluster = '' OR ClusterName = @cluster)
+      ORDER BY CreatedAt ASC
       OFFSET @offset ROWS
       FETCH NEXT @pageSize ROWS ONLY
     `;
@@ -2342,11 +2918,13 @@ app.post("/api/users/list", async (req, res) => {
       WHERE
         (@name = '' OR UserName LIKE '%' + @name + '%')
         AND (@branch = '' OR BranchName = @branch)
+		AND (@cluster = '' OR ClusterName = @cluster)   
     `;
 
     const request = pool.request()
       .input("name", sql.VarChar, name)
       .input("branch", sql.VarChar, branch)
+	  .input("cluster", sql.VarChar, cluster)
       .input("offset", sql.Int, offset)
       .input("pageSize", sql.Int, pageSize);
 
@@ -2357,10 +2935,11 @@ app.post("/api/users/list", async (req, res) => {
     const pages = Math.ceil(total / pageSize);
 
     res.json({
-      records: records.recordset,
-      page,
-      pages
-    });
+  records: records.recordset,
+  page,
+  pages,
+  totalRecords: total
+});
 
   } catch (err) {
     console.error("GET USERS ERROR:", err);
@@ -2391,59 +2970,75 @@ app.get("/api/products", async (req, res) => {
 });
 
 // ====================================================================================
-// FIELD VISIT REPORT - SEARCH (FIXED)
+// FIELD VISIT REPORT
 // ====================================================================================
 app.post("/api/field-visit-report", async (req, res) => {
-  const { user, fromDate, toDate } = req.body;
+  const { user, cluster, branch, fromDate, toDate } = req.body;
 
   try {
     const pool = await poolPromise;
+    const request = pool.request();
 
     let query = `
       SELECT
-        UserID,
-        UserName,
-        AccountNo,
-        CustomerName,
-        BranchLatitude,
-        BranchLongitude,
-        MeetingDate,
-        StartLatitude,
-        StartLongitude,
-        MeetingLatitude,
-        MeetingLongitude,
-        MeetingAddress,
-        DistanceTravelled,
-        CustomerLatitude,
-        CustomerLongitude,
-        Variance,
-        Flow
-      FROM smart_call.dbo.FieldVisitReport
+        f.UserID,
+        f.UserName,
+        f.AccountNo,
+        f.CustomerName,
+        f.BranchLatitude,
+        f.BranchLongitude,
+        f.MeetingDate,
+        f.StartLatitude,
+        f.StartLongitude,
+        f.MeetingLatitude,
+        f.MeetingLongitude,
+        f.MeetingAddress,
+        f.DistanceTravelled,
+        f.CustomerLatitude,
+        f.CustomerLongitude,
+        f.Variance,
+        f.Flow
+      FROM smart_call.dbo.FieldVisitReport f
+
+      INNER JOIN smart_call.dbo.Account_Assignments aa
+        ON f.AccountNo = aa.LoanAccountNumber
+        AND f.UserID = aa.AssignedToUserId
+
       WHERE 1 = 1
+        AND aa.AssignmentStatus = 'ASSIGNED'
+        AND aa.UnassignedAt IS NULL
     `;
 
-    const request = pool.request();
-
     if (user) {
-      query += " AND UserID = @user";
+      query += " AND f.UserID = @user";
       request.input("user", user);
     }
 
+    // ✅ Cluster filter (skip Corporate Office)
+    if (cluster && cluster !== "Corporate Office") {
+      query += " AND aa.ClusterName = @cluster";
+      request.input("cluster", cluster);
+    }
+
+    if (branch) {
+      query += " AND aa.BranchName = @branch";
+      request.input("branch", branch);
+    }
+
     if (fromDate) {
-      query += " AND CAST(MeetingDate AS DATE) >= @fromDate";
+      query += " AND CAST(f.MeetingDate AS DATE) >= @fromDate";
       request.input("fromDate", fromDate);
     }
 
     if (toDate) {
-      query += " AND CAST(MeetingDate AS DATE) <= @toDate";
+      query += " AND CAST(f.MeetingDate AS DATE) <= @toDate";
       request.input("toDate", toDate);
     }
 
-    query += " ORDER BY MeetingDate DESC";
+    query += " ORDER BY f.MeetingDate DESC";
 
     const result = await request.query(query);
-
-    res.json(result.recordset); // ALWAYS ARRAY
+    res.json(result.recordset || []);
   } catch (err) {
     console.error("FIELD VISIT REPORT ERROR:", err);
     res.status(500).json([]);
@@ -2604,7 +3199,7 @@ app.post("/api/field-visit-report/export-pdf", (req, res) => {
 // Activity Summary
 // =============================
 app.post("/api/activity-summary", async (req, res) => {
-  const { user, branch, fromDate, toDate } = req.body;
+  const { user, branch, cluster, fromDate, toDate } = req.body;
 
   try {
     const pool = await sql.connect(dbConfig);
@@ -2644,19 +3239,25 @@ app.post("/api/activity-summary", async (req, res) => {
     `;
 
     if (user) {
-      query += ` AND aa.AssignedToUserName = @user`;
-      request.input("user", sql.NVarChar, user);
-    }
+  query += ` AND aa.AssignedToUserName = @user`;
+  request.input("user", sql.NVarChar, user);
+}
 
-    if (branch) {
-      query += ` AND aa.BranchName = @branch`;
-      request.input("branch", sql.NVarChar, branch);
-    }
+if (branch) {
+  query += ` AND aa.BranchName = @branch`;
+  request.input("branch", sql.NVarChar, branch);
+}
+
+if (cluster && cluster !== "Corporate Office") {
+  query += ` AND aa.ClusterName = @cluster`;
+  request.input("cluster", sql.NVarChar, cluster);
+}
 
     query += `
         GROUP BY
           aa.AssignedToUserName,
           aa.BranchName,
+		  aa.ClusterName,
           aa.LoanAccountNumber
       )
 
@@ -2695,89 +3296,26 @@ ORDER BY UserName, BranchName;
 // ACTIVITY SUMMARY → EXPORT PDF
 // =====================================================================
 app.post("/api/activity-summary/export-pdf", async (req, res) => {
-  const { filters, columns, fileName } = req.body;
+  const { selectedData, columns, fileName } = req.body;
+
+  if (!selectedData || selectedData.length === 0) {
+    return res.status(400).json({ message: "No records selected" });
+  }
 
   if (!columns || columns.length === 0) {
     return res.status(400).json({ message: "No columns selected" });
   }
 
   try {
-    const pool = await poolPromise;
-    const request = pool.request();
 
-    request.input("fromDate", sql.Date, filters?.fromDate || null);
-    request.input("toDate", sql.Date, filters?.toDate || null);
-
-    if (filters?.user) {
-      request.input("user", sql.NVarChar, filters.user);
-    }
-
-    if (filters?.branch) {
-      request.input("branch", sql.NVarChar, filters.branch);
-    }
-
-    // 🔁 SAME QUERY AS /api/activity-summary
-    let query = `
-      WITH CallVisitCounts AS (
-        SELECT
-          aa.AssignedToUserName AS UserName,
-          aa.BranchName,
-          aa.LoanAccountNumber,
-
-          COUNT(CASE WHEN l.ActionCode = 'CALL_SPOKE' THEN 1 END) AS CallCount,
-          COUNT(CASE WHEN l.ActionCode = 'VISIT_COMPLETED' THEN 1 END) AS VisitCount
-
-        FROM Account_Assignments aa
-        LEFT JOIN Activity_Sessions s
-          ON aa.LoanAccountNumber = s.LoanAccountNumber
-          AND aa.AssignedToUserName = s.StartedByUserName
-
-        LEFT JOIN Activity_Logs l
-          ON s.SessionId = l.SessionId
-          AND l.ActionCode IN ('CALL_SPOKE','VISIT_COMPLETED')
-          AND (@fromDate IS NULL OR CAST(l.CreatedAt AS DATE) >= @fromDate)
-          AND (@toDate IS NULL OR CAST(l.CreatedAt AS DATE) <= @toDate)
-
-        WHERE aa.AssignmentStatus = 'ASSIGNED'
-          AND aa.UnassignedAt IS NULL
-    `;
-
-    if (filters?.user) query += ` AND aa.AssignedToUserName = @user`;
-    if (filters?.branch) query += ` AND aa.BranchName = @branch`;
-
-    query += `
-        GROUP BY
-          aa.AssignedToUserName,
-          aa.BranchName,
-          aa.LoanAccountNumber
-      )
-
-      SELECT
-        UserName,
-        BranchName,
-        COUNT(*) AS Assigned,
-        SUM(CASE WHEN CallCount >= 1 THEN 1 ELSE 0 END) AS CalledOnce,
-        SUM(CASE WHEN CallCount >= 2 THEN 1 ELSE 0 END) AS CalledTwice,
-        SUM(CASE WHEN CallCount >= 3 THEN 1 ELSE 0 END) AS CalledThrice,
-        SUM(CallCount) AS NoOfTimesCalled,
-        SUM(CASE WHEN CallCount = 0 THEN 1 ELSE 0 END) AS NotCalled,
-        SUM(VisitCount) AS NoOfVisits
-      FROM CallVisitCounts
-      GROUP BY UserName, BranchName
-      ORDER BY UserName, BranchName
-    `;
-
-    const result = await request.query(query);
-    const data = result.recordset || [];
-
-    // ================= PDF SETUP =================
     const doc = new PDFDocument({
       size: "A4",
       layout: "landscape",
       margin: 30
     });
 
-    const safeName = (fileName || "Activity_Summary_Report").replace(/\s+/g, "_");
+    const safeName = (fileName || "Activity_Summary_Report")
+      .replace(/\s+/g, "_");
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader(
@@ -2788,14 +3326,15 @@ app.post("/api/activity-summary/export-pdf", async (req, res) => {
     doc.pipe(res);
 
     // ================= TITLE =================
-    doc.font("Helvetica-Bold").fontSize(14).text("Activity Summary Report", {
-      align: "center"
-    });
+    doc.font("Helvetica-Bold")
+       .fontSize(14)
+       .text("Activity Summary Report", { align: "center" });
 
     doc.moveDown(1);
 
     // ================= COLUMN LABELS =================
     const COLUMN_LABELS = {
+      SNo: "S. No.",
       UserName: "User Name",
       BranchName: "Branch Name",
       Assigned: "Assigned",
@@ -2807,10 +3346,12 @@ app.post("/api/activity-summary/export-pdf", async (req, res) => {
       NoOfVisits: "No. of Visits"
     };
 
+    const finalColumns = ["SNo", ...columns]; // ✅ Always add S.No first
+
     const pageWidth =
       doc.page.width - doc.page.margins.left - doc.page.margins.right;
 
-    const colWidth = pageWidth / columns.length;
+    const colWidth = pageWidth / finalColumns.length;
     const rowHeight = 22;
 
     let x = doc.page.margins.left;
@@ -2819,14 +3360,16 @@ app.post("/api/activity-summary/export-pdf", async (req, res) => {
     // ================= HEADER =================
     doc.fontSize(9).font("Helvetica-Bold");
 
-    columns.forEach(col => {
-      doc.rect(x, y, colWidth, rowHeight).fillAndStroke("#e5e7eb", "#000");
-      doc
-        .fillColor("#000")
-        .text(COLUMN_LABELS[col], x + 4, y + 6, {
-          width: colWidth - 8,
-          align: "center"
-        });
+    finalColumns.forEach(col => {
+      doc.rect(x, y, colWidth, rowHeight)
+         .fillAndStroke("#e5e7eb", "#000");
+
+      doc.fillColor("#000")
+         .text(COLUMN_LABELS[col], x + 4, y + 6, {
+           width: colWidth - 8,
+           align: "center"
+         });
+
       x += colWidth;
     });
 
@@ -2834,15 +3377,18 @@ app.post("/api/activity-summary/export-pdf", async (req, res) => {
     doc.font("Helvetica").fontSize(9);
 
     // ================= ROWS =================
-    data.forEach(row => {
+    selectedData.forEach(row => {
+
       x = doc.page.margins.left;
 
-      columns.forEach(col => {
+      finalColumns.forEach(col => {
         doc.rect(x, y, colWidth, rowHeight).stroke();
+
         doc.text(String(row[col] ?? ""), x + 4, y + 6, {
           width: colWidth - 8,
           align: "center"
         });
+
         x += colWidth;
       });
 
@@ -2857,10 +3403,11 @@ app.post("/api/activity-summary/export-pdf", async (req, res) => {
     doc.end();
 
   } catch (err) {
-    console.error("❌ ACTIVITY SUMMARY PDF ERROR:", err);
+    console.error("PDF ERROR:", err);
     res.status(500).json({ message: "Failed to generate PDF" });
   }
 });
+
 
 
 // =====================================================================
@@ -2869,45 +3416,70 @@ app.post("/api/activity-summary/export-pdf", async (req, res) => {
 
 app.post("/api/assignment-summary/search", async (req, res) => {
   const { userName, cluster, branch, fromDate, toDate } = req.body;
+  if (!userName && !cluster && !branch && !fromDate && !toDate) {
+  return res.json([]); // 🚫 Return empty
+}
 
   try {
     const pool = await poolPromise;
     const request = pool.request();
 
     request.input("UserName", sql.VarChar, userName || "");
-    request.input("Cluster", sql.VarChar, cluster || "");
+    let selectedCluster = cluster;
+
+if (cluster === "Corporate Office") {
+  selectedCluster = "";   // Treat Corporate Office as ALL
+}
+
+request.input("Cluster", sql.VarChar, selectedCluster || "");
     request.input("Branch", sql.VarChar, branch || "");
     request.input("FromDate", sql.Date, fromDate || null);
     request.input("ToDate", sql.Date, toDate || null);
 
     const result = await request.query(`
       SELECT 
-          U.UserId,
-          U.UserName,
-          U.BranchCode,
-          U.BranchName,
-          A.LoanAccountNumber AS AccountNumber,
-          R.firstname AS CustomerName,
-          R.dpdQueue AS DpdQueue,
-          COUNT(A.LoanAccountNumber) 
-              OVER (PARTITION BY U.UserId) AS NoOfAccounts,
-          A.AssignedAt
-      FROM Account_Assignments A
-      INNER JOIN UsersInfo U
-          ON A.AssignedByAdminName = U.UserName
-      INNER JOIN Recovery_Raw_Data R
-          ON A.LoanAccountNumber = R.loanAccountNumber
-      WHERE 
-          (@UserName = '' OR U.UserName = @UserName)
-          AND (@Cluster = '' OR U.ClusterName = @Cluster)
-          AND (@Branch = '' OR U.BranchName = @Branch)
-          AND (
-              @FromDate IS NULL 
-              OR @ToDate IS NULL 
-              OR CAST(A.AssignedAt AS DATE) 
-                  BETWEEN @FromDate AND @ToDate
-          )
-      ORDER BY A.AssignedAt DESC
+    U.UserId,
+    U.UserName,
+    U.BranchCode,
+    U.BranchName,
+    A.LoanAccountNumber AS AccountNumber,
+    R.firstname AS CustomerName,
+    R.dpdQueue AS DpdQueue,
+
+    COUNT(A.LoanAccountNumber) 
+        OVER (PARTITION BY U.UserId) AS NoOfAccounts,
+
+    ISNULL(C.CallCount, 0) AS NoOfCalls,
+
+    A.AssignedAt
+
+FROM Account_Assignments A
+
+INNER JOIN UsersInfo U
+    ON A.AssignedByAdminName = U.UserName
+
+INNER JOIN Recovery_Raw_Data R
+    ON A.LoanAccountNumber = R.loanAccountNumber
+
+OUTER APPLY (
+    SELECT COUNT(AL.LogId) AS CallCount
+    FROM Activity_Sessions S
+    INNER JOIN Activity_Logs AL
+        ON S.SessionId = AL.SessionId
+    WHERE 
+        S.LoanAccountNumber = A.LoanAccountNumber
+        AND AL.ActionCode = 'CALL_SPOKE'
+        AND AL.ActionLabel = 'Spoke to Customer'
+) C
+
+WHERE 
+    (@UserName = '' OR U.UserName = @UserName)
+    AND (@Cluster = '' OR U.ClusterName = @Cluster)
+    AND (@Branch = '' OR U.BranchName = @Branch)
+    AND (@FromDate IS NULL OR CAST(A.AssignedAt AS DATE) >= @FromDate)
+    AND (@ToDate IS NULL OR CAST(A.AssignedAt AS DATE) <= @ToDate)
+
+ORDER BY A.AssignedAt DESC
     `);
 
     res.json(result.recordset);
@@ -2918,13 +3490,521 @@ app.post("/api/assignment-summary/search", async (req, res) => {
   }
 });
 
+// ============================================================
+// ASSIGNMENT SUMMARY → EXPORT PDF
+// ============================================================
+
+app.post("/api/assignment-summary/export-pdf", async (req, res) => {
+
+  const { records, columns, fileName } = req.body;
+
+  if (!records || records.length === 0) {
+    return res.status(400).json({ message: "No records selected" });
+  }
+
+  if (!columns || columns.length === 0) {
+    return res.status(400).json({ message: "No columns selected" });
+  }
+
+  try {
+
+    const PDFDocument = require("pdfkit");
+
+    const doc = new PDFDocument({
+      size: "A4",
+      layout: "landscape",
+      margin: 40
+    });
+
+    const safeName = (fileName || "Assignment_Summary")
+      .replace(/\s+/g, "_");
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${safeName}.pdf"`
+    );
+
+    doc.pipe(res);
+
+    // ================= TITLE =================
+    doc.font("Helvetica-Bold")
+       .fontSize(16)
+       .text("Assignment Summary Report", { align: "center" });
+
+    doc.moveDown(1);
+
+    // ================= TABLE SETUP =================
+    const pageWidth =
+      doc.page.width - doc.page.margins.left - doc.page.margins.right;
+
+    const columnWidth = pageWidth / columns.length;
+
+    let y = doc.y;
+
+    const LABELS = {
+      serialNumber: "S. No.",
+      UserId: "User Id",
+      UserName: "User Name",
+      BranchCode: "Branch Code",
+      BranchName: "Branch Name",
+      AccountNumber: "Account Number",
+      CustomerName: "Customer Name",
+      DpdQueue: "DPD Queue",
+      NoOfCalls: "No. of Calls"
+    };
+
+    // ================= HEADER =================
+doc.font("Helvetica-Bold").fontSize(10);
+
+let headerHeight = 25;
+
+// ✅ Calculate dynamic header height
+columns.forEach(col => {
+
+  const textHeight = doc.heightOfString(LABELS[col] || col, {
+    width: columnWidth - 10
+  });
+
+  headerHeight = Math.max(headerHeight, textHeight + 10);
+});
+
+let x = doc.page.margins.left;
+
+columns.forEach(col => {
+
+  doc.rect(x, y, columnWidth, headerHeight)
+     .fillAndStroke("#e2e8f0", "#94a3b8");
+
+  doc.fillColor("#000")
+     .text(LABELS[col] || col, x + 5, y + 5, {
+       width: columnWidth - 10,
+       align: "center"
+     });
+
+  x += columnWidth;
+});
+
+y += headerHeight;
+doc.font("Helvetica").fontSize(9);
+
+    // ================= ROWS =================
+    records.forEach((row, index) => {
+
+      let x = doc.page.margins.left;
+      let dynamicHeight = 20;
+
+      // 🔹 Calculate dynamic row height
+      columns.forEach(col => {
+
+        let value = row[col] ?? "";
+
+        if (col === "DpdQueue") {
+          if (value === "01") value = "0-30 Days";
+          else if (value === "02") value = "31-60 Days";
+          else if (value === "03") value = "61-90 Days";
+          else if (!isNaN(value) && parseInt(value) >= 4) value = "Above 90 Days";
+        }
+
+        const textHeight = doc.heightOfString(String(value), {
+          width: columnWidth - 10
+        });
+
+        dynamicHeight = Math.max(dynamicHeight, textHeight + 10);
+      });
+
+      // 🔹 Page Break Check
+      if (y + dynamicHeight > doc.page.height - 40) {
+
+        doc.addPage({
+          size: "A4",
+          layout: "landscape",
+          margin: 40
+        });
+
+        y = doc.page.margins.top;
+
+        // Redraw Header on new page
+doc.font("Helvetica-Bold").fontSize(10);
+
+let newHeaderHeight = 25;
+
+// Recalculate height
+columns.forEach(col => {
+  const textHeight = doc.heightOfString(LABELS[col] || col, {
+    width: columnWidth - 10
+  });
+
+  newHeaderHeight = Math.max(newHeaderHeight, textHeight + 10);
+});
+
+let newX = doc.page.margins.left;
+
+columns.forEach(col => {
+
+  doc.rect(newX, y, columnWidth, newHeaderHeight)
+     .fillAndStroke("#e2e8f0", "#94a3b8");
+
+  doc.fillColor("#000")
+     .text(LABELS[col] || col, newX + 5, y + 5, {
+       width: columnWidth - 10,
+       align: "center"
+     });
+
+  newX += columnWidth;
+});
+
+y += newHeaderHeight;
+doc.font("Helvetica").fontSize(9);
+      }
+
+      // 🔹 Alternate Row Background
+      if (index % 2 === 0) {
+        doc.rect(doc.page.margins.left, y, pageWidth, dynamicHeight)
+           .fill("#f8fafc");
+      }
+
+      // 🔹 Draw Cells
+      columns.forEach(col => {
+
+        doc.rect(x, y, columnWidth, dynamicHeight).stroke();
+
+        let value = row[col] ?? "";
+
+        if (col === "DpdQueue") {
+          if (value === "01") value = "0-30 Days";
+          else if (value === "02") value = "31-60 Days";
+          else if (value === "03") value = "61-90 Days";
+          else if (!isNaN(value) && parseInt(value) >= 4) value = "Above 90 Days";
+        }
+
+        doc.fillColor("#000")
+           .text(String(value), x + 5, y + 5, {
+             width: columnWidth - 10,
+             align: "center"
+           });
+
+        x += columnWidth;
+      });
+
+      y += dynamicHeight;
+    });
+
+    doc.end();
+
+  } catch (err) {
+    console.error("PDF ERROR:", err);
+
+    if (!res.headersSent) {
+      res.status(500).json({ message: "Failed to generate PDF" });
+    }
+  }
+});
+
+// ======================================================
+// BORROWERS CONTACTED BY PHONE 
+// ======================================================
+app.post("/api/borrowers-contacted/search", async (req, res) => {
+  const { cluster, branch, userId, fromDate, toDate } = req.body;
+
+  try {
+    const pool = await poolPromise;
+    const request = pool.request();
+
+    let query = `
+    WITH SpokeSessions AS (
+        SELECT DISTINCT SessionId
+        FROM smart_call.dbo.Activity_Logs
+        WHERE ActionCode = 'CALL_SPOKE'
+    ),
+
+    OrderedLogs AS (
+        SELECT
+            S.SessionId,
+            S.StartedAt,
+
+            AA.AssignedToUserId,
+            AA.AssignedToUserName,
+            AA.LoanAccountNumber,
+            AA.BranchName,
+            AA.ClusterName,
+
+            RD.firstname,
+            RD.mobileNumber,
+
+            AL.ActionLabel,
+            AL.CreatedAt,
+
+            ROW_NUMBER() OVER (
+                PARTITION BY S.SessionId
+                ORDER BY AL.CreatedAt ASC
+            ) AS StepNumber
+
+        FROM smart_call.dbo.Account_Assignments AA
+
+        INNER JOIN smart_call.dbo.Activity_Sessions S
+            ON S.AssignmentId = AA.AssignmentId
+
+        INNER JOIN SpokeSessions SS
+            ON SS.SessionId = S.SessionId
+
+        INNER JOIN smart_call.dbo.Activity_Logs AL
+            ON AL.SessionId = S.SessionId
+
+        LEFT JOIN smart_call.dbo.Recovery_Raw_Data RD
+            ON RD.loanAccountNumber = AA.LoanAccountNumber
+    )
+
+    SELECT
+        AssignedToUserId      AS employeeId,
+        AssignedToUserName    AS employeeName,
+        LoanAccountNumber     AS accountNumber,
+        BranchName            AS branchName,
+        firstname             AS borrowerName,
+        mobileNumber          AS numberContacted,
+
+        StartedAt AS dateOfCall,
+		
+        STRING_AGG(
+            CAST(StepNumber AS VARCHAR) + '. ' + ActionLabel,
+            CHAR(10)
+        ) WITHIN GROUP (ORDER BY StepNumber) AS flow
+
+    FROM OrderedLogs
+    WHERE 1=1
+    `;
+
+    // ================= USER FILTER =================
+    if (userId) {
+      query += ` AND AssignedToUserId = @userId`;
+      request.input("userId", sql.VarChar, userId);
+    }
+
+    // ================= BRANCH FILTER =================
+    if (branch) {
+      query += ` AND BranchName = @branch`;
+      request.input("branch", sql.VarChar, branch);
+    }
+
+    // ================= CLUSTER FILTER =================
+    if (cluster && cluster !== "Corporate Office") {
+      query += ` AND ClusterName = @cluster`;
+      request.input("cluster", sql.VarChar, cluster);
+    }
+
+    // ================= DATE FILTER =================
+    if (fromDate) {
+      query += ` AND CAST(StartedAt AS DATE) >= @fromDate`;
+      request.input("fromDate", sql.Date, fromDate);
+    }
+
+    if (toDate) {
+      query += ` AND CAST(StartedAt AS DATE) <= @toDate`;
+      request.input("toDate", sql.Date, toDate);
+    }
+
+    query += `
+    GROUP BY
+        SessionId,
+        StartedAt,
+        AssignedToUserId,
+        AssignedToUserName,
+        LoanAccountNumber,
+        BranchName,
+        firstname,
+        mobileNumber
+
+    ORDER BY StartedAt DESC
+    `;
+
+    const result = await request.query(query);
+
+    res.json(result.recordset);
+
+  } catch (err) {
+    console.error("Borrowers Contacted Report Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
+// BORROWERS CONTACTED → EXPORT PDF
+// ============================================================
+
+app.post("/api/borrowers-contacted/export-pdf", async (req, res) => {
+  const { selectedIndexes, columns, fileName, fullData } = req.body;
+
+  if (!selectedIndexes || selectedIndexes.length === 0) {
+    return res.status(400).json({ message: "No records selected" });
+  }
+
+  if (!columns || columns.length === 0) {
+    return res.status(400).json({ message: "No columns selected" });
+  }
+
+  try {
+    // Preserve order from frontend
+    const data = selectedIndexes.map(i => fullData[i]);
+
+    if (!data || data.length === 0) {
+      return res.status(400).json({ message: "No records found" });
+    }
+
+    const PDFDocument = require("pdfkit");
+
+    const doc = new PDFDocument({
+      size: "A4",
+      layout: "landscape",
+      margin: 40
+    });
+
+    const safeName = (fileName || "Borrowers_Contacted_Report")
+      .replace(/\s+/g, "_");
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${safeName}.pdf"`
+    );
+
+    doc.pipe(res);
+
+    // ================= TITLE =================
+    doc.font("Helvetica-Bold")
+      .fontSize(16)
+      .text("Borrowers Contacted By Phone Report", { align: "center" });
+
+    doc.moveDown(1);
+
+    const pageWidth =
+      doc.page.width - doc.page.margins.left - doc.page.margins.right;
+
+    const columnWidths = {};
+    const equalWidth = pageWidth / columns.length;
+
+    columns.forEach(col => {
+      columnWidths[col] = equalWidth;
+    });
+
+    const COLUMN_LABELS = {
+      serialNumber: "S. No.",
+      employeeId: "Employee Id",
+      employeeName: "Employee Name",
+      accountNumber: "Account Number",
+      branchName: "Branch Name",
+      borrowerName: "Borrower Name",
+      dateOfCall: "Date Of Call",
+      numberContacted: "Number Contacted",
+      flow: "Flow"
+    };
+
+    let y = doc.y;
+
+    const drawHeader = () => {
+
+  let x = doc.page.margins.left;
+
+  doc.font("Helvetica-Bold").fontSize(10);
+
+  // ✅ Dynamic header height
+  let headerHeight = 25;
+
+  columns.forEach(col => {
+    const textHeight = doc.heightOfString(COLUMN_LABELS[col], {
+      width: columnWidths[col] - 10
+    });
+
+    headerHeight = Math.max(headerHeight, textHeight + 10);
+  });
+
+  columns.forEach(col => {
+
+    doc.rect(x, y, columnWidths[col], headerHeight)
+       .fillAndStroke("#e2e8f0", "#94a3b8");
+
+    doc.fillColor("#000")
+       .text(COLUMN_LABELS[col], x + 5, y + 5, {
+         width: columnWidths[col] - 10,
+         align: "center"
+       });
+
+    x += columnWidths[col];
+  });
+
+  y += headerHeight;
+
+  doc.font("Helvetica").fontSize(9);
+};
+    drawHeader();
+
+    data.forEach((row, index) => {
+      let x = doc.page.margins.left;
+
+      let dynamicHeight = 20;
+
+      columns.forEach(col => {
+        const value =
+          col === "serialNumber"
+            ? selectedIndexes[index] + 1
+            : row[col] ?? "";
+
+        const textHeight = doc.heightOfString(String(value), {
+          width: columnWidths[col] - 10
+        });
+
+        dynamicHeight = Math.max(dynamicHeight, textHeight + 10);
+      });
+
+      if (y + dynamicHeight > doc.page.height - 40) {
+        doc.addPage({
+          size: "A4",
+          layout: "landscape",
+          margin: 40
+        });
+        y = doc.page.margins.top;
+        drawHeader();
+      }
+
+      columns.forEach(col => {
+        const value =
+          col === "serialNumber"
+            ? selectedIndexes[index] + 1
+            : row[col] ?? "";
+
+        doc.rect(x, y, columnWidths[col], dynamicHeight).stroke();
+
+        doc.text(String(value), x + 5, y + 5, {
+          width: columnWidths[col] - 10,
+          align: "center"
+        });
+
+        x += columnWidths[col];
+      });
+
+      y += dynamicHeight;
+    });
+
+    doc.end();
+
+  } catch (err) {
+    console.error("PDF ERROR:", err);
+    res.status(500).json({ message: "Failed to generate PDF" });
+  }
+});
+
+
 
 
 // =====================================================================
-// USER TRIPS REPORT (SEARCH)
+// CASH COLLECTION REPORT (ONLY CASH PAYMENTS)
 // =====================================================================
-app.post("/api/user-trips", async (req, res) => {
-  const { cluster, branch, fromDate, toDate } = req.body;
+app.post("/api/cash-collection-report/search", async (req, res) => {
+  const { user, cluster, branch, fromDate, toDate } = req.body;
+
+// ✅ BLOCK EMPTY SEARCH
+if (!user && !cluster && !branch && !fromDate && !toDate) {
+  return res.json([]);  // Return empty data
+}
 
   try {
     const pool = await poolPromise;
@@ -2932,52 +4012,329 @@ app.post("/api/user-trips", async (req, res) => {
 
     let query = `
       SELECT
-        UserName,
-        UserId,
-        MemberName,
-        AccountNumber,
-        BranchName,
-        MonthYear,
-        VisitDate,
-        TotalDistance,
-        DistanceTravelled,
-        StartLocation,
-        EndLocation
-      FROM smart_call.dbo.User_Trips
-      WHERE 1 = 1
+        A.AssignedToUserId      AS employeeId,
+        A.AssignedToUserName    AS userName,
+        A.BranchName            AS branchName,
+        S.LoanAccountNumber     AS accountNumber,
+        R.firstname             AS customerName,
+        CONVERT(VARCHAR, L.CreatedAt, 105) AS collectionDate,
+        SUM(CAST(P.amount AS DECIMAL(18,2))) AS amountCollected
+
+      FROM Activity_Logs L
+
+      INNER JOIN Activity_Sessions S
+        ON L.SessionId = S.SessionId
+
+      INNER JOIN Account_Assignments A
+        ON S.AssignmentId = A.AssignmentId
+
+      INNER JOIN Recovery_Raw_Data R
+        ON S.LoanAccountNumber = R.loanAccountNumber
+
+      CROSS APPLY OPENJSON(L.MetadataJson, '$.payments')
+      WITH (
+        type NVARCHAR(50) '$.type',
+        amount NVARCHAR(50) '$.amount'
+      ) AS P
+
+      WHERE 
+        L.ActionCode = 'VISIT_PAYMENT_COLLECTED'
+        AND L.ActionLabel = 'Payment Collected During Visit'
+        AND P.type = 'CASH'
     `;
+
+    // ================= USER FILTER =================
+    if (user) {
+      query += ` AND A.AssignedToUserId = @user`;
+      request.input("user", sql.VarChar, user);
+    }
 
     // ================= CLUSTER FILTER =================
     if (cluster && cluster !== "Corporate Office") {
-      query += `
-        AND BranchName IN (
-          SELECT branch_name
-          FROM Branch_Cluster_Master
-          WHERE cluster_name = @cluster
-        )
-      `;
+      query += ` AND A.ClusterName = @cluster`;
       request.input("cluster", sql.VarChar, cluster);
     }
 
     // ================= BRANCH FILTER =================
     if (branch) {
-      query += " AND BranchName = @branch";
+      query += ` AND A.BranchName = @branch`;
+      request.input("branch", sql.VarChar, branch);
+    }
+
+    // ================= DATE FILTER =================
+    if (fromDate) {
+      query += ` AND CAST(L.CreatedAt AS DATE) >= @fromDate`;
+      request.input("fromDate", sql.Date, fromDate);
+    }
+
+    if (toDate) {
+      query += ` AND CAST(L.CreatedAt AS DATE) <= @toDate`;
+      request.input("toDate", sql.Date, toDate);
+    }
+
+    query += `
+      GROUP BY
+        A.AssignedToUserId,
+        A.AssignedToUserName,
+        A.BranchName,
+        S.LoanAccountNumber,
+        R.firstname,
+        L.CreatedAt
+
+      ORDER BY L.CreatedAt DESC
+    `;
+
+    const result = await request.query(query);
+
+    return res.json(result.recordset);
+
+  } catch (err) {
+    console.error("CASH COLLECTION REPORT ERROR:", err);
+    return res.status(500).json([]);
+  }
+});
+
+// ============================================================
+// CASH COLLECTION REPORT → EXPORT PDF
+// ============================================================
+
+app.post("/api/cash-collection-report/export-pdf", async (req, res) => {
+  const { selectedIndexes, columns, fileName, fullData } = req.body;
+
+  if (!selectedIndexes || selectedIndexes.length === 0) {
+    return res.status(400).json({ message: "No records selected" });
+  }
+
+  if (!columns || columns.length === 0) {
+    return res.status(400).json({ message: "No columns selected" });
+  }
+
+  try {
+
+    const data = selectedIndexes.map(i => fullData[i]).filter(Boolean);
+
+    if (data.length === 0) {
+      return res.status(400).json({ message: "No records found" });
+    }
+
+    const PDFDocument = require("pdfkit");
+
+    const doc = new PDFDocument({
+      size: "A4",
+      layout: "landscape",
+      margin: 40
+    });
+
+    const safeName = (fileName || "Cash_Collection_Report")
+      .replace(/\s+/g, "_");
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${safeName}.pdf"`
+    );
+
+    doc.pipe(res);
+
+    doc.font("Helvetica-Bold")
+       .fontSize(16)
+       .text("Cash Collection Report", { align: "center" });
+
+    doc.moveDown(1);
+
+    const pageWidth =
+      doc.page.width - doc.page.margins.left - doc.page.margins.right;
+
+    // ===== COLUMN WIDTH FITTING (NO CUT ISSUE) =====
+    const columnWidths = {};
+
+    const serialWidth = columns.includes("serialNumber") ? 50 : 0;
+    const availableWidth = pageWidth - serialWidth;
+
+    const otherColumns = columns.filter(col => col !== "serialNumber");
+    const equalWidth = availableWidth / otherColumns.length;
+
+    columns.forEach(col => {
+      if (col === "serialNumber") {
+        columnWidths[col] = 50;
+      } else {
+        columnWidths[col] = equalWidth;
+      }
+    });
+
+    const COLUMN_LABELS = {
+      serialNumber: "S. No.",
+      employeeId: "Employee Id",
+      userName: "User Name",
+      branchName: "Branch Name",
+      accountNumber: "Account Number",
+      customerName: "Customer Name",
+      collectionDate: "Collection Date",
+      amountCollected: "Amount Collected"
+    };
+
+    let y = doc.y;
+
+    // ===== Dynamic Header =====
+    const drawHeader = () => {
+      let x = doc.page.margins.left;
+
+      doc.font("Helvetica-Bold").fontSize(10);
+
+      let headerHeight = 25;
+
+      columns.forEach(col => {
+        const textHeight = doc.heightOfString(COLUMN_LABELS[col], {
+          width: columnWidths[col] - 10
+        });
+        headerHeight = Math.max(headerHeight, textHeight + 12);
+      });
+
+      columns.forEach(col => {
+        doc.rect(x, y, columnWidths[col], headerHeight)
+           .fillAndStroke("#e2e8f0", "#94a3b8");
+
+        doc.fillColor("#000")
+           .text(COLUMN_LABELS[col], x + 5, y + 6, {
+             width: columnWidths[col] - 10,
+             align: "center"
+           });
+
+        x += columnWidths[col];
+      });
+
+      y += headerHeight;
+      doc.font("Helvetica").fontSize(9);
+    };
+
+    drawHeader();
+
+    // ===== Rows =====
+    data.forEach((row, index) => {
+
+      let x = doc.page.margins.left;
+      let dynamicHeight = 20;
+
+      columns.forEach(col => {
+
+        const value =
+          col === "serialNumber"
+            ? selectedIndexes[index] + 1
+            : row[col] ?? "";
+
+        const textHeight = doc.heightOfString(String(value), {
+          width: columnWidths[col] - 10
+        });
+
+        dynamicHeight = Math.max(dynamicHeight, textHeight + 10);
+      });
+
+      if (y + dynamicHeight > doc.page.height - 40) {
+        doc.addPage({
+          size: "A4",
+          layout: "landscape",
+          margin: 40
+        });
+        y = doc.page.margins.top;
+        drawHeader();
+      }
+
+      columns.forEach(col => {
+
+        const value =
+          col === "serialNumber"
+            ? selectedIndexes[index] + 1
+            : row[col] ?? "";
+
+        doc.rect(x, y, columnWidths[col], dynamicHeight).stroke();
+
+        doc.text(String(value), x + 5, y + 5, {
+          width: columnWidths[col] - 10,
+          align: "center"
+        });
+
+        x += columnWidths[col];
+      });
+
+      y += dynamicHeight;
+    });
+
+    doc.end();
+
+  } catch (err) {
+    console.error("❌ CASH COLLECTION PDF ERROR:", err);
+    res.status(500).json({ message: "Failed to generate PDF" });
+  }
+});
+
+
+// =====================================================================
+// USER TRIPS REPORT
+// =====================================================================
+app.post("/api/user-trips", async (req, res) => {
+  const { cluster, branch, fromDate, toDate } = req.body;
+
+  if (!cluster && !branch && !fromDate && !toDate) {
+    return res.status(200).json([]);
+  }
+
+  try {
+    const pool = await poolPromise;
+    const request = pool.request();
+
+    let query = `
+      SELECT
+        AA.AssignedToUserName     AS UserName,
+        AA.AssignedToUserId       AS UserId,
+        RR.firstname              AS MemberName,
+        AA.LoanAccountNumber      AS AccountNumber,
+        AA.BranchName             AS BranchName,
+
+        FORMAT(AA.AssignedAt, 'MMM yyyy') AS MonthYear,
+        CAST(AA.AssignedAt AS DATE)       AS VisitDate,
+
+        FVR.DistanceTravelled     AS TotalDistance,
+        FVR.DistanceTravelled     AS DistanceTravelled,
+        FVR.StartAddress          AS StartLocation,
+        FVR.MeetingAddress        AS EndLocation
+
+      FROM smart_call.dbo.Account_Assignments AA
+
+      LEFT JOIN smart_call.dbo.Recovery_Raw_Data RR
+        ON AA.LoanAccountNumber = RR.loanAccountNumber
+
+      LEFT JOIN smart_call.dbo.FieldVisitReport FVR
+        ON AA.LoanAccountNumber = FVR.AccountNo
+        AND AA.AssignedToUserId = FVR.UserID
+
+      WHERE 1 = 1
+    `;
+
+    // ================= CLUSTER FILTER =================
+    if (cluster && cluster !== "Corporate Office") {
+      query += " AND AA.ClusterName = @cluster";
+      request.input("cluster", sql.VarChar, cluster);
+    }
+
+    // ================= BRANCH FILTER =================
+    if (branch) {
+      query += " AND AA.BranchName = @branch";
       request.input("branch", sql.VarChar, branch);
     }
 
     // ================= FROM DATE =================
     if (fromDate) {
-      query += " AND CAST(VisitDate AS DATE) >= @fromDate";
+      query += " AND CAST(AA.AssignedAt AS DATE) >= @fromDate";
       request.input("fromDate", sql.Date, fromDate);
     }
 
     // ================= TO DATE =================
     if (toDate) {
-      query += " AND CAST(VisitDate AS DATE) <= @toDate";
+      query += " AND CAST(AA.AssignedAt AS DATE) <= @toDate";
       request.input("toDate", sql.Date, toDate);
     }
 
-    query += " ORDER BY VisitDate DESC";
+    query += " ORDER BY AA.AssignedAt DESC";
 
     const result = await request.query(query);
 
@@ -2989,12 +4346,213 @@ app.post("/api/user-trips", async (req, res) => {
   }
 });
 
+// ============================================================
+// USER TRIPS → EXPORT PDF
+// ============================================================
+
+app.post("/api/user-trips/export-pdf", async (req, res) => {
+  const { selectedIndexes, columns, fileName, fullData } = req.body;
+
+  if (!selectedIndexes || selectedIndexes.length === 0) {
+    return res.status(400).json({ message: "No records selected" });
+  }
+
+  if (!columns || columns.length === 0) {
+    return res.status(400).json({ message: "No columns selected" });
+  }
+
+  try {
+
+    // Preserve exact order from frontend
+    const data = selectedIndexes.map(i => fullData[i]).filter(Boolean);
+
+    if (data.length === 0) {
+      return res.status(400).json({ message: "No records found for PDF" });
+    }
+
+    const PDFDocument = require("pdfkit");
+
+    const doc = new PDFDocument({
+      size: "A4",
+      layout: "landscape",
+      margin: 40
+    });
+
+    const safeName = (fileName || "User_Trips_Report")
+      .replace(/\s+/g, "_");
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${safeName}.pdf"`
+    );
+
+    doc.pipe(res);
+
+    // ================= TITLE =================
+    doc.font("Helvetica-Bold")
+       .fontSize(16)
+       .text("User Trips Report", { align: "center" });
+
+    doc.moveDown(1);
+
+    const pageWidth =
+      doc.page.width - doc.page.margins.left - doc.page.margins.right;
+
+    // Column Width Logic (S.No small, others auto)
+    const columnWidths = {};
+
+    columns.forEach(col => {
+      if (col === "serialNumber") {
+        columnWidths[col] = 50;
+      } else {
+        columnWidths[col] = null;
+      }
+    });
+
+    const usedWidth = Object.values(columnWidths)
+      .filter(w => w !== null)
+      .reduce((a, b) => a + b, 0);
+
+    const remainingCols = columns.filter(c => columnWidths[c] === null);
+    const remainingWidth = pageWidth - usedWidth;
+    const equalWidth = remainingWidth / remainingCols.length;
+
+    remainingCols.forEach(col => {
+      columnWidths[col] = equalWidth;
+    });
+
+    const COLUMN_LABELS = {
+      serialNumber: "S. No.",
+      UserName: "User Name",
+      UserId: "User Id",
+      MemberName: "Member Name",
+      AccountNumber: "Account Number",
+      BranchName: "Branch Name",
+      MonthYear: "Month Year",
+      VisitDate: "Date",
+      TotalDistance: "Total Distance",
+      DistanceTravelled: "Distance Travelled",
+      StartLocation: "Start Location",
+      EndLocation: "End Location"
+    };
+
+    let y = doc.y;
+    const drawHeader = () => {
+
+  let x = doc.page.margins.left;
+
+  doc.font("Helvetica-Bold").fontSize(10);
+
+  // 🔥 Calculate dynamic header height
+  let headerHeight = 25;
+
+  columns.forEach(col => {
+
+    const textHeight = doc.heightOfString(COLUMN_LABELS[col], {
+      width: columnWidths[col] - 10
+    });
+
+    headerHeight = Math.max(headerHeight, textHeight + 10);
+  });
+
+  columns.forEach(col => {
+
+    doc.rect(x, y, columnWidths[col], headerHeight)
+       .fillAndStroke("#e2e8f0", "#94a3b8");
+
+    doc.fillColor("#000")
+       .text(COLUMN_LABELS[col], x + 5, y + 5, {
+         width: columnWidths[col] - 10,
+         align: "center"
+       });
+
+    x += columnWidths[col];
+  });
+
+  y += headerHeight;
+
+  doc.font("Helvetica").fontSize(9);
+};
+
+    drawHeader();
+
+    // ================= ROWS =================
+    data.forEach((row, index) => {
+
+      let x = doc.page.margins.left;
+      let dynamicHeight = 20;
+
+      columns.forEach(col => {
+
+        let value =
+          col === "serialNumber"
+            ? selectedIndexes[index] + 1
+            : row[col] ?? "";
+
+        if (col === "VisitDate" && value) {
+          value = value.toString().split("T")[0];
+        }
+
+        const textHeight = doc.heightOfString(String(value), {
+          width: columnWidths[col] - 10
+        });
+
+        dynamicHeight = Math.max(dynamicHeight, textHeight + 10);
+      });
+
+      if (y + dynamicHeight > doc.page.height - 40) {
+        doc.addPage({
+          size: "A4",
+          layout: "landscape",
+          margin: 40
+        });
+        y = doc.page.margins.top;
+        drawHeader();
+      }
+
+      columns.forEach(col => {
+
+        let value =
+          col === "serialNumber"
+            ? selectedIndexes[index] + 1
+            : row[col] ?? "";
+
+        if (col === "VisitDate" && value) {
+          value = value.toString().split("T")[0];
+        }
+
+        doc.rect(x, y, columnWidths[col], dynamicHeight).stroke();
+
+        doc.text(String(value), x + 5, y + 5, {
+          width: columnWidths[col] - 10,
+          align: "center"
+        });
+
+        x += columnWidths[col];
+      });
+
+      y += dynamicHeight;
+    });
+
+    doc.end();
+
+  } catch (err) {
+    console.error("❌ USER TRIPS PDF ERROR:", err);
+    res.status(500).json({ message: "Failed to generate PDF" });
+  }
+});
+
 
 // =====================================================================
-// LEAD DATA REPORT (SEARCH)
+// LEAD DATA REPORT
 // =====================================================================
 app.post("/api/lead-data-report", async (req, res) => {
   const { userId, cluster, branch, fromDate, toDate } = req.body;
+
+  if (!userId && !cluster && !branch && !fromDate && !toDate) {
+    return res.json([]);
+  }
 
   try {
     const pool = await poolPromise;
@@ -3065,9 +4623,196 @@ app.post("/api/lead-data-report", async (req, res) => {
   }
 });
 
+// ============================================================
+// LEAD DATA REPORT → EXPORT PDF
+// ============================================================
+
+app.post("/api/lead-data-report/export-pdf", async (req, res) => {
+  const { selectedIndexes, columns, fileName, fullData } = req.body;
+
+  if (!selectedIndexes || selectedIndexes.length === 0) {
+    return res.status(400).json({ message: "No records selected" });
+  }
+
+  if (!columns || columns.length === 0) {
+    return res.status(400).json({ message: "No columns selected" });
+  }
+
+  try {
+
+    // Preserve exact order from frontend
+    const data = selectedIndexes.map(i => fullData[i]).filter(Boolean);
+
+    if (data.length === 0) {
+      return res.status(400).json({ message: "No records found" });
+    }
+
+    const PDFDocument = require("pdfkit");
+
+    const doc = new PDFDocument({
+      size: "A4",
+      layout: "landscape",
+      margin: 40
+    });
+
+    const safeName = (fileName || "Lead_Data_Report")
+      .replace(/\s+/g, "_");
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${safeName}.pdf"`
+    );
+
+    doc.pipe(res);
+
+    // ================= TITLE =================
+    doc.font("Helvetica-Bold")
+       .fontSize(16)
+       .text("Lead Data Report", { align: "center" });
+
+    doc.moveDown(1);
+
+    const pageWidth =
+      doc.page.width - doc.page.margins.left - doc.page.margins.right;
+
+    // Column Width Logic
+    const columnWidths = {};
+
+const totalColumns = columns.length;
+
+// Special width for S.No
+const serialWidth = columns.includes("serialNumber") ? 50 : 0;
+
+const availableWidth = pageWidth - serialWidth;
+
+// Remaining columns
+const otherColumns = columns.filter(col => col !== "serialNumber");
+
+// Distribute evenly so total ALWAYS fits page
+const equalWidth = availableWidth / otherColumns.length;
+
+columns.forEach(col => {
+  if (col === "serialNumber") {
+    columnWidths[col] = 50;
+  } else {
+    columnWidths[col] = equalWidth;
+  }
+});
+
+    const COLUMN_LABELS = {
+      serialNumber: "S. No.",
+      BranchName: "Branch Name",
+      UserName: "User Name",
+      MemberName: "Member Name",
+      MemberAddress: "Member Address",
+      MemberMobileNumber: "Member Mobile Number",
+      ProductCategory: "Product Category",
+      InitialProduct: "Initial Product",
+      InterestedProduct: "Interested Product",
+      DateOfEntry: "Date Of Entry",
+      DateOfVisit: "Date Of Visit",
+      ActivityStatus: "Activity Status"
+    };
+
+    let y = doc.y;
+
+    // 🔥 Dynamic Header Height
+    const drawHeader = () => {
+      let x = doc.page.margins.left;
+
+      doc.font("Helvetica-Bold").fontSize(10);
+
+      let headerHeight = 25;
+
+      columns.forEach(col => {
+        const textHeight = doc.heightOfString(COLUMN_LABELS[col], {
+          width: columnWidths[col] - 10
+        });
+
+        headerHeight = Math.max(headerHeight, textHeight + 12);
+      });
+
+      columns.forEach(col => {
+        doc.rect(x, y, columnWidths[col], headerHeight)
+           .fillAndStroke("#e2e8f0", "#94a3b8");
+
+        doc.fillColor("#000")
+           .text(COLUMN_LABELS[col], x + 5, y + 6, {
+             width: columnWidths[col] - 10,
+             align: "center"
+           });
+
+        x += columnWidths[col];
+      });
+
+      y += headerHeight;
+      doc.font("Helvetica").fontSize(9);
+    };
+
+    drawHeader();
+
+    // ================= ROWS =================
+    data.forEach((row, index) => {
+
+      let x = doc.page.margins.left;
+      let dynamicHeight = 20;
+
+      columns.forEach(col => {
+
+        const value =
+          col === "serialNumber"
+            ? selectedIndexes[index] + 1
+            : row[col] ?? "";
+
+        const textHeight = doc.heightOfString(String(value), {
+          width: columnWidths[col] - 10
+        });
+
+        dynamicHeight = Math.max(dynamicHeight, textHeight + 10);
+      });
+
+      if (y + dynamicHeight > doc.page.height - 40) {
+        doc.addPage({
+          size: "A4",
+          layout: "landscape",
+          margin: 40
+        });
+        y = doc.page.margins.top;
+        drawHeader();
+      }
+
+      columns.forEach(col => {
+
+        const value =
+          col === "serialNumber"
+            ? selectedIndexes[index] + 1
+            : row[col] ?? "";
+
+        doc.rect(x, y, columnWidths[col], dynamicHeight).stroke();
+
+        doc.text(String(value), x + 5, y + 5, {
+          width: columnWidths[col] - 10,
+          align: "center"
+        });
+
+        x += columnWidths[col];
+      });
+
+      y += dynamicHeight;
+    });
+
+    doc.end();
+
+  } catch (err) {
+    console.error("❌ LEAD DATA PDF ERROR:", err);
+    res.status(500).json({ message: "Failed to generate PDF" });
+  }
+});
+
 
 // =============================
-// LEAD DATA UPLOAD (FINAL)
+// LEAD DATA UPLOAD (UPDATED SCHEMA)
 // =============================
 
 const parseDate = (value) => {
@@ -3081,18 +4826,8 @@ const normalizeText = (value) => {
   return value.toString().trim();
 };
 
-// DB constraint values
-const ALLOWED_LEAD_CATEGORIES = [
-  "Known Lead",
-  "Unknown Lead"
-];
-
-// Business Lead Types
-const ALLOWED_LEAD_TYPES = [
-  "Hot Lead",
-  "Warm Lead",
-  "Cold Lead"
-];
+const ALLOWED_LEAD_CATEGORIES = ["Known Lead", "Unknown Lead"];
+const ALLOWED_LEAD_TYPES = ["Hot Lead", "Warm Lead", "Cold Lead"];
 
 app.post("/api/leads/upload", async (req, res) => {
   const leads = req.body;
@@ -3107,41 +4842,31 @@ app.post("/api/leads/upload", async (req, res) => {
   try {
     await transaction.begin();
 
-    // =====================================
-    // STEP 1 — DELETE OLD LEADS
-    // =====================================
+    // STEP 1 — DELETE OLD DATA
     await new sql.Request(transaction).query(`
       DELETE FROM dbo.Leads_Data
     `);
 
-    // =====================================
-    // STEP 2 — INSERT NEW LEADS
-    // =====================================
+    // STEP 2 — INSERT NEW DATA
     for (const lead of leads) {
       const request = new sql.Request(transaction);
 
       const leadCategory = normalizeText(lead.LeadCategory);
       const leadType = normalizeText(lead.SelectLeadType);
 
-      // ---------------- VALIDATIONS ----------------
       if (!ALLOWED_LEAD_CATEGORIES.includes(leadCategory)) {
-        throw new Error(
-          `Invalid LeadCategory: "${lead.LeadCategory}". Allowed: Known Lead, Unknown Lead`
-        );
+        throw new Error(`Invalid LeadCategory`);
       }
 
       if (!ALLOWED_LEAD_TYPES.includes(leadType)) {
-        throw new Error(
-          `Invalid SelectLeadType: "${lead.SelectLeadType}". Allowed: Hot Lead, Warm Lead, Cold Lead`
-        );
+        throw new Error(`Invalid SelectLeadType`);
       }
 
-      // ---------------- PARAMETERS ----------------
       request.input("BranchCode", sql.VarChar, normalizeText(lead.BranchCode));
       request.input("BranchName", sql.VarChar, normalizeText(lead.BranchName));
+      request.input("ClusterName", sql.VarChar, normalizeText(lead.ClusterName));
       request.input("UserID", sql.VarChar, normalizeText(lead.UserID));
       request.input("UserName", sql.VarChar, normalizeText(lead.UserName));
-      request.input("AssignedTo", sql.VarChar, normalizeText(lead.AssignedTo));
       request.input("LeadCategory", sql.VarChar, leadCategory);
       request.input("FullName", sql.VarChar, normalizeText(lead.FullName || lead.FirstName));
       request.input("MobileNumber", sql.VarChar, normalizeText(lead.MobileNumber));
@@ -3151,20 +4876,14 @@ app.post("/api/leads/upload", async (req, res) => {
       request.input("ProductCategory", sql.VarChar, normalizeText(lead.ProductCategory));
       request.input("SelectProduct", sql.VarChar, normalizeText(lead.SelectProduct));
       request.input("SelectLeadType", sql.VarChar, leadType);
-      request.input("LeadStatus", sql.VarChar, normalizeText(lead.LeadStatus));
-      request.input("ScheduledTime", sql.DateTime, parseDate(lead.ScheduledTime));
-      request.input("ScheduledVisit", sql.DateTime, parseDate(lead.ScheduledVisit));
-      request.input("CalledAt", sql.DateTime, parseDate(lead.CalledAt));
-      request.input("VisitedAt", sql.DateTime, parseDate(lead.VisitedAt));
 
-      // ---------- INSERT INTO MAIN TABLE ----------
+      // MAIN TABLE
       await request.query(`
         INSERT INTO dbo.Leads_Data (
           BranchCode,
           BranchName,
           UserID,
           UserName,
-          AssignedTo,
           LeadCategory,
           FullName,
           MobileNumber,
@@ -3174,18 +4893,14 @@ app.post("/api/leads/upload", async (req, res) => {
           ProductCategory,
           SelectProduct,
           SelectLeadType,
-          LeadStatus,
-          ScheduledTime,
-          ScheduledVisit,
-          CalledAt,
-          VisitedAt,
-          TimeStamp
-        ) VALUES (
+          TimeStamp,
+          ClusterName
+        )
+        VALUES (
           @BranchCode,
           @BranchName,
           @UserID,
           @UserName,
-          @AssignedTo,
           @LeadCategory,
           @FullName,
           @MobileNumber,
@@ -3195,23 +4910,18 @@ app.post("/api/leads/upload", async (req, res) => {
           @ProductCategory,
           @SelectProduct,
           @SelectLeadType,
-          @LeadStatus,
-          @ScheduledTime,
-          @ScheduledVisit,
-          @CalledAt,
-          @VisitedAt,
-          GETDATE()
+          GETDATE(),
+          @ClusterName
         )
       `);
 
-      // ---------- INSERT INTO HISTORY TABLE ----------
+      // HISTORY TABLE
       await request.query(`
         INSERT INTO dbo.Leads_Data_History (
           BranchCode,
           BranchName,
           UserID,
           UserName,
-          AssignedTo,
           LeadCategory,
           FullName,
           MobileNumber,
@@ -3221,19 +4931,15 @@ app.post("/api/leads/upload", async (req, res) => {
           ProductCategory,
           SelectProduct,
           SelectLeadType,
-          LeadStatus,
-          ScheduledTime,
-          ScheduledVisit,
-          CalledAt,
-          VisitedAt,
           TimeStamp,
-          UploadedAt
-        ) VALUES (
+          UploadedAt,
+          ClusterName
+        )
+        VALUES (
           @BranchCode,
           @BranchName,
           @UserID,
           @UserName,
-          @AssignedTo,
           @LeadCategory,
           @FullName,
           @MobileNumber,
@@ -3243,13 +4949,9 @@ app.post("/api/leads/upload", async (req, res) => {
           @ProductCategory,
           @SelectProduct,
           @SelectLeadType,
-          @LeadStatus,
-          @ScheduledTime,
-          @ScheduledVisit,
-          @CalledAt,
-          @VisitedAt,
           GETDATE(),
-          GETDATE()
+          GETDATE(),
+          @ClusterName
         )
       `);
     }
@@ -3258,7 +4960,7 @@ app.post("/api/leads/upload", async (req, res) => {
 
     res.json({
       message: "Leads uploaded successfully",
-      uploaded: leads.length
+      count: leads.length
     });
 
   } catch (err) {
@@ -3279,8 +4981,6 @@ app.post("/api/leads/upload", async (req, res) => {
 
 app.post("/api/lead/list/search", async (req, res) => {
   try {
-    console.log("SEARCH FILTERS:", req.body);
-
     const {
       memberName,
       mobileNumber,
@@ -3288,9 +4988,11 @@ app.post("/api/lead/list/search", async (req, res) => {
       cluster,
       branch,
       product,
-      assignedTo,
       leadType
     } = req.body;
+
+    const pool = await sql.connect(dbConfig);
+    const request = pool.request();
 
     let sqlQuery = `
       SELECT
@@ -3299,68 +5001,79 @@ app.post("/api/lead/list/search", async (req, res) => {
         L.MobileNumber    AS mobileNumber,
         L.BranchName      AS branch,
         L.SelectLeadType  AS leadType,
-        L.LeadStatus      AS status
+        L.ClusterName     AS cluster,
+        L.SelectProduct   AS product,
+        L.TimeStamp
       FROM smart_call.dbo.Leads_Data L
-      INNER JOIN smart_call.dbo.Branch_Cluster_Master B
-        ON L.BranchName = B.branch_name
       WHERE 1 = 1
     `;
 
-    const pool = await sql.connect(dbConfig);
-    const request = pool.request();
+    let filterApplied = false;
 
     // 🔎 Member Name
     if (memberName) {
       sqlQuery += " AND L.FullName LIKE @memberName";
-      request.input("memberName", `%${memberName}%`);
+      request.input("memberName", sql.VarChar, `%${memberName}%`);
+      filterApplied = true;
     }
 
-    // 🔎 Mobile Number
+    // 🔎 Mobile
     if (mobileNumber) {
       sqlQuery += " AND L.MobileNumber LIKE @mobileNumber";
-      request.input("mobileNumber", `%${mobileNumber}%`);
+      request.input("mobileNumber", sql.VarChar, `%${mobileNumber}%`);
+      filterApplied = true;
     }
 
     // 🔎 Pincode
     if (pincode) {
       sqlQuery += " AND L.PinCode = @pincode";
-      request.input("pincode", pincode);
+      request.input("pincode", sql.VarChar, pincode);
+      filterApplied = true;
     }
 
-    // 🔎 Cluster (NOW WORKS)
+    // 🔎 Cluster
     if (cluster) {
-      sqlQuery += " AND B.cluster_name = @cluster";
-      request.input("cluster", cluster);
+      if (cluster !== "Corporate Office") {
+        sqlQuery += " AND LTRIM(RTRIM(LOWER(L.ClusterName))) = LOWER(@cluster)";
+        request.input("cluster", sql.VarChar, cluster.trim());
+      }
+      // Corporate Office = no filter but still considered selected
+      filterApplied = true;
     }
 
     // 🔎 Branch
     if (branch) {
-      sqlQuery += " AND L.BranchName = @branch";
-      request.input("branch", branch);
+      sqlQuery += " AND LTRIM(RTRIM(LOWER(L.BranchName))) = LOWER(@branch)";
+      request.input("branch", sql.VarChar, branch.trim());
+      filterApplied = true;
     }
 
     // 🔎 Product
     if (product) {
       sqlQuery += " AND L.SelectProduct LIKE @product";
-      request.input("product", `%${product}%`);
-    }
-
-    // 🔎 Assigned To
-    if (assignedTo) {
-      sqlQuery += " AND L.AssignedTo LIKE @assignedTo";
-      request.input("assignedTo", `%${assignedTo}%`);
+      request.input("product", sql.VarChar, `%${product}%`);
+      filterApplied = true;
     }
 
     // 🔎 Lead Type
     if (leadType) {
-      sqlQuery += " AND L.SelectLeadType LIKE @leadType";
-      request.input("leadType", `%${leadType}%`);
+      sqlQuery += " AND L.SelectLeadType = @leadType";
+      request.input("leadType", sql.VarChar, leadType);
+      filterApplied = true;
     }
+
+    // ✅ IMPORTANT: If no filter applied → return empty
+    if (!filterApplied) {
+      return res.json([]);
+    }
+
+    sqlQuery += " ORDER BY L.TimeStamp DESC";
 
     console.log("FINAL SQL:", sqlQuery);
 
     const result = await request.query(sqlQuery);
     res.json(result.recordset);
+
   } catch (err) {
     console.error("Lead List Search Error:", err);
     res.status(500).json([]);
@@ -3369,7 +5082,7 @@ app.post("/api/lead/list/search", async (req, res) => {
 
 
 // =============================
-// LEAD LIST SEARCH (Leads_Data)
+// LEAD ACTIVITY STATUS (STRICT MODE)
 // =============================
 app.post("/api/leads-data/search", async (req, res) => {
   try {
@@ -3378,11 +5091,12 @@ app.post("/api/leads-data/search", async (req, res) => {
       mobileNumber = "",
       pincode = "",
       cluster = "",
-      branch = "",
+      branchName = "",
       product = "",
-      assignedTo = "",
       leadType = "",
-      leadStatus = ""
+      leadStatus = "",
+      assignedTo = "",
+      closedBy = ""
     } = req.body;
 
     const pool = await poolPromise;
@@ -3396,66 +5110,95 @@ app.post("/api/leads-data/search", async (req, res) => {
         L.BranchName      AS branchName,
         L.SelectProduct   AS product,
         L.SelectLeadType  AS leadType,
-        L.LeadStatus      AS leadStatus,
-        L.AssignedTo      AS assignedTo
+        L.ClusterName     AS cluster,
+        A.LeadStatus      AS leadStatus,
+        A.AssignedTo      AS assignedTo,
+        A.ClosedBy        AS closedBy,
+        L.TimeStamp
       FROM smart_call.dbo.Leads_Data L
-      LEFT JOIN smart_call.dbo.Branch_Cluster_Master B
-        ON L.BranchName = B.branch_name
+      LEFT JOIN smart_call.dbo.Lead_Activity_Status A
+        ON L.SNo = A.SNo
       WHERE 1 = 1
     `;
 
+    let filterApplied = false;
+
     // 🔎 Member Name
-    if (memberName) {
-      query += " AND L.FullName LIKE @memberName";
-      request.input("memberName", sql.VarChar, `%${memberName}%`);
+    if (memberName.trim()) {
+      query += " AND LOWER(L.FullName) LIKE LOWER(@memberName)";
+      request.input("memberName", sql.VarChar, `%${memberName.trim()}%`);
+      filterApplied = true;
     }
 
-    // 🔎 Mobile Number
-    if (mobileNumber) {
+    // 🔎 Mobile
+    if (mobileNumber.trim()) {
       query += " AND L.MobileNumber LIKE @mobileNumber";
-      request.input("mobileNumber", sql.VarChar, `%${mobileNumber}%`);
+      request.input("mobileNumber", sql.VarChar, `%${mobileNumber.trim()}%`);
+      filterApplied = true;
     }
 
     // 🔎 Pincode
-    if (pincode) {
+    if (pincode.trim()) {
       query += " AND L.PinCode = @pincode";
-      request.input("pincode", sql.VarChar, pincode);
+      request.input("pincode", sql.VarChar, pincode.trim());
+      filterApplied = true;
     }
 
-    // 🔎 Cluster (via Branch master)
-    if (cluster && cluster !== "Corporate Office") {
-      query += " AND B.cluster_name = @cluster";
-      request.input("cluster", sql.VarChar, cluster);
+    // 🔎 Cluster
+    if (cluster.trim()) {
+      filterApplied = true;
+
+      if (cluster !== "Corporate Office") {
+        query += " AND LOWER(L.ClusterName) LIKE LOWER(@cluster)";
+        request.input("cluster", sql.VarChar, `%${cluster.trim()}%`);
+      }
     }
 
     // 🔎 Branch
-    if (branch) {
-      query += " AND L.BranchName = @branch";
-      request.input("branch", sql.VarChar, branch);
+    if (branchName.trim()) {
+      query += " AND LOWER(L.BranchName) LIKE LOWER(@branchName)";
+      request.input("branchName", sql.VarChar, `%${branchName.trim()}%`);
+      filterApplied = true;
     }
 
     // 🔎 Product
-    if (product) {
-      query += " AND L.SelectProduct = @product";
-      request.input("product", sql.VarChar, product);
-    }
-
-    // 🔎 Assigned To
-    if (assignedTo) {
-      query += " AND L.AssignedTo = @assignedTo";
-      request.input("assignedTo", sql.VarChar, assignedTo);
+    if (product.trim()) {
+      query += " AND LOWER(L.SelectProduct) LIKE LOWER(@product)";
+      request.input("product", sql.VarChar, `%${product.trim()}%`);
+      filterApplied = true;
     }
 
     // 🔎 Lead Type
-    if (leadType) {
+    if (leadType.trim()) {
       query += " AND L.SelectLeadType = @leadType";
-      request.input("leadType", sql.VarChar, leadType);
+      request.input("leadType", sql.VarChar, leadType.trim());
+      filterApplied = true;
     }
 
     // 🔎 Lead Status
-    if (leadStatus) {
-      query += " AND L.LeadStatus = @leadStatus";
-      request.input("leadStatus", sql.VarChar, leadStatus);
+    if (leadStatus.trim()) {
+      query += " AND A.LeadStatus = @leadStatus";
+      request.input("leadStatus", sql.VarChar, leadStatus.trim());
+      filterApplied = true;
+    }
+
+    // 🔎 Assigned To
+    if (assignedTo.trim()) {
+      query += " AND A.AssignedTo = @assignedTo";
+      request.input("assignedTo", sql.VarChar, assignedTo.trim());
+      filterApplied = true;
+    }
+
+    // 🔎 Closed By
+    if (closedBy.trim()) {
+      query += " AND A.ClosedBy = @closedBy";
+      request.input("closedBy", sql.VarChar, closedBy.trim());
+      filterApplied = true;
+    }
+
+    // ✅ No filter selected → return empty
+    if (!filterApplied) {
+      return res.json([]);
     }
 
     query += " ORDER BY L.TimeStamp DESC";
@@ -3519,9 +5262,9 @@ app.post("/api/login", async (req, res) => {
     }
 
     // 4. Check role access (optional rules)
-    if (!["ADMIN"].includes(user.Role)) {
-      return res.status(403).json({ message: "User role not authorized for dashboard" });
-    }
+    if (!user || !["Admin", "Branch Manager"].includes(user.Role)) {
+  return res.status(403).json({ message: "User role not authorized for dashboard" });
+}
 
 
     // 5. Successful login
@@ -4091,6 +5834,7 @@ app.post("/api/activity/session/end", async (req, res) => {
   }
 });
 
+
 // ======================
 // Activity Status
 // ======================
@@ -4147,23 +5891,36 @@ app.post("/api/activity-status/search", async (req, res) => {
       request.input("product", product);
     }
 	
-	if (queue) {
-  query += ` AND R.QueueType = @queue`;
-  request.input("queue", queue);
+	// ================= Queue Filter =================
+if (queue === "NPA") {
+  query += ` AND R.dpdQueue >= '04'`;
+}
+else if (queue === "Marketing") {
+  query += ` AND R.QueueType = 'Marketing'`;
+}
+else if (queue === "Welcome Call") {
+  query += ` AND R.QueueType = 'Welcome Call'`;
 }
 
-if (dpdQueue === "30") {
-  query += ` AND R.DPD BETWEEN 1 AND 30`;
-}
+// ================= DPD Queue Filter =================
+if (dpdQueue) {
 
-if (dpdQueue === "60") {
-  query += ` AND R.DPD BETWEEN 31 AND 60`;
-}
+  if (dpdQueue === "0-30") {
+    query += ` AND R.dpdQueue = '01'`;
+  }
 
-if (dpdQueue === "60+") {
-  query += ` AND R.DPD > 60`;
-}
+  else if (dpdQueue === "31-60") {
+    query += ` AND R.dpdQueue = '02'`;
+  }
 
+  else if (dpdQueue === "61-90") {
+    query += ` AND R.dpdQueue = '03'`;
+  }
+
+  else if (dpdQueue === "90+") {
+    query += ` AND R.dpdQueue >= '04'`;
+  }
+}
 
     if (loanAccount) {
       query += ` AND R.loanAccountNumber = @loanAccount`;
@@ -4180,16 +5937,16 @@ if (dpdQueue === "60+") {
       request.input("assignedTo", assignedTo);
     }
 
-    if (cluster && cluster !== "Corporate Office") {
-      query += `
-        AND R.branchCode IN (
-          SELECT branch_code
-          FROM Branch_Cluster_Master
-          WHERE cluster_name = @cluster
-        )
-      `;
-      request.input("cluster", cluster);
-    }
+   if (cluster && cluster !== "Corporate Office") {
+  query += `
+    AND R.branchName IN (
+      SELECT branch_name
+      FROM Branch_Cluster_Master
+      WHERE cluster_name = @cluster
+    )
+  `;
+  request.input("cluster", cluster);
+}
 
     const result = await request.query(query);
     return res.json(result.recordset);
@@ -4246,30 +6003,1252 @@ app.post("/api/activity-details", async (req, res) => {
     const logs = logsResult.recordset;
 
     // 3️⃣ Group logs under sessions
-    const response = sessions.map(session => {
-      const actions = logs
-        .filter(l => l.SessionId === session.SessionId)
-        .map(l => `• ${l.ActionLabel}`)
-        .join("\n");
+const response = sessions.map(session => {
 
-      return {
-        activityDate: session.activityDate,
-        activityTime: session.activityTime,
-        userName: session.userName,
-        activityType: session.SessionType,
-        activityStatus: session.SessionStatus,
-        notes: actions
-      };
-    });
+  const sessionLogs = logs
+    .filter(l => l.SessionId === session.SessionId);
+
+  const actions = sessionLogs
+    .map((l, index) => `${index + 1}. ${l.ActionLabel}`)
+    .join("\n");
+
+  return {
+    activityDate: session.activityDate,
+    activityTime: session.activityTime,
+    userName: session.userName,
+    activityType: session.SessionType,
+
+    // Show numbered logs under Activity Status
+    activityStatus: actions || "",
+
+    // Keep Notes column empty
+    notes: ""
+  };
+});
 
     res.json(response);
 
   } catch (err) {
     console.error("ACTIVITY DETAILS ERROR:", err);
     res.status(500).json([]);
+	
   }
 });
 
+// ============================================================
+// ACTIVITY STATUS → EXPORT PDF (MATCHES TRANSACTION FORMAT)
+// ============================================================
+
+app.post("/api/activity-status/export-pdf", async (req, res) => {
+  const { selectedIds, columns, fileName, serialData } = req.body;
+
+  if (!selectedIds || selectedIds.length === 0) {
+    return res.status(400).json({ message: "No records selected" });
+  }
+
+  if (!columns || columns.length === 0) {
+    return res.status(400).json({ message: "No columns selected" });
+  }
+
+  try {
+    const pool = await poolPromise;
+    const request = pool.request();
+
+    selectedIds.forEach((id, index) => {
+      request.input(`id${index}`, sql.VarChar, id);
+    });
+
+    // 🔥 Preserve exact selected order
+    const orderCase = selectedIds
+      .map((id, index) => `WHEN R.loanAccountNumber = @id${index} THEN ${index}`)
+      .join(" ");
+
+    const result = await request.query(`
+      SELECT 
+        R.firstname AS memberName,
+        R.loanAccountNumber,
+        R.mobileNumber,
+        R.branchName,
+        A.AssignedToUserName AS assignedTo,
+        S.SessionId,
+        CONVERT(varchar, S.StartedAt, 105) AS activityDate,
+        FORMAT(S.StartedAt, 'hh:mm tt') AS activityTime,
+        S.SessionType,
+        S.SessionStatus,
+        L.ActionLabel
+      FROM dbo.Recovery_Raw_Data R
+      INNER JOIN Account_Assignments A
+        ON A.LoanAccountNumber = R.loanAccountNumber
+      LEFT JOIN Activity_Sessions S
+        ON S.LoanAccountNumber = R.loanAccountNumber
+      LEFT JOIN Activity_Logs L
+        ON L.SessionId = S.SessionId
+      WHERE R.loanAccountNumber IN (${selectedIds.map((_, i) => `@id${i}`).join(",")})
+      ORDER BY CASE ${orderCase} END, S.StartedAt DESC
+    `);
+
+    if (!result.recordset.length) {
+      return res.status(400).json({ message: "No records found for PDF" });
+    }
+
+    // ================= GROUP DATA =================
+
+    const grouped = {};
+
+    result.recordset.forEach(row => {
+
+      if (!grouped[row.loanAccountNumber]) {
+        grouped[row.loanAccountNumber] = {
+          memberName: row.memberName,
+          loanAccountNumber: row.loanAccountNumber,
+          mobileNumber: row.mobileNumber,
+          branchName: row.branchName,
+          assignedTo: row.assignedTo,
+          sessions: {}
+        };
+      }
+
+      if (row.SessionId) {
+
+        if (!grouped[row.loanAccountNumber].sessions[row.SessionId]) {
+          grouped[row.loanAccountNumber].sessions[row.SessionId] = {
+            date: row.activityDate,
+            time: row.activityTime,
+            type: row.SessionType,
+            status: row.SessionStatus,
+            logs: new Set()
+          };
+        }
+
+        if (row.ActionLabel) {
+          grouped[row.loanAccountNumber]
+            .sessions[row.SessionId]
+            .logs.add(row.ActionLabel);
+        }
+      }
+    });
+
+    const data = Object.values(grouped);
+
+    // Attach serial from frontend
+    if (serialData && Array.isArray(serialData)) {
+      const serialMap = {};
+      serialData.forEach(item => {
+        serialMap[item.loanAccountNumber] = item.serialNumber;
+      });
+
+      data.forEach(row => {
+        row.serialNumber = serialMap[row.loanAccountNumber] || "";
+      });
+    }
+
+    // Build activity text
+    data.forEach(row => {
+      const activityText = Object.values(row.sessions)
+        .map(session => {
+          const logs = [...session.logs]
+            .map(l => `• ${l}`)
+            .join("\n");
+
+          return `Date: ${session.date}
+Time: ${session.time}
+Type: ${session.type}
+Status: ${session.status}
+${logs}`;
+        })
+        .join("\n\n");
+
+      row.activityDetails = activityText || "No Activity";
+    });
+
+    // ================= PDF START =================
+
+    const PDFDocument = require("pdfkit");
+
+    const doc = new PDFDocument({
+      size: "A4",
+      layout: "landscape",
+      margin: 40
+    });
+
+    const safeName = (fileName || "Activity_Report").replace(/\s+/g, "_");
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${safeName}.pdf"`
+    );
+
+    doc.pipe(res);
+
+    // ================= TITLE =================
+    doc.font("Helvetica-Bold")
+       .fontSize(16)
+       .text("Activity Status Report", { align: "center" });
+
+    doc.moveDown(1);
+
+    const pageWidth =
+      doc.page.width - doc.page.margins.left - doc.page.margins.right;
+
+    // ===== SAME COLUMN WIDTH LOGIC AS TRANSACTION =====
+
+    const columnWidths = {};
+
+    columns.forEach(col => {
+      if (col === "serialNumber") {
+        columnWidths[col] = 50;
+      } else {
+        columnWidths[col] = null;
+      }
+    });
+
+    const usedWidth = Object.values(columnWidths)
+      .filter(w => w !== null)
+      .reduce((a, b) => a + b, 0);
+
+    const remainingCols = columns.filter(col => columnWidths[col] === null);
+    const equalWidth = (pageWidth - usedWidth) / remainingCols.length;
+
+    remainingCols.forEach(col => {
+      columnWidths[col] = equalWidth;
+    });
+
+    const rowHeight = 22;
+
+    const COLUMN_LABELS = {
+      serialNumber: "S. No.",
+      memberName: "Member",
+      loanAccountNumber: "Loan A/c #",
+      mobileNumber: "Mobile",
+      branchName: "Branch",
+      assignedTo: "Assigned To",
+      activityDetails: "Activity Details"
+    };
+
+    let y = doc.y;
+
+    const drawHeader = () => {
+      let x = doc.page.margins.left;
+
+      doc.font("Helvetica-Bold").fontSize(10);
+
+      columns.forEach(col => {
+        doc.rect(x, y, columnWidths[col], rowHeight)
+           .fillAndStroke("#e2e8f0", "#94a3b8");
+
+        doc.fillColor("#000")
+           .text(COLUMN_LABELS[col], x + 5, y + 6, {
+             width: columnWidths[col] - 10,
+             align: "center"
+           });
+
+        x += columnWidths[col];
+      });
+
+      y += rowHeight;
+      doc.font("Helvetica").fontSize(9);
+    };
+
+    drawHeader();
+
+    // ================= ROWS =================
+
+    data.forEach((row, index) => {
+
+      let x = doc.page.margins.left;
+      let dynamicHeight = 20;
+
+      columns.forEach(col => {
+        const text = String(row[col] ?? "");
+        const textHeight = doc.heightOfString(text, {
+          width: columnWidths[col] - 10
+        });
+        dynamicHeight = Math.max(dynamicHeight, textHeight + 10);
+      });
+
+      if (y + dynamicHeight > doc.page.height - 40) {
+        doc.addPage({
+          size: "A4",
+          layout: "landscape",
+          margin: 40
+        });
+        y = doc.page.margins.top;
+        drawHeader();
+      }
+
+      if (index % 2 === 0) {
+        doc.rect(x, y, pageWidth, dynamicHeight)
+           .fill("#f8fafc");
+      }
+
+      columns.forEach(col => {
+        doc.rect(x, y, columnWidths[col], dynamicHeight).stroke();
+
+        doc.fillColor("#000")
+           .text(String(row[col] ?? ""), x + 5, y + 5, {
+             width: columnWidths[col] - 10
+           });
+
+        x += columnWidths[col];
+      });
+
+      y += dynamicHeight;
+    });
+
+    doc.end();
+
+  } catch (err) {
+    console.error("❌ ACTIVITY PDF ERROR:", err);
+    res.status(500).json({ message: "Failed to generate PDF" });
+  }
+});
+
+// ==========================================================
+// ACTIVITY STATUS ACTION API (Past / Future / Completed / Reactivate)
+// ==========================================================
+app.post("/api/activity-status/action", async (req, res) => {
+
+  const {
+    actionType,
+    selectedIds = [],
+    mobileNumber = "",
+    pincode = "",
+    branchName = "",
+    product = "",
+    assignedTo = "",
+    loanAccount = "",
+    memberName = "",
+    cluster = "",
+    queue = "",
+    dpdQueue = ""
+  } = req.body;
+
+  if (!actionType) {
+    return res.status(400).json({ message: "actionType is required" });
+  }
+
+  try {
+    const pool = await poolPromise;
+    const request = pool.request();
+
+    // ================= BASE QUERY =================
+    let baseQuery = `
+      FROM Account_Assignments A
+      INNER JOIN Recovery_Raw_Data R
+        ON R.loanAccountNumber = A.LoanAccountNumber
+      INNER JOIN CallRecovery_Status CRS
+        ON CRS.LoanAccountNumber = A.LoanAccountNumber
+      WHERE A.AssignmentStatus = 'Assigned'
+    `;
+
+    // ================= COMMON FILTERS =================
+
+    if (mobileNumber) {
+      baseQuery += ` AND R.mobileNumber = @mobileNumber`;
+      request.input("mobileNumber", mobileNumber);
+    }
+
+    if (pincode) {
+      baseQuery += ` AND R.pincode = @pincode`;
+      request.input("pincode", pincode);
+    }
+
+    if (branchName) {
+      baseQuery += ` AND R.branchName = @branchName`;
+      request.input("branchName", branchName);
+    }
+
+    if (product) {
+      baseQuery += ` AND R.product = @product`;
+      request.input("product", product);
+    }
+
+    if (loanAccount) {
+      baseQuery += ` AND R.loanAccountNumber = @loanAccount`;
+      request.input("loanAccount", loanAccount);
+    }
+
+    if (memberName) {
+      baseQuery += ` AND R.firstname LIKE '%' + @memberName + '%'`;
+      request.input("memberName", memberName);
+    }
+
+    if (assignedTo) {
+      baseQuery += ` AND A.AssignedToUserId = @assignedTo`;
+      request.input("assignedTo", assignedTo);
+    }
+
+    if (cluster && cluster !== "Corporate Office") {
+      baseQuery += `
+        AND R.branchName IN (
+          SELECT branch_name
+          FROM Branch_Cluster_Master
+          WHERE cluster_name = @cluster
+        )
+      `;
+      request.input("cluster", cluster);
+    }
+
+    // ================= Queue Filter =================
+    if (queue === "NPA") {
+      baseQuery += ` AND R.dpdQueue >= '04'`;
+    }
+    else if (queue === "Marketing") {
+      baseQuery += ` AND R.QueueType = 'Marketing'`;
+    }
+    else if (queue === "Welcome Call") {
+      baseQuery += ` AND R.QueueType = 'Welcome Call'`;
+    }
+
+    // ================= DPD Queue Filter =================
+    if (dpdQueue === "0-30") {
+      baseQuery += ` AND R.dpdQueue = '01'`;
+    }
+    else if (dpdQueue === "31-60") {
+      baseQuery += ` AND R.dpdQueue = '02'`;
+    }
+    else if (dpdQueue === "61-90") {
+      baseQuery += ` AND R.dpdQueue = '03'`;
+    }
+    else if (dpdQueue === "90+") {
+      baseQuery += ` AND R.dpdQueue >= '04'`;
+    }
+
+    // ======================================================
+    // 1️⃣ PAST SCHEDULE
+    // ======================================================
+    if (actionType === "past") {
+
+      const query = `
+        SELECT DISTINCT
+          R.firstname AS memberName,
+          R.loanAccountNumber,
+          R.mobileNumber,
+          R.branchName,
+          A.AssignedToUserName AS assignedTo,
+          CRS.ScheduleCallTimestamp,
+          CRS.ScheduleVisitTimestamp
+        ${baseQuery}
+        AND (
+      (CRS.ScheduleCallTimestamp IS NOT NULL 
+       AND CONVERT(date, CRS.ScheduleCallTimestamp) < CONVERT(date, GETDATE()))
+      OR
+      (CRS.ScheduleVisitTimestamp IS NOT NULL 
+       AND CONVERT(date, CRS.ScheduleVisitTimestamp) < CONVERT(date, GETDATE()))
+    )
+AND ISNULL(CRS.CompleteFlag,0) = 0
+AND ISNULL(CRS.Submitted,0) = 0
+      `;
+
+      const result = await request.query(query);
+      return res.json(result.recordset);
+    }
+
+    // ======================================================
+    // 2️⃣ FUTURE SCHEDULE
+    // ======================================================
+    if (actionType === "future") {
+
+      const query = `
+        SELECT DISTINCT
+          R.firstname AS memberName,
+          R.loanAccountNumber,
+          R.mobileNumber,
+          R.branchName,
+          A.AssignedToUserName AS assignedTo,
+          CRS.ScheduleCallTimestamp,
+          CRS.ScheduleVisitTimestamp
+        ${baseQuery}
+        AND (
+              (CRS.ScheduleCallTimestamp IS NOT NULL AND CRS.ScheduleCallTimestamp > GETDATE())
+              OR
+              (CRS.ScheduleVisitTimestamp IS NOT NULL AND CRS.ScheduleVisitTimestamp > GETDATE())
+            )
+        AND ISNULL(CRS.CompleteFlag,0) = 0
+        AND ISNULL(CRS.Submitted,0) = 0
+      `;
+
+      const result = await request.query(query);
+      return res.json(result.recordset);
+    }
+
+    // ======================================================
+    // 3️⃣ COMPLETED ACTIVITIES
+    // ======================================================
+    if (actionType === "completed") {
+
+      const query = `
+        SELECT DISTINCT
+          R.firstname AS memberName,
+          R.loanAccountNumber,
+          R.mobileNumber,
+          R.branchName,
+          A.AssignedToUserName AS assignedTo
+        ${baseQuery}
+        AND (
+              ISNULL(CRS.CompleteFlag,0) = 1
+              OR
+              ISNULL(CRS.Submitted,0) = 1
+            )
+      `;
+
+      const result = await request.query(query);
+      return res.json(result.recordset);
+    }
+
+// ======================================================
+// 4️⃣ RE-ACTIVATE (Update Only - No Delete)
+// ======================================================
+if (actionType === "reactivate") {
+
+  if (!selectedIds || selectedIds.length === 0) {
+    return res.status(400).json({ message: "No accounts selected" });
+  }
+
+  for (const loanAccount of selectedIds) {
+
+    // ✅ Update CallRecovery_Status (Update Only Existing Timestamp Column)
+await pool.request()
+  .input("loanAccountNumber", loanAccount)
+  .query(`
+    UPDATE CallRecovery_Status
+    SET
+      ScheduleCallTimestamp =
+        CASE
+          WHEN ScheduleCallTimestamp IS NOT NULL
+          THEN GETDATE()
+          ELSE ScheduleCallTimestamp
+        END,
+
+      ScheduleVisitTimestamp =
+        CASE
+          WHEN ScheduleVisitTimestamp IS NOT NULL
+          THEN GETDATE()
+          ELSE ScheduleVisitTimestamp
+        END,
+
+      PendingFlag = 1,
+      InProcessFlag = 0,
+      CompleteFlag = 0,
+      Submitted = 0,
+      UpdatedAt = GETDATE()
+
+    WHERE LoanAccountNumber = @loanAccountNumber
+  `);
+
+    // ✅ Insert into History Table
+    await pool.request()
+      .input("loanAccountNumber", loanAccount)
+      .query(`
+        INSERT INTO CallRecovery_Status_History
+        (
+          LoanAccountNumber,
+          ScheduleCallTimestamp,
+          ScheduleVisitTimestamp,
+          PendingFlag,
+          InProcessFlag,
+          CompleteFlag,
+          Submitted,
+          UpdatedTimeStamp
+        )
+        SELECT
+          LoanAccountNumber,
+          ScheduleCallTimestamp,
+          ScheduleVisitTimestamp,
+          PendingFlag,
+          InProcessFlag,
+          CompleteFlag,
+          Submitted,
+          GETDATE()
+        FROM CallRecovery_Status
+        WHERE LoanAccountNumber = @loanAccountNumber
+      `);
+
+    // ✅ Update Assignment
+    await pool.request()
+      .input("loanAccountNumber", loanAccount)
+      .query(`
+        UPDATE Account_Assignments
+        SET
+          WorkStatus = 'Reactivated',
+          WorkUpdatedAt = GETDATE()
+        WHERE LoanAccountNumber = @loanAccountNumber
+      `);
+  }
+
+  return res.json({ message: "Accounts reactivated successfully" });
+}
+    return res.status(400).json({ message: "Invalid actionType" });
+
+  } catch (err) {
+    console.error("ACTIVITY STATUS ACTION ERROR:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+
+// ======================================================
+// 1️⃣ GET ROLES (POST METHOD - SEARCH + PAGINATION)
+// ======================================================
+app.post("/api/roles/list", async (req, res) => {
+
+  const { name = "", page = 1, fetchAll = false } = req.body;
+
+  const pageNumber = parseInt(page);
+  const pageSize = 15;
+  const offset = (pageNumber - 1) * pageSize;
+
+  try {
+    const pool = await poolPromise;
+
+    // ==================================================
+    // 🔹 FETCH ALL (Used for Select All Across Pages)
+    // ==================================================
+    if (fetchAll === true) {
+
+      const allResult = await pool.request()
+        .input("name", sql.VarChar, `%${name}%`)
+        .query(`
+          SELECT RoleId
+          FROM smart_call.dbo.Roles
+          WHERE (@name = '%%' OR RoleName LIKE @name)
+          ORDER BY RoleId ASC
+        `);
+
+      return res.status(200).json({
+        records: allResult.recordset
+      });
+    }
+
+    // ==================================================
+    // 🔹 NORMAL PAGINATION FETCH
+    // ==================================================
+    const result = await pool.request()
+      .input("name", sql.VarChar, `%${name}%`)
+      .input("offset", sql.Int, offset)
+      .input("pageSize", sql.Int, pageSize)
+      .query(`
+        SELECT 
+          RoleId,
+          RoleName,
+          ValidFrom,
+          ValidTo,
+          CreatedAt
+        FROM smart_call.dbo.Roles
+        WHERE (@name = '%%' OR RoleName LIKE @name)
+        ORDER BY RoleId ASC
+        OFFSET @offset ROWS
+        FETCH NEXT @pageSize ROWS ONLY
+      `);
+
+    // 🔹 Total Count
+    const countResult = await pool.request()
+      .input("name", sql.VarChar, `%${name}%`)
+      .query(`
+        SELECT COUNT(*) AS total
+        FROM smart_call.dbo.Roles
+        WHERE (@name = '%%' OR RoleName LIKE @name)
+      `);
+
+    res.status(200).json({
+      records: result.recordset,
+      total: countResult.recordset[0].total,
+      page: pageNumber,
+      pageSize
+    });
+
+  } catch (err) {
+    console.error("❌ LIST ROLES ERROR:", err);
+    res.status(500).json({ message: "Failed to fetch roles" });
+  }
+});
+
+
+
+// ======================================================
+// 2️⃣ ADD ROLE
+// ======================================================
+app.post("/api/roles", async (req, res) => {
+
+  const { roleName, validFrom, validTo } = req.body;
+
+  if (!roleName || roleName.trim() === "") {
+    return res.status(400).json({ message: "Role name is required" });
+  }
+
+  try {
+    const pool = await poolPromise;
+
+    // 🔹 Duplicate Check
+    const exists = await pool.request()
+      .input("roleName", sql.VarChar, roleName.trim())
+      .query(`
+        SELECT COUNT(*) AS cnt
+        FROM smart_call.dbo.Roles
+        WHERE RoleName = @roleName
+      `);
+
+    if (exists.recordset[0].cnt > 0) {
+      return res.status(409).json({ message: "Role already exists" });
+    }
+
+    // 🔹 Insert Role
+    await pool.request()
+      .input("roleName", sql.VarChar, roleName.trim())
+      .input("validFrom", sql.Date, validFrom || null)
+      .input("validTo", sql.Date, validTo || null)
+      .query(`
+        INSERT INTO smart_call.dbo.Roles
+        (
+          RoleName,
+          ValidFrom,
+          ValidTo,
+          CreatedAt
+        )
+        VALUES
+        (
+          @roleName,
+          @validFrom,
+          @validTo,
+          GETDATE()
+        )
+      `);
+
+    res.status(201).json({ message: "Role added successfully" });
+
+  } catch (err) {
+    console.error("❌ ADD ROLE ERROR:", err);
+    res.status(500).json({ message: "Failed to add role" });
+  }
+});
+
+
+
+// ======================================================
+// 3️⃣ DELETE ROLES (MULTIPLE DELETE)
+// ======================================================
+app.post("/api/roles/delete", async (req, res) => {
+
+  const { ids } = req.body;
+
+  if (!ids || !Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ message: "No roles selected" });
+  }
+
+  try {
+    const pool = await poolPromise;
+    const request = pool.request();
+
+    ids.forEach((id, index) => {
+      request.input(`id${index}`, sql.Int, id);
+    });
+
+    await request.query(`
+      DELETE FROM smart_call.dbo.Roles
+      WHERE RoleId IN (${ids.map((_, i) => `@id${i}`).join(",")})
+    `);
+
+    res.status(200).json({ message: "Roles deleted successfully" });
+
+  } catch (err) {
+    console.error("❌ DELETE ROLE ERROR:", err);
+    res.status(500).json({ message: "Failed to delete roles" });
+  }
+});
+
+// ======================================================
+// 4️⃣ UPDATE ROLE
+// ======================================================
+app.put("/api/roles/:id", async (req, res) => {
+
+  const { id } = req.params;
+  const { roleName, validFrom, validTo } = req.body;
+
+  if (!roleName || roleName.trim() === "") {
+    return res.status(400).json({ message: "Role name is required" });
+  }
+
+  try {
+    const pool = await poolPromise;
+
+    await pool.request()
+      .input("id", sql.Int, id)
+      .input("roleName", sql.VarChar, roleName.trim())
+      .input("validFrom", sql.Date, validFrom || null)
+      .input("validTo", sql.Date, validTo || null)
+      .query(`
+        UPDATE smart_call.dbo.Roles
+        SET
+          RoleName = @roleName,
+          ValidFrom = @validFrom,
+          ValidTo = @validTo
+        WHERE RoleId = @id
+      `);
+
+    res.status(200).json({ message: "Role updated successfully" });
+
+  } catch (err) {
+    console.error("❌ UPDATE ROLE ERROR:", err);
+    res.status(500).json({ message: "Failed to update role" });
+  }
+});
+
+// ======================
+// GET ROLES - POST
+// ======================
+app.post("/api/roles/list", async (req, res) => {
+  try {
+    const pool = await poolPromise;
+
+    const result = await pool.request().query(`
+      SELECT 
+        RoleId,
+        RoleName,
+        ValidFrom,
+        ValidTo,
+        CreatedAt
+      FROM Roles
+      WHERE (ValidTo IS NULL OR ValidTo >= GETDATE())
+      ORDER BY RoleName ASC
+    `);
+
+    res.json({
+      records: result.recordset
+    });
+
+  } catch (err) {
+    console.error("GET ROLES ERROR:", err);
+    res.status(500).json({ message: "Failed to fetch roles" });
+  }
+});
+
+// ===============================
+// GET BRANCHES (WITH FILTER + ORDER)
+// ===============================
+
+app.get("/api/branch-master", async (req, res) => {
+  try {
+    const pool = await poolPromise;
+
+    const { name, code } = req.query;
+
+    let query = `
+  SELECT 
+    BranchCode AS branchCode,
+    BranchName AS branchName,
+    BranchEmailId AS branchEmailId,
+    Status AS status,
+    BranchCategory AS branchCategory,
+    BranchType AS branchType,
+    ParentBranch AS parentBranch,
+    Address AS address,
+    Pincode AS pincode,
+    TimeStamp AS timeStamp,
+    MapLink AS mapLink,
+    Location AS location,
+    SNo AS sNo
+  FROM smart_call.dbo.Branches
+  WHERE 1 = 1
+`;
+
+    if (name) {
+      query += ` AND BranchName LIKE '%' + @BranchName + '%' `;
+    }
+
+    if (code) {
+      query += ` AND BranchCode LIKE '%' + @BranchCode + '%' `;
+    }
+
+    query += ` ORDER BY BranchCode ASC `;   // 🔥 THIS FIXES JUMBLING
+
+    const request = pool.request();
+
+    if (name)
+      request.input("BranchName", sql.VarChar, name);
+
+    if (code)
+      request.input("BranchCode", sql.VarChar, code);
+
+    const result = await request.query(query);
+
+    res.json(result.recordset);
+
+  } catch (err) {
+    console.error("GET ERROR:", err);
+    res.status(500).json({ message: "Fetch failed" });
+  }
+});
+
+// ===============================
+// ADD BRANCH
+// ===============================
+
+app.post("/api/branch-master", async (req, res) => {
+  try {
+    const pool = await poolPromise;
+
+    const {
+      BranchCode,
+      BranchName,
+      BranchEmailId,
+      BranchCategory,
+      BranchType,
+      ParentBranch,
+      Address,
+      Pincode,
+      Status,
+      Location
+    } = req.body;
+
+    // Duplicate Check
+    const exists = await pool.request()
+      .input("BranchCode", sql.VarChar, BranchCode)
+      .query(`
+        SELECT COUNT(*) AS cnt
+        FROM smart_call.dbo.Branches
+        WHERE BranchCode = @BranchCode
+      `);
+
+    if (exists.recordset[0].cnt > 0) {
+      return res.status(409).json({ message: "Branch Code already exists" });
+    }
+
+    await pool.request()
+      .input("BranchCode", sql.VarChar, BranchCode)
+      .input("BranchName", sql.VarChar, BranchName)
+      .input("BranchEmailId", sql.VarChar, BranchEmailId)
+      .input("BranchCategory", sql.VarChar, BranchCategory)
+      .input("BranchType", sql.VarChar, BranchType)
+      .input("ParentBranch", sql.VarChar, ParentBranch)
+      .input("Address", sql.VarChar, Address)
+      .input("Pincode", sql.VarChar, Pincode)
+      .input("Status", sql.Bit, Status ?? 1)
+      .input("Location", sql.VarChar, Location)
+      .query(`
+        INSERT INTO smart_call.dbo.Branches
+        (BranchCode, BranchName, BranchEmailId, BranchCategory,
+         BranchType, ParentBranch, Address, Pincode, Status, Location)
+        VALUES
+        (@BranchCode, @BranchName, @BranchEmailId, @BranchCategory,
+         @BranchType, @ParentBranch, @Address, @Pincode, @Status, @Location)
+      `);
+
+    res.status(201).json({
+      branchCode: BranchCode,
+      branchName: BranchName,
+      branchEmailId: BranchEmailId,
+      branchCategory: BranchCategory,
+      branchType: BranchType,
+      parentBranch: ParentBranch,
+      address: Address,
+      pincode: Pincode,
+      status: 1,
+      location: Location
+    });
+
+  } catch (err) {
+    console.error("INSERT ERROR:", err);
+    res.status(500).json({ message: "Insert failed" });
+  }
+});
+
+// ===============================
+// UPDATE BRANCH
+// ===============================
+
+app.put("/api/branch-master/:code", async (req, res) => {
+  try {
+    const pool = await poolPromise;
+    const branchCode = req.params.code;
+
+    const {
+      BranchName,
+      BranchEmailId,
+      BranchCategory,
+      BranchType,
+      ParentBranch,
+      Address,
+      Pincode,
+      Location
+    } = req.body;
+
+    await pool.request()
+      .input("BranchCode", sql.VarChar, branchCode)
+      .input("BranchName", sql.VarChar, BranchName)
+      .input("BranchEmailId", sql.VarChar, BranchEmailId)
+      .input("BranchCategory", sql.VarChar, BranchCategory)
+      .input("BranchType", sql.VarChar, BranchType)
+      .input("ParentBranch", sql.VarChar, ParentBranch)
+      .input("Address", sql.VarChar, Address)
+      .input("Pincode", sql.VarChar, Pincode)
+      .input("Location", sql.VarChar, Location)
+      .query(`
+        UPDATE smart_call.dbo.Branches
+        SET BranchName = @BranchName,
+            BranchEmailId = @BranchEmailId,
+            BranchCategory = @BranchCategory,
+            BranchType = @BranchType,
+            ParentBranch = @ParentBranch,
+            Address = @Address,
+            Pincode = @Pincode,
+            Location = @Location,
+			TimeStamp = GETDATE()
+        WHERE BranchCode = @BranchCode
+      `);
+
+    res.json({ message: "Branch updated successfully" });
+
+  } catch (err) {
+    console.error("UPDATE ERROR:", err);
+    res.status(500).json({ message: "Update failed" });
+  }
+});
+
+// ===============================
+// DELETE BRANCH
+// ===============================
+
+app.delete("/api/branch-master/:code", async (req, res) => {
+  try {
+    const pool = await poolPromise;
+    const branchCode = req.params.code;
+
+    await pool.request()
+      .input("BranchCode", sql.VarChar, branchCode)
+      .query(`
+        DELETE FROM smart_call.dbo.Branches
+        WHERE BranchCode = @BranchCode
+      `);
+
+    res.json({ message: "Branch deleted successfully" });
+
+  } catch (err) {
+    console.error("DELETE ERROR:", err);
+    res.status(500).json({ message: "Delete failed" });
+  }
+});
+
+
+/* ======================================================
+   GET PRODUCT MASTER (WITH FILTER + ORDER)
+====================================================== */
+app.get("/api/product-master", async (req, res) => {
+  try {
+    const pool = await poolPromise;
+    const { name, code } = req.query;
+
+    let query = `
+      SELECT
+        SNo,
+        ProductCategory,
+        ProductType,
+        ProductCode,
+        ProductName,
+        MaxTenure,
+        MinTenure,
+        MaxLimit,
+        MinLimit,
+        ValidFrom,
+        ValidTo,
+        Status
+      FROM smart_call.dbo.ProductMaster
+      WHERE 1 = 1
+    `;
+
+    const request = pool.request();
+
+    if (name) {
+      query += " AND ProductName LIKE @name";
+      request.input("name", `%${name}%`);
+    }
+
+    if (code) {
+      query += " AND ProductCode LIKE @code";
+      request.input("code", `%${code}%`);
+    }
+
+    query += " ORDER BY ProductCode ASC";
+
+    const result = await request.query(query);
+
+    res.json(result.recordset);
+
+  } catch (err) {
+    console.error("GET PRODUCT MASTER ERROR:", err);
+    res.status(500).json({ message: "Error fetching product master" });
+  }
+});
+
+
+
+/* ======================================================
+   ADD PRODUCT MASTER (POST)
+====================================================== */
+app.post("/api/product-master", async (req, res) => {
+  try {
+    const pool = await poolPromise;
+
+    const {
+      productCategory,
+      productType,
+      productCode,
+      productName,
+      maxTenure,
+      minTenure,
+      maxLimit,
+      minLimit,
+      validFrom,
+      validTo
+    } = req.body;
+
+    // 🔎 Duplicate Check
+    const exists = await pool.request()
+      .input("ProductCode", productCode)
+      .query(`
+        SELECT COUNT(*) AS cnt
+        FROM smart_call.dbo.ProductMaster
+        WHERE ProductCode = @ProductCode
+      `);
+
+    if (exists.recordset[0].cnt > 0) {
+      return res.status(409).json({ message: "Product Code already exists" });
+    }
+
+    await pool.request()
+      .input("ProductCategory", productCategory)
+      .input("ProductType", productType || "")
+      .input("ProductCode", productCode)
+      .input("ProductName", productName)
+      .input("MaxTenure", maxTenure || 0)
+      .input("MinTenure", minTenure || 0)
+      .input("MaxLimit", maxLimit || 0)
+      .input("MinLimit", minLimit || 0)
+      .input("ValidFrom", validFrom || null)
+      .input("ValidTo", validTo || null)
+      .input("Status", "Active")
+      .query(`
+        INSERT INTO smart_call.dbo.ProductMaster
+        (
+          ProductCategory,
+          ProductType,
+          ProductCode,
+          ProductName,
+          MaxTenure,
+          MinTenure,
+          MaxLimit,
+          MinLimit,
+          ValidFrom,
+          ValidTo,
+          Status,
+          Timestamp
+        )
+        VALUES
+        (
+          @ProductCategory,
+          @ProductType,
+          @ProductCode,
+          @ProductName,
+          @MaxTenure,
+          @MinTenure,
+          @MaxLimit,
+          @MinLimit,
+          @ValidFrom,
+          @ValidTo,
+          @Status,
+          GETDATE()
+        )
+      `);
+
+    res.status(201).json({ message: "Product added successfully" });
+
+  } catch (err) {
+    console.error("POST PRODUCT MASTER ERROR:", err);
+    res.status(500).json({ message: "Error adding product master" });
+  }
+});
+
+
+
+/* ======================================================
+   UPDATE PRODUCT MASTER (USING ProductCode)
+====================================================== */
+app.put("/api/product-master/:code", async (req, res) => {
+  try {
+    const pool = await poolPromise;
+    const productCode = req.params.code;
+
+    const {
+      productCategory,
+      productType,
+      productName,
+      maxTenure,
+      minTenure,
+      maxLimit,
+      minLimit,
+      validFrom,
+      validTo
+    } = req.body;
+
+    await pool.request()
+      .input("ProductCode", productCode)
+      .input("ProductCategory", productCategory)
+      .input("ProductType", productType || "")
+      .input("ProductName", productName)
+      .input("MaxTenure", maxTenure || 0)
+      .input("MinTenure", minTenure || 0)
+      .input("MaxLimit", maxLimit || 0)
+      .input("MinLimit", minLimit || 0)
+      .input("ValidFrom", validFrom || null)
+      .input("ValidTo", validTo || null)
+      .query(`
+        UPDATE smart_call.dbo.ProductMaster
+        SET
+          ProductCategory = @ProductCategory,
+          ProductType = @ProductType,
+          ProductName = @ProductName,
+          MaxTenure = @MaxTenure,
+          MinTenure = @MinTenure,
+          MaxLimit = @MaxLimit,
+          MinLimit = @MinLimit,
+          ValidFrom = @ValidFrom,
+          ValidTo = @ValidTo,
+          Timestamp = GETDATE()
+        WHERE ProductCode = @ProductCode
+      `);
+
+    res.json({ message: "Product updated successfully" });
+
+  } catch (err) {
+    console.error("UPDATE PRODUCT MASTER ERROR:", err);
+    res.status(500).json({ message: "Error updating product master" });
+  }
+});
+
+
+
+/* ======================================================
+   DELETE PRODUCT MASTER (USING ProductCode)
+====================================================== */
+app.delete("/api/product-master/:code", async (req, res) => {
+  try {
+    const pool = await poolPromise;
+    const productCode = req.params.code;
+
+    await pool.request()
+      .input("ProductCode", productCode)
+      .query(`
+        DELETE FROM smart_call.dbo.ProductMaster
+        WHERE ProductCode = @ProductCode
+      `);
+
+    res.json({ message: "Product deleted successfully" });
+
+  } catch (err) {
+    console.error("DELETE PRODUCT MASTER ERROR:", err);
+    res.status(500).json({ message: "Error deleting product master" });
+  }
+});
 
 // ======================
 // START SERVER

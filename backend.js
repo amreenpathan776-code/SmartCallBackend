@@ -4,7 +4,42 @@ const cors = require("cors");
 
 const app = express();
 const PORT = 5001;
+const axios = require("axios");
 
+const GOOGLE_API_KEY = "AIzaSyBU8cG2UuNw7i-6m7azb1cUIiNgX0DJ4KA";
+
+async function getRoadDistanceKm(startLat, startLng, stopLat, stopLng) {
+  try {
+    const response = await axios.get(
+      "https://maps.googleapis.com/maps/api/directions/json",
+      {
+        params: {
+          origin: `${startLat},${startLng}`,
+          destination: `${stopLat},${stopLng}`,
+key: GOOGLE_API_KEY,        
+},
+      }
+    );
+
+    if (
+      response.data.routes &&
+      response.data.routes.length > 0 &&
+      response.data.routes[0].legs.length > 0
+    ) {
+      const distanceMeters =
+        response.data.routes[0].legs[0].distance.value;
+
+      const distanceKm = distanceMeters / 1000;
+
+      return distanceKm;
+    } else {
+      throw new Error("No route found");
+    }
+  } catch (error) {
+    console.error("Google Distance Error:", error.message);
+    throw error;
+  }
+}
 // ======================
 // MIDDLEWARE
 // ======================
@@ -323,29 +358,35 @@ app.post("/api/account-details", async (req, res) => {
   try {
     const pool = await poolPromise;
 
-    const result = await pool.request()
-      .input("loanAccountNumber", sql.VarChar, loanAccountNumber)
-      .query(`
-        SELECT
-  firstname,
-  fathersName,
-  village,
-  gp,
-  pincode,
-  mobileNumber,
-  loanAccountNumber,
-  product,
-  dpdQueue,
-  currentOutstandingBalance,
-  principleDue,
-  interestDue,
-  interestRate,
-  CAST(lastInterestAppliedDate AS VARCHAR(20)) AS lastInterestAppliedDate,
-  EMIAMOUNT,
-  OVERDUEAMT
-FROM dbo.Recovery_Raw_Data
-WHERE loanAccountNumber = @loanAccountNumber;
-      `);
+const result = await pool.request()
+  .input("loanAccountNumber", sql.VarChar(50), loanAccountNumber)
+  .query(`
+    SELECT
+      R.firstname,
+      R.fathersName,
+      R.village,
+      R.gp,
+      R.pincode,
+      R.mobileNumber,
+      R.loanAccountNumber,
+      R.product,
+      R.dpdQueue,
+      R.currentOutstandingBalance,
+      R.principleDue,
+      R.interestDue,
+      R.interestRate,
+      CAST(R.lastInterestAppliedDate AS VARCHAR(20)) AS lastInterestAppliedDate,
+      R.EMIAMOUNT,
+      R.OVERDUEAMT,
+
+      A.AlternateNumber
+
+    FROM dbo.Recovery_Raw_Data R
+    LEFT JOIN dbo.Recovery_Alternate_Number A
+      ON R.loanAccountNumber = A.LoanAccountNumber
+
+    WHERE R.loanAccountNumber = @loanAccountNumber
+  `);
 
     if (result.recordset.length === 0) {
       return res.status(404).json({ message: "Account not found" });
@@ -357,6 +398,52 @@ WHERE loanAccountNumber = @loanAccountNumber;
     res.status(500).json({ message: "Server error" });
   }
 });
+
+// =======================================================
+// SAVE ALTERNATE NUMBER
+// =======================================================
+app.post("/api/account/save-alternate", async (req, res) => {
+  const { loanAccountNumber, alternateNumber } = req.body;
+
+  if (!loanAccountNumber || !alternateNumber) {
+    return res.status(400).json({ message: "Loan account and alternate number required" });
+  }
+
+  if (!/^\d{10}$/.test(String(alternateNumber))) {
+    return res.status(400).json({ message: "Alternate number must be 10 digits" });
+  }
+
+  try {
+    const pool = await poolPromise;
+
+await pool.request()
+  .input("LoanAccountNumber", sql.VarChar(50), loanAccountNumber)
+  .input("AlternateNumber", sql.VarChar(15), alternateNumber)
+  .query(`
+    IF EXISTS (SELECT 1 FROM dbo.Recovery_Alternate_Number 
+               WHERE LoanAccountNumber = @LoanAccountNumber)
+    BEGIN
+        UPDATE dbo.Recovery_Alternate_Number
+        SET AlternateNumber = @AlternateNumber,
+            UpdatedAt = GETDATE()
+        WHERE LoanAccountNumber = @LoanAccountNumber
+    END
+    ELSE
+    BEGIN
+        INSERT INTO dbo.Recovery_Alternate_Number
+        (LoanAccountNumber, AlternateNumber)
+        VALUES (@LoanAccountNumber, @AlternateNumber)
+    END
+  `);
+
+    res.json({ success: true, message: "Alternate number saved successfully" });
+
+  } catch (err) {
+    console.error("SAVE ALTERNATE ERROR:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+}); 
+
 // =====================================================================
 // HOME → MEMBERS SUMMARY (ASSIGNMENT BASED)
 // =====================================================================
@@ -1140,40 +1227,59 @@ if (
 });
 
 app.post("/api/field-visit/stop", async (req, res) => {
-  const { sno, meetLat, meetLng, meetAddress, distanceTravelled } = req.body;
-
-  if (!sno || !meetLat || !meetLng) {
-    return res.status(400).json({ message: "Missing required fields" });
-  }
-
   try {
+    const { sno, stopLat, stopLng, stopAddress } = req.body;
+
     const pool = await poolPromise;
 
-    await pool.request()
+    const result = await pool.request()
       .input("SNo", sql.Int, sno)
-      .input("MeetingLatitude", sql.Decimal(18, 10), meetLat)
-      .input("MeetingLongitude", sql.Decimal(18, 10), meetLng)
-      .input("MeetingAddress", sql.VarChar(sql.MAX), meetAddress || null)
-      .input("DistanceTravelled", sql.Decimal(18, 3), distanceTravelled || 0)
-      .input("MeetingDate", sql.DateTime, new Date())
       .query(`
-        UPDATE FieldVisitReport
-        SET
-          MeetingDate = @MeetingDate,
-          MeetingLatitude = @MeetingLatitude,
-          MeetingLongitude = @MeetingLongitude,
-          MeetingAddress = @MeetingAddress,
-          DistanceTravelled = @DistanceTravelled
+        SELECT StartLatitude, StartLongitude
+        FROM FieldVisitReport
         WHERE SNo = @SNo
       `);
 
-    return res.json({ message: "✅ Stop saved and distance updated" });
+    if (!result.recordset.length) {
+      return res.status(404).json({ message: "Visit not found" });
+    }
+
+    const startLat = result.recordset[0].StartLatitude;
+    const startLng = result.recordset[0].StartLongitude;
+
+    const distanceKm = await getRoadDistanceKm(
+      startLat,
+      startLng,
+      stopLat,
+      stopLng
+    );
+
+    await pool.request()
+      .input("SNo", sql.Int, sno)
+      .input("StopLat", sql.Float, stopLat)
+      .input("StopLng", sql.Float, stopLng)
+      .input("StopAddress", sql.NVarChar(500), stopAddress)
+      .input("Distance", sql.Float, distanceKm)
+      .query(`
+        UPDATE FieldVisitReport
+        SET 
+          MeetingLatitude = @StopLat,
+          MeetingLongitude = @StopLng,
+          MeetingAddress = @StopAddress,
+          DistanceTravelled = @Distance
+        WHERE SNo = @SNo
+      `);
+
+    res.json({
+      success: true,
+      distanceKm: Number(distanceKm.toFixed(3))
+    });
+
   } catch (err) {
-    console.log("FieldVisitReport stop update error:", err);
-    return res.status(500).json({ message: "Server error", error: err.message });
+    console.error("Stop Visit Error:", err);
+    res.status(500).json({ message: "Server error" });
   }
 });
-
 // =====================================
 // SAVE LEAD API (CORRECTED)
 // =====================================
@@ -1379,13 +1485,9 @@ app.get("/api/getLeadDetails/:sno", async (req, res) => {
     });
   }
 });
-// =========================================================
-// ACTIVITY HISTORY OVERVIEW
-// =========================================================
-
 app.post("/api/activity/history", async (req, res) => {
   try {
-    const { userId } = req.body;
+    const { userId, fromDate, toDate, searchText } = req.body;
 
     if (!userId) {
       return res.status(400).json({ message: "userId required" });
@@ -1393,9 +1495,11 @@ app.post("/api/activity/history", async (req, res) => {
 
     const pool = await poolPromise;
 
-    const result = await pool
-      .request()
+    const result = await pool.request()
       .input("UserId", sql.VarChar(50), String(userId))
+      .input("FromDate", sql.Date, fromDate || null)   // ✅ Allow NULL
+      .input("ToDate", sql.Date, toDate || null)       // ✅ Allow NULL
+      .input("SearchText", sql.VarChar(100), searchText || null)
       .query(`
         ;WITH LatestAction AS (
           SELECT
@@ -1405,78 +1509,66 @@ app.post("/api/activity/history", async (req, res) => {
           INNER JOIN smart_call.dbo.Activity_Logs l
             ON s.SessionId = l.SessionId
           WHERE s.StartedByUserId = @UserId
+            AND (
+                  (@FromDate IS NULL OR CAST(l.CreatedAt AS DATE) >= @FromDate)
+                  AND
+                  (@ToDate IS NULL OR CAST(l.CreatedAt AS DATE) <= @ToDate)
+                )
           GROUP BY s.LoanAccountNumber
         )
 
         SELECT
-          s.SessionId,
           s.LoanAccountNumber,
           r.firstname AS CustomerName,
+          r.dpdQueue,
           s.SessionType,
           l.ActionLabel,
-
-          -- ✅ Proper formatted time (IST safe)
           FORMAT(l.CreatedAt, 'dd/MM/yyyy hh:mm tt') AS FormattedTime,
 
-          -- ✅ Raw flags (kept for debugging if needed)
-          ISNULL(cr.PendingFlag,0) AS PendingFlag,
-          ISNULL(cr.InProcessFlag,0) AS InProcessFlag,
-          ISNULL(cr.CompleteFlag,0) AS CompleteFlag,
-          ISNULL(cr.ScheduleCallPendingFlag,0) AS ScheduleCallPendingFlag,
-          ISNULL(cr.ScheduleCallCompletedFlag,0) AS ScheduleCallCompletedFlag,
-          ISNULL(cr.ScheduleVisitPendingFlag,0) AS ScheduleVisitPendingFlag,
-          ISNULL(cr.ScheduleVisitCompletedFlag,0) AS ScheduleVisitCompletedFlag,
-
-          -- 🔥 FINAL DERIVED STATUS
           CASE
-            WHEN ISNULL(cr.CompleteFlag,0) = 1
-              OR ISNULL(cr.ScheduleCallCompletedFlag,0) = 1
-              OR ISNULL(cr.ScheduleVisitCompletedFlag,0) = 1
+            WHEN ISNULL(cr.CompleteFlag,0)=1
+              OR ISNULL(cr.ScheduleCallCompletedFlag,0)=1
+              OR ISNULL(cr.ScheduleVisitCompletedFlag,0)=1
               THEN 'COMPLETED'
-
-            WHEN ISNULL(cr.InProcessFlag,0) = 1
-              OR ISNULL(cr.ScheduleCallPendingFlag,0) = 1
-              OR ISNULL(cr.ScheduleVisitPendingFlag,0) = 1
+            WHEN ISNULL(cr.InProcessFlag,0)=1
+              OR ISNULL(cr.ScheduleCallPendingFlag,0)=1
+              OR ISNULL(cr.ScheduleVisitPendingFlag,0)=1
               THEN 'IN PROCESS'
-
-            WHEN ISNULL(cr.PendingFlag,0) = 1
-              THEN 'PENDING'
-
             ELSE 'PENDING'
           END AS AccountStatus
 
         FROM LatestAction LA
         INNER JOIN smart_call.dbo.Activity_Sessions s
           ON s.LoanAccountNumber = LA.LoanAccountNumber
-
         INNER JOIN smart_call.dbo.Activity_Logs l
           ON l.SessionId = s.SessionId
          AND l.CreatedAt = LA.LatestTime
-
         LEFT JOIN smart_call.dbo.Recovery_Raw_Data r
           ON r.loanAccountNumber = s.LoanAccountNumber
-
         LEFT JOIN smart_call.dbo.CallRecovery_Status cr
           ON cr.LoanAccountNumber = s.LoanAccountNumber
          AND cr.UserId = @UserId
 
+        WHERE
+          (@SearchText IS NULL OR
+           s.LoanAccountNumber LIKE '%' + @SearchText + '%' OR
+           r.firstname LIKE '%' + @SearchText + '%' OR
+           r.dpdQueue LIKE '%' + @SearchText + '%')
+
         ORDER BY l.CreatedAt DESC
       `);
 
-    return res.status(200).json({
+    res.json({
       success: true,
-      records: result.recordset,
+      count: result.recordset.length,
+      records: result.recordset
     });
 
   } catch (err) {
-    console.error("History overview error:", err);
-    return res.status(500).json({
-      success: false,
-      message: "History fetch failed",
-    });
+    console.error("History API Error:", err);
+    res.status(500).json({ message: "History fetch failed" });
   }
 });
-
 // =========================================================
 // ACTIVITY HISTORY DETAILS
 // Returns ALL actions for one LoanAccountNumber
@@ -1796,35 +1888,35 @@ app.get("/api/recovery-upload-status", async (req, res) => {
   try {
     const pool = await poolPromise;
 
-// Today latest
-const todayRes = await pool.request().query(`
-  SELECT TOP 1 record_count
-  FROM Recovery_Upload_Log
-  WHERE upload_date = CAST(GETDATE() AS DATE)
-  ORDER BY uploaded_at DESC
-`);
+    // 🔹 Get Today's Latest Upload
+    const todayRes = await pool.request().query(`
+      SELECT TOP 1 record_count
+      FROM Recovery_Upload_Log
+      WHERE upload_date = CAST(GETDATE() AS DATE)
+      ORDER BY uploaded_at DESC
+    `);
 
-// Yesterday latest
-const yesterdayRes = await pool.request().query(`
-  SELECT TOP 1 record_count
-  FROM Recovery_Upload_Log
-  WHERE upload_date = CAST(DATEADD(DAY, -1, GETDATE()) AS DATE)
-  ORDER BY uploaded_at DESC
-`);
+    const today = todayRes.recordset.length
+      ? todayRes.recordset[0].record_count
+      : 0;
 
-const today = todayRes.recordset.length
-  ? todayRes.recordset[0].record_count
-  : 0;
+    // 🔹 Get Last Available Upload Before Today
+    const lastRes = await pool.request().query(`
+      SELECT TOP 1 record_count
+      FROM Recovery_Upload_Log
+      WHERE upload_date < CAST(GETDATE() AS DATE)
+      ORDER BY upload_date DESC, uploaded_at DESC
+    `);
 
-const yesterday = yesterdayRes.recordset.length
-  ? yesterdayRes.recordset[0].record_count
-  : 0;
+    const last = lastRes.recordset.length
+      ? lastRes.recordset[0].record_count
+      : 0;
 
-res.json({
-  archived: today < yesterday ? yesterday - today : 0,
-  uploaded: today > yesterday ? today - yesterday : 0,
-  history_total: today
-});
+    res.json({
+      archived: today < last ? last - today : 0,
+      uploaded: today > last ? today - last : 0,
+      history_total: today
+    });
 
   } catch (err) {
     console.error("❌ STATUS ERROR:", err);
@@ -1837,6 +1929,13 @@ res.json({
 //                                TRANSACTION SEARCH API
 //============================================================================================
 app.post("/api/transaction/search", async (req, res) => {
+	
+	const userId = req.headers["x-user-id"];
+
+if (!userId) {
+  return res.status(401).json({ message: "Unauthorized" });
+}
+	
   const {
     mobileNumber,
     cluster,
@@ -1857,7 +1956,26 @@ const isDirectSearch =
 
 
   try {
+	  
     const pool = await poolPromise;
+
+// 🔥 Get logged-in user role & branch
+const userInfo = await pool.request()
+  .input("userId", sql.VarChar, userId)
+  .query(`
+    SELECT Role, BranchName
+    FROM UsersInfo
+    WHERE UserId = @userId
+  `);
+
+if (!userInfo.recordset.length) {
+  return res.status(403).json({ message: "User not found" });
+}
+
+const { Role, BranchName: userBranch } = userInfo.recordset[0];
+const isBranchManager = Role === "Branch Manager";
+
+
     let query = `
   SELECT 
     R.firstname AS firstName,
@@ -1879,6 +1997,12 @@ const isDirectSearch =
 
   
     const request = pool.request();
+	
+	// 🔒 FORCE BRANCH RESTRICTION FOR BRANCH MANAGER
+if (isBranchManager) {
+  query += ` AND R.branchName = @restrictedBranch`;
+  request.input("restrictedBranch", sql.VarChar, userBranch);
+}
 
     if (mobileNumber) {
       query += ` AND mobileNumber = @mobileNumber`;
@@ -2206,6 +2330,13 @@ if (!assignedByAdminId) {
 //                         TRANSACTION VIEW DETAILS (READ ONLY)
 //============================================================================================
 app.get("/api/transaction/details/:loanAccountNumber", async (req, res) => {
+
+  const userId = req.headers["x-user-id"];
+
+  if (!userId) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+
   const { loanAccountNumber } = req.params;
 
   if (!loanAccountNumber) {
@@ -2215,36 +2346,56 @@ app.get("/api/transaction/details/:loanAccountNumber", async (req, res) => {
   try {
     const pool = await poolPromise;
 
-    const result = await pool.request()
-      .input("loanAccountNumber", sql.VarChar, loanAccountNumber)
+    // 🔥 Get user role + branch
+    const userInfo = await pool.request()
+      .input("userId", sql.VarChar, userId)
       .query(`
-        SELECT TOP 1
-          firstname                           AS customerName,
-
-          CONVERT(VARCHAR, dob, 105)          AS dob,               -- dd-mm-yyyy
-
-          CASE 
-            WHEN gender = 'M' THEN 'Male'
-            WHEN gender = 'F' THEN 'Female'
-            ELSE gender
-          END                                 AS gender,
-
-          pancard                             AS panNumber,
-          gp                                  AS address,
-          pincode                             AS pincode,
-          mobileNumber                        AS mobileNumber,
-          loanAccountNumber                   AS loanAccountNumber,
-          OVERDUEAMT                          AS outstandingAmount,
-          interestDue                         AS interestDue,
-          principleDue                        AS principalDue,
-          interestRate                        AS interestRate
-
-        FROM smart_call.dbo.Recovery_Raw_Data
-        WHERE loanAccountNumber = @loanAccountNumber
+        SELECT Role, BranchName
+        FROM UsersInfo
+        WHERE UserId = @userId
       `);
 
-    if (result.recordset.length === 0) {
-      return res.status(404).json({ message: "Record not found" });
+    if (!userInfo.recordset.length) {
+      return res.status(403).json({ message: "User not found" });
+    }
+
+    const { Role, BranchName: userBranch } = userInfo.recordset[0];
+
+    let query = `
+      SELECT TOP 1
+        firstname AS customerName,
+        CONVERT(VARCHAR, dob, 105) AS dob,
+        CASE 
+          WHEN gender = 'M' THEN 'Male'
+          WHEN gender = 'F' THEN 'Female'
+          ELSE gender
+        END AS gender,
+        pancard AS panNumber,
+        gp AS address,
+        pincode,
+        mobileNumber,
+        loanAccountNumber,
+        OVERDUEAMT AS outstandingAmount,
+        interestDue,
+        principleDue AS principalDue,
+        interestRate
+      FROM smart_call.dbo.Recovery_Raw_Data
+      WHERE loanAccountNumber = @loanAccountNumber
+    `;
+
+    const request = pool.request();
+    request.input("loanAccountNumber", sql.VarChar, loanAccountNumber);
+
+    // 🔒 Restrict Branch Manager
+    if (Role === "Branch Manager") {
+      query += ` AND branchName = @restrictedBranch`;
+      request.input("restrictedBranch", sql.VarChar, userBranch);
+    }
+
+    const result = await request.query(query);
+
+    if (!result.recordset.length) {
+      return res.status(404).json({ message: "Record not found or access denied" });
     }
 
     return res.status(200).json(result.recordset[0]);
@@ -2493,9 +2644,30 @@ app.use(cors({
 // ======================
 // Assign Users (dropdown)
 // ======================
-app.post("/api/assignUsers", async (req, res) => {
+app.post("/api/assignUsers/v2", async (req, res) => {
   try {
+	  const userId = req.headers["x-user-id"];
+
+if (!userId) {
+  return res.status(401).json({ message: "Unauthorized" });
+}
+	  
     const pool = await poolPromise;
+	
+	const userInfo = await pool.request()
+  .input("userId", sql.VarChar, userId)
+  .query(`
+    SELECT Role, BranchName
+    FROM UsersInfo
+    WHERE UserId = @userId
+  `);
+
+if (!userInfo.recordset.length) {
+  return res.status(403).json({ message: "User not found" });
+}
+
+const { Role, BranchName: userBranch } = userInfo.recordset[0];
+	
     const { branchName, cluster } = req.body;
 
     let query = `
@@ -2507,10 +2679,16 @@ app.post("/api/assignUsers", async (req, res) => {
         Role AS role,
         BranchCode AS branchCode
       FROM UsersInfo
-      WHERE Role IN ('Admin','Branch Manager','Calling Agent', 'Regional Manager')  -- Shows Admins also
+      WHERE Role IN ('Admin','Branch Manager','Calling Agent', 'Regional Manager')
     `;
 
     const request = pool.request();
+	
+	// 🔒 Restrict branch manager to their branch only
+if (Role === "Branch Manager") {
+  query += ` AND BranchName = @restrictedBranch`;
+  request.input("restrictedBranch", sql.VarChar, userBranch);
+}
 
     if (cluster && cluster !== "") {
       query += ` AND ClusterName = @cluster`;
@@ -3438,25 +3616,26 @@ request.input("Cluster", sql.VarChar, selectedCluster || "");
 
     const result = await request.query(`
       SELECT 
-    U.UserId,
-    U.UserName,
-    U.BranchCode,
-    U.BranchName,
-    A.LoanAccountNumber AS AccountNumber,
-    R.firstname AS CustomerName,
-    R.dpdQueue AS DpdQueue,
+    A.AssignedByAdminId     AS AssignedByUserId,
+    A.AssignedByAdminName   AS AssignedByUserName,
+    A.AssignedToUserId      AS AssignedToUserId,
+    A.AssignedToUserName    AS AssignedToUserName,
+
+    A.BranchCode,
+    A.BranchName,
+
+    A.LoanAccountNumber     AS AccountNumber,
+    R.firstname             AS CustomerName,
+    R.dpdQueue              AS DpdQueue,
 
     COUNT(A.LoanAccountNumber) 
-        OVER (PARTITION BY U.UserId) AS NoOfAccounts,
+        OVER (PARTITION BY A.AssignedByAdminId) AS NoOfAccounts,
 
-    ISNULL(C.CallCount, 0) AS NoOfCalls,
+    ISNULL(C.CallCount, 0)  AS NoOfCalls,
 
     A.AssignedAt
 
 FROM Account_Assignments A
-
-INNER JOIN UsersInfo U
-    ON A.AssignedByAdminName = U.UserName
 
 INNER JOIN Recovery_Raw_Data R
     ON A.LoanAccountNumber = R.loanAccountNumber
@@ -3473,9 +3652,9 @@ OUTER APPLY (
 ) C
 
 WHERE 
-    (@UserName = '' OR U.UserName = @UserName)
-    AND (@Cluster = '' OR U.ClusterName = @Cluster)
-    AND (@Branch = '' OR U.BranchName = @Branch)
+    (@UserName = '' OR A.AssignedByAdminName = @UserName)
+    AND (@Cluster = '' OR A.ClusterName = @Cluster)
+    AND (@Branch = '' OR A.BranchName = @Branch)
     AND (@FromDate IS NULL OR CAST(A.AssignedAt AS DATE) >= @FromDate)
     AND (@ToDate IS NULL OR CAST(A.AssignedAt AS DATE) <= @ToDate)
 
@@ -3543,16 +3722,20 @@ app.post("/api/assignment-summary/export-pdf", async (req, res) => {
     let y = doc.y;
 
     const LABELS = {
-      serialNumber: "S. No.",
-      UserId: "User Id",
-      UserName: "User Name",
-      BranchCode: "Branch Code",
-      BranchName: "Branch Name",
-      AccountNumber: "Account Number",
-      CustomerName: "Customer Name",
-      DpdQueue: "DPD Queue",
-      NoOfCalls: "No. of Calls"
-    };
+  serialNumber: "S. No.",
+
+  AssignedByUserId: "Assigned By User Id",
+  AssignedByUserName: "Assigned By User Name",
+  AssignedToUserId: "Assigned To User Id",
+  AssignedToUserName: "Assigned To User Name",
+
+  BranchCode: "Branch Code",
+  BranchName: "Branch Name",
+  AccountNumber: "Account Number",
+  CustomerName: "Customer Name",
+  DpdQueue: "DPD Queue",
+  NoOfCalls: "No. of Calls"
+};
 
     // ================= HEADER =================
 doc.font("Helvetica-Bold").fontSize(10);
@@ -5227,12 +5410,13 @@ app.post("/api/login", async (req, res) => {
   try {
     const pool = await poolPromise;
 
-    // 1. Check credentials in UserAuth
+    // 1️⃣ Check credentials
     const authQuery = await pool.request()
       .input("userId", userId)
       .input("password", password)
       .query(`
-        SELECT UserId FROM UserAuth
+        SELECT UserId 
+        FROM UserAuth
         WHERE UserId = @userId AND AppPassword = @password
       `);
 
@@ -5240,11 +5424,17 @@ app.post("/api/login", async (req, res) => {
       return res.status(401).json({ message: "Invalid User ID or Password" });
     }
 
-    // 2. Check user authorization & role in UsersInfo
+    // 2️⃣ Get full user info
     const infoQuery = await pool.request()
       .input("userId", userId)
       .query(`
-        SELECT Role, ValidFrom, ValidUntil
+        SELECT 
+          Role,
+          ValidFrom,
+          ValidUntil,
+          BranchName,
+          BranchCode,
+          ClusterName
         FROM UsersInfo
         WHERE UserId = @userId
       `);
@@ -5256,22 +5446,24 @@ app.post("/api/login", async (req, res) => {
     const user = infoQuery.recordset[0];
     const today = new Date();
 
-    // 3. Check validity dates
+    // 3️⃣ Check validity
     if (new Date(user.ValidFrom) > today || new Date(user.ValidUntil) < today) {
       return res.status(403).json({ message: "User access expired or not yet active" });
     }
 
-    // 4. Check role access (optional rules)
-    if (!user || !["Admin", "Branch Manager"].includes(user.Role)) {
-  return res.status(403).json({ message: "User role not authorized for dashboard" });
-}
+    // 4️⃣ Role check
+    if (!["Admin", "Branch Manager"].includes(user.Role)) {
+      return res.status(403).json({ message: "User role not authorized for dashboard" });
+    }
 
-
-    // 5. Successful login
+    // 5️⃣ SUCCESS
     return res.json({
       message: "Login successful",
+      userId: userId,
       role: user.Role,
-      userId: userId
+      branchName: user.BranchName,
+      branchCode: user.BranchCode,
+      clusterName: user.ClusterName
     });
 
   } catch (err) {
@@ -6845,9 +7037,7 @@ app.get("/api/branch-master", async (req, res) => {
     Address AS address,
     Pincode AS pincode,
     TimeStamp AS timeStamp,
-    MapLink AS mapLink,
-    Location AS location,
-    SNo AS sNo
+    Location AS location
   FROM smart_call.dbo.Branches
   WHERE 1 = 1
 `;

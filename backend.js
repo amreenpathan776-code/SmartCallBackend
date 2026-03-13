@@ -1,3 +1,11 @@
+process.on("uncaughtException", err => {
+  console.error("UNCAUGHT EXCEPTION:", err);
+});
+
+process.on("unhandledRejection", err => {
+  console.error("UNHANDLED REJECTION:", err);
+});
+
 const express = require("express");
 const sql = require("mssql");
 const cors = require("cors");
@@ -276,13 +284,13 @@ app.post("/api/dpd-list", async (req, res) => {
     });
   }
 
-  const dpdList = dpdQueue.split(",").map(d => d.trim());
+  const dpdList = dpdQueue.split(",").map((d) => d.trim());
 
   try {
     const pool = await poolPromise;
     const request = pool.request();
 
-    // ✅ FORCE STRING USER ID
+    // force string userId
     request.input("userId", sql.VarChar(50), String(userId));
 
     dpdList.forEach((dpd, index) => {
@@ -293,50 +301,66 @@ app.post("/api/dpd-list", async (req, res) => {
       .map((_, index) => `@dpd${index}`)
       .join(",");
 
-const query = `
-  SELECT TOP 10000
-    R.firstname,
-    R.loanAccountNumber,
-    R.mobileNumber,
-R.OVERDUEAMT AS overdueAmount,
-    R.dpdQueue,
+    const query = `
+      SELECT TOP 10000
+        R.firstname,
+        R.loanAccountNumber,
+        R.mobileNumber,
+        R.OVERDUEAMT AS overdueAmount,
+        R.dpdQueue,
 
-    -- ✅ EXTRA: STATUS FLAGS
-    ISNULL(CRS.PendingFlag, 0) AS PendingFlag,
-    ISNULL(CRS.InProcessFlag, 0) AS InProcessFlag,
-    ISNULL(CRS.CompleteFlag, 0) AS CompleteFlag,
+        -- ⭐ ATTEMPT COUNT
+        ISNULL(ATT.AttemptCount,0) AS AttemptCount,
 
-    ISNULL(CRS.ScheduleCallPendingFlag, 0) AS ScheduleCallPendingFlag,
-    ISNULL(CRS.ScheduleVisitPendingFlag, 0) AS ScheduleVisitPendingFlag,
+        ISNULL(CRS.PendingFlag, 0) AS PendingFlag,
+        ISNULL(CRS.InProcessFlag, 0) AS InProcessFlag,
+        ISNULL(CRS.CompleteFlag, 0) AS CompleteFlag,
 
-    -- ✅ FINAL STATUS LABEL (Your requirement)
-    CASE
-      WHEN ISNULL(CRS.CompleteFlag,0) = 1 THEN 'COMPLETED'
+        CRS.UpdatedAt AS CompletedAt,
 
-      WHEN ISNULL(CRS.InProcessFlag,0) = 1
-        OR ISNULL(CRS.ScheduleCallPendingFlag,0) = 1
-        OR ISNULL(CRS.ScheduleVisitPendingFlag,0) = 1
-      THEN 'IN PROCESS'
+        ISNULL(CRS.ScheduleCallPendingFlag, 0) AS ScheduleCallPendingFlag,
+        ISNULL(CRS.ScheduleVisitPendingFlag, 0) AS ScheduleVisitPendingFlag,
 
-      ELSE 'PENDING'
-    END AS AccountStatus
+        CASE
+          WHEN ISNULL(CRS.CompleteFlag,0) = 1 THEN 'COMPLETED'
 
-  FROM Recovery_Raw_Data R
-  INNER JOIN Account_Assignments A
-    ON A.LoanAccountNumber = R.loanAccountNumber
+          WHEN ISNULL(CRS.InProcessFlag,0) = 1
+            OR ISNULL(CRS.ScheduleCallPendingFlag,0) = 1
+            OR ISNULL(CRS.ScheduleVisitPendingFlag,0) = 1
+          THEN 'IN PROCESS'
 
-  LEFT JOIN CallRecovery_Status CRS
-    ON CRS.LoanAccountNumber = R.loanAccountNumber
-   AND CRS.UserId = @userId
+          ELSE 'PENDING'
+        END AS AccountStatus
 
-  WHERE
-    A.AssignedToUserId = @userId
-    AND A.AssignmentStatus = 'Assigned'
-    AND RIGHT('00' + R.dpdQueue, 2) IN (${placeholders})
+      FROM Recovery_Raw_Data R
 
-  ORDER BY TRY_CAST(R.currentOutstandingBalance AS DECIMAL(18,2)) DESC
-`;
+      INNER JOIN Account_Assignments A
+        ON A.LoanAccountNumber = R.loanAccountNumber
 
+      LEFT JOIN CallRecovery_Status CRS
+        ON CRS.LoanAccountNumber = R.loanAccountNumber
+       AND CRS.UserId = @userId
+
+      -- ⭐ COUNT CALL ATTEMPTS
+      OUTER APPLY (
+          SELECT COUNT(*) AS AttemptCount
+          FROM Activity_Logs
+          WHERE SourceType = 'NPA'
+            AND SourceId = R.loanAccountNumber
+            AND ActionCode IN (
+                'CALL_BUSY',
+                'CALL_NOT_REACHABLE',
+                'INVALID_NUMBER'
+            )
+      ) ATT
+
+      WHERE
+        A.AssignedToUserId = @userId
+        AND A.AssignmentStatus = 'Assigned'
+        AND RIGHT('00' + R.dpdQueue, 2) IN (${placeholders})
+
+      ORDER BY TRY_CAST(R.currentOutstandingBalance AS DECIMAL(18,2)) DESC
+    `;
 
     const result = await request.query(query);
 
@@ -347,8 +371,6 @@ R.OVERDUEAMT AS overdueAmount,
     return res.status(500).json({ message: "Internal server error" });
   }
 });
-
-
 //============================================================================================
 //                                ACCOUNT DETAILS
 //============================================================================================
@@ -776,39 +798,95 @@ app.post("/api/home/members-summary-v3", async (req, res) => {
     // =====================================================
     // 2️⃣ MARKETING SUMMARY (From Leads_Data)
     // =====================================================
-    const marketingResult = await pool.request()
-      .input("UserId", sql.VarChar(50), String(userId))
-      .query(`
-        SELECT
-          SUM(CASE WHEN SelectLeadType IS NOT NULL THEN 1 ELSE 0 END) AS marketing_pending
-        FROM Leads_Data
-        WHERE UserID = @UserId
-      `);
+const marketingResult = await pool.request()
+  .input("UserId", sql.VarChar(50), String(userId))
+  .query(`
 
-    const m = marketingResult.recordset[0] || {};
+  ;WITH LeadLogs AS (
+      SELECT
+          L.SNo,
 
-    // Since Leads don't have InProcess/Completed flags yet,
-    // we treat all as pending for now.
-    const marketingPending = m.marketing_pending || 0;
+          LASTLOG.ActionCode
+
+      FROM Leads_Data L
+
+      OUTER APPLY(
+          SELECT TOP 1 ActionCode
+          FROM Activity_Logs
+          WHERE SourceType='LEAD'
+          AND SourceId=L.SNo
+          ORDER BY LogId DESC
+      ) LASTLOG
+
+      WHERE L.UserID=@UserId
+  )
+
+  SELECT
+
+  SUM(
+      CASE
+          WHEN ActionCode IS NULL
+          OR ActionCode IN (
+		       'LEAD_NOT_SPOKE',
+              'LEAD_BUSY',
+              'LEAD_NOT_REACHABLE',
+              'LEAD_INVALID_NUMBER'
+          )
+          THEN 1 ELSE 0
+      END
+  ) AS marketing_pending,
+
+  SUM(
+      CASE
+          WHEN ActionCode IN (
+              'LEAD_SCHEDULED',
+              'LEAD_FLOW_SUBMITTED',
+              'LEAD_INTEREST_OTHER_PRODUCT',
+              'LEAD_PRODUCT_DEPOSIT',
+              'LEAD_PRODUCT_LOAN',
+              'LEAD_PRODUCT_OTHER',
+              'LEAD_OTHER_PRODUCT_TYPED'
+          )
+          THEN 1 ELSE 0
+      END
+  ) AS marketing_inprocess,
+
+  SUM(
+      CASE
+          WHEN ActionCode IN (
+              'LEAD_LOS_CAPTURED',
+              'LEAD_NO_REQUIREMENT'
+          )
+          THEN 1 ELSE 0
+      END
+  ) AS marketing_completed
+
+  FROM LeadLogs
+
+`);
+
+const m = marketingResult.recordset[0] || {};
 
     // =====================================================
     // FINAL RESPONSE
     // =====================================================
     return res.json({
-      members: {
-        pending:
-          (r.npa_pending || 0) +
-          (r.welcome_pending || 0) +
-          marketingPending,
+members: {
+  pending:
+    (r.npa_pending || 0) +
+    (r.welcome_pending || 0) +
+    (m.marketing_pending || 0),
 
-        inProcess:
-          (r.npa_inprocess || 0) +
-          (r.welcome_inprocess || 0),
+  inProcess:
+    (r.npa_inprocess || 0) +
+    (r.welcome_inprocess || 0) +
+    (m.marketing_inprocess || 0),
 
-        completed:
-          (r.npa_completed || 0) +
-          (r.welcome_completed || 0),
-      },
+  completed:
+    (r.npa_completed || 0) +
+    (r.welcome_completed || 0) +
+    (m.marketing_completed || 0),
+},
 
       npa: {
         pending: r.npa_pending || 0,
@@ -816,11 +894,11 @@ app.post("/api/home/members-summary-v3", async (req, res) => {
         completed: r.npa_completed || 0,
       },
 
-      marketing: {
-        pending: marketingPending,
-        inProcess: 0,
-        completed: 0,
-      },
+marketing: {
+  pending: m.marketing_pending || 0,
+  inProcess: m.marketing_inprocess || 0,
+  completed: m.marketing_completed || 0,
+},
 
       welcome: {
         pending: r.welcome_pending || 0,
@@ -1285,12 +1363,12 @@ app.post("/api/field-visit/stop", async (req, res) => {
 // =====================================
 app.post("/api/saveLead", async (req, res) => {
   try {
+
     let {
       BranchCode,
       BranchName,
       UserID,
       UserName,
-      ClusterName,
       LeadCategory,
       FullName,
       MobileNumber,
@@ -1314,9 +1392,9 @@ app.post("/api/saveLead", async (req, res) => {
     PinCode = PinCode || "";
     DOB = DOB || "";
 
-    // 🔥 NORMALIZE ProductCategory TO MATCH DB
+    // Normalize ProductCategory
     if (ProductCategory === "Loans") {
-      ProductCategory = "Loan";   // DB expects singular
+      ProductCategory = "Loan";
     }
 
     if (ProductCategory === "Deposits") {
@@ -1333,7 +1411,6 @@ app.post("/api/saveLead", async (req, res) => {
       });
     }
 
-    // Optional safety validation
     if (!["Deposits", "Loan"].includes(ProductCategory)) {
       return res.status(400).json({
         success: false,
@@ -1342,6 +1419,26 @@ app.post("/api/saveLead", async (req, res) => {
     }
 
     const pool = await poolPromise;
+
+    // =====================================
+    // FETCH CLUSTER FROM BRANCH MASTER
+    // =====================================
+    const clusterResult = await pool.request()
+      .input("BranchCode", sql.VarChar(50), BranchCode)
+      .query(`
+        SELECT TOP 1 cluster_name
+        FROM smart_call.dbo.Branch_Cluster_Master
+        WHERE branch_code = @BranchCode
+      `);
+
+    if (!clusterResult.recordset.length) {
+      return res.status(400).json({
+        success: false,
+        message: "Cluster not found for this BranchCode"
+      });
+    }
+
+    const ClusterName = clusterResult.recordset[0].cluster_name;
 
     // =====================================
     // INSERT INTO Leads_Data
@@ -1409,11 +1506,14 @@ app.post("/api/saveLead", async (req, res) => {
     });
 
   } catch (err) {
+
     console.log("SAVE LEAD ERROR:", err);
+
     return res.status(500).json({
       success: false,
       message: "Server error while saving lead"
     });
+
   }
 });
 // ================= GET LEADS FOR LOGGED USER =================
@@ -1421,22 +1521,43 @@ app.get("/api/getMyLeads/:userId", async (req, res) => {
   try {
     const { userId } = req.params;
 
-    const pool = await sql.connect(dbConfig);
+    const pool = await poolPromise;
 
     const result = await pool.request()
       .input("UserID", sql.VarChar, userId)
       .query(`
         SELECT 
-          SNo,
-          FullName,
-          MobileNumber,
-          PinCode,
-          SelectLeadType,
-          LeadCategory,
-          TimeStamp
-        FROM Leads_Data
-        WHERE UserID = @UserID
-        ORDER BY TimeStamp DESC
+          L.SNo,
+          L.FullName,
+          L.MobileNumber,
+          L.PinCode,
+          L.SelectLeadType,
+          L.LeadCategory,
+          L.TimeStamp,
+
+          ISNULL(A.AttemptCount,0) AS AttemptCount
+
+        FROM Leads_Data L
+
+        LEFT JOIN
+        (
+          SELECT 
+            SourceId,
+            COUNT(*) AS AttemptCount
+          FROM Activity_Logs
+          WHERE SourceType = 'LEAD'
+          AND ActionCode IN (
+            'LEAD_BUSY',
+            'LEAD_NOT_REACHABLE',
+            'LEAD_INVALID_NUMBER'
+          )
+          GROUP BY SourceId
+        ) A
+        ON A.SourceId = L.SNo
+
+        WHERE L.UserID = @UserID
+
+        ORDER BY L.TimeStamp DESC
       `);
 
     res.json({
@@ -1455,7 +1576,7 @@ app.get("/api/getLeadDetails/:sno", async (req, res) => {
   try {
     const { sno } = req.params;
 
-    const pool = await sql.connect(dbConfig);
+    const pool = await poolPromise;
 
     const result = await pool.request()
       .input("SNo", sql.Int, sno)
@@ -1487,7 +1608,7 @@ app.get("/api/getLeadDetails/:sno", async (req, res) => {
 });
 app.post("/api/activity/history", async (req, res) => {
   try {
-    const { userId, fromDate, toDate, searchText } = req.body;
+    const { userId, fromDate, toDate, searchText, type } = req.body;
 
     if (!userId) {
       return res.status(400).json({ message: "userId required" });
@@ -1497,31 +1618,42 @@ app.post("/api/activity/history", async (req, res) => {
 
     const result = await pool.request()
       .input("UserId", sql.VarChar(50), String(userId))
-      .input("FromDate", sql.Date, fromDate || null)   // ✅ Allow NULL
-      .input("ToDate", sql.Date, toDate || null)       // ✅ Allow NULL
+      .input("FromDate", sql.Date, fromDate || null)
+      .input("ToDate", sql.Date, toDate || null)
       .input("SearchText", sql.VarChar(100), searchText || null)
+      .input("Type", sql.VarChar(20), type || null)
       .query(`
+
         ;WITH LatestAction AS (
           SELECT
-            s.LoanAccountNumber,
+            s.SessionId,
             MAX(l.CreatedAt) AS LatestTime
           FROM smart_call.dbo.Activity_Sessions s
           INNER JOIN smart_call.dbo.Activity_Logs l
             ON s.SessionId = l.SessionId
           WHERE s.StartedByUserId = @UserId
             AND (
-                  (@FromDate IS NULL OR CAST(l.CreatedAt AS DATE) >= @FromDate)
-                  AND
-                  (@ToDate IS NULL OR CAST(l.CreatedAt AS DATE) <= @ToDate)
-                )
-          GROUP BY s.LoanAccountNumber
+                (@FromDate IS NULL OR CAST(l.CreatedAt AS DATE) >= @FromDate)
+                AND
+                (@ToDate IS NULL OR CAST(l.CreatedAt AS DATE) <= @ToDate)
+            )
+            AND (
+                @Type IS NULL
+                OR @Type = 'BOTH'
+                OR UPPER(ISNULL(s.SourceType,'NPA')) = UPPER(@Type)
+            )
+          GROUP BY s.SessionId
         )
 
+        ----------------------
+        -- NPA RECORDS
+        ----------------------
         SELECT
           s.LoanAccountNumber,
+          'NPA' AS SourceType,
+          s.SessionType,
           r.firstname AS CustomerName,
           r.dpdQueue,
-          s.SessionType,
           l.ActionLabel,
           FORMAT(l.CreatedAt, 'dd/MM/yyyy hh:mm tt') AS FormattedTime,
 
@@ -1539,23 +1671,53 @@ app.post("/api/activity/history", async (req, res) => {
 
         FROM LatestAction LA
         INNER JOIN smart_call.dbo.Activity_Sessions s
-          ON s.LoanAccountNumber = LA.LoanAccountNumber
+          ON s.SessionId = LA.SessionId
         INNER JOIN smart_call.dbo.Activity_Logs l
           ON l.SessionId = s.SessionId
          AND l.CreatedAt = LA.LatestTime
-        LEFT JOIN smart_call.dbo.Recovery_Raw_Data r
+        INNER JOIN smart_call.dbo.Recovery_Raw_Data r
           ON r.loanAccountNumber = s.LoanAccountNumber
         LEFT JOIN smart_call.dbo.CallRecovery_Status cr
           ON cr.LoanAccountNumber = s.LoanAccountNumber
          AND cr.UserId = @UserId
+        WHERE ISNULL(s.SourceType,'NPA') = 'NPA'
+          AND (
+              @SearchText IS NULL OR
+              r.firstname LIKE '%' + @SearchText + '%' OR
+              r.loanAccountNumber LIKE '%' + @SearchText + '%'
+          )
 
-        WHERE
-          (@SearchText IS NULL OR
-           s.LoanAccountNumber LIKE '%' + @SearchText + '%' OR
-           r.firstname LIKE '%' + @SearchText + '%' OR
-           r.dpdQueue LIKE '%' + @SearchText + '%')
+        UNION ALL
 
-        ORDER BY l.CreatedAt DESC
+        ----------------------
+        -- LEAD RECORDS
+        ----------------------
+        SELECT
+          s.LoanAccountNumber,
+          'LEAD' AS SourceType,
+          s.SessionType,
+          ld.FullName AS CustomerName,
+          NULL AS dpdQueue,
+          l.ActionLabel,
+          FORMAT(l.CreatedAt, 'dd/MM/yyyy hh:mm tt') AS FormattedTime,
+          'PENDING' AS AccountStatus
+
+        FROM LatestAction LA
+        INNER JOIN smart_call.dbo.Activity_Sessions s
+          ON s.SessionId = LA.SessionId
+        INNER JOIN smart_call.dbo.Activity_Logs l
+          ON l.SessionId = s.SessionId
+         AND l.CreatedAt = LA.LatestTime
+        INNER JOIN smart_call.dbo.Leads_Data ld
+          ON ld.SNo = s.SourceId
+        WHERE s.SourceType = 'LEAD'
+          AND (
+              @SearchText IS NULL OR
+              ld.FullName LIKE '%' + @SearchText + '%' OR
+              ld.MobileNumber LIKE '%' + @SearchText + '%'
+          )
+
+        ORDER BY FormattedTime DESC
       `);
 
     res.json({
@@ -1621,6 +1783,505 @@ app.post("/api/activity/history-details", async (req, res) => {
     console.error("History details error:", err);
     res.status(500).json({ message: "Details fetch failed" });
   }
+});
+//=============================RESET VISIT=====================================
+app.post("/api/visit/reset", async (req, res) => {
+  try {
+    const { loanAccountNumber, userId } = req.body;
+
+    const pool = await poolPromise;
+
+    await pool.request()
+      .input("LoanAccountNumber", sql.VarChar(50), loanAccountNumber)
+      .input("UserId", sql.VarChar(50), userId)
+      .query(`
+        UPDATE CallRecovery_Status
+        SET
+          PendingFlag = 1,
+          InProcessFlag = 0,
+          CompleteFlag = 0,
+
+          ScheduleVisitTimestamp = GETDATE(),   -- ⭐ IMPORTANT
+
+          ScheduleVisitPendingFlag = 1,
+          ScheduleVisitCompletedFlag = 0,
+
+          UpdatedAt = GETDATE()
+
+        WHERE LoanAccountNumber = @LoanAccountNumber
+        AND UserId = @UserId
+      `);
+
+    res.json({ success: true });
+
+  } catch (err) {
+    console.error("Reset visit error:", err);
+    res.status(500).json({ message: "Reset visit failed" });
+  }
+});
+
+//============================================================================================
+//                               APP SMA Report
+//============================================================================================
+app.get("/api/sma-report", async (req, res) => {
+  try {
+
+    const { cluster, branchCode, branchName, irac } = req.query;
+
+    const pool = await poolPromise;
+
+    // Cluster Name → Cluster Code mapping
+    const clusterMap = {
+      "Krishna": "KR",
+      "Guntur": "GU",
+      "West Godavari": "WG",
+      "Visakhapatnam": "VS"
+    };
+
+    const clusterCode = clusterMap[cluster] || null;
+
+    let query = `
+      SELECT
+        [SNo.],
+        [Br Code],
+        [Branch Name],
+        [Cluster Code],
+        [Account No.],
+        [Account Name],
+        [Account Type Description],
+        [Limit],
+        [Drawing Power],
+        [Int Rate],
+        [Theo Balance],
+        [Cleared Balance],
+        [Uncleared Balance],
+        [Outstanding Balance],
+        [Overdue],
+        [Sanction Date],
+        [Expiry Date],
+        [EMIs Due],
+        [EMIs Paid],
+        [EMIs OD],
+        [NEW IRAC],
+        [OLD IRAC],
+        [NPA Date],
+        [Arrear Condition],
+        [Arrear Description],
+        [Loan Type],
+        [Product Group]
+      FROM smart_call.dbo.SMA_Report
+      WHERE 1=1
+    `;
+
+    // Cluster filter
+    if (clusterCode) {
+      query += ` AND [Cluster Code] = '${clusterCode}'`;
+    }
+
+    // Branch Code filter (handles leading zeros like 00001)
+    if (branchCode) {
+      query += ` AND CAST([Br Code] AS INT) = ${parseInt(branchCode)}`;
+    }
+
+    // Branch Name filter
+    if (branchName) {
+      query += ` AND [Branch Name] LIKE '%${branchName}%'`;
+    }
+
+    // IRAC filter (handles values like 00,01,02 etc)
+    if (irac) {
+      query += ` AND CAST([NEW IRAC] AS INT) = ${parseInt(irac)}`;
+    }
+
+    const result = await pool.request().query(query);
+
+    res.json(result.recordset);
+
+  } catch (err) {
+
+    console.error("SMA API Error:", err);
+    res.status(500).send("Server Error");
+
+  }
+});
+//============================================================================================
+//                                BRANCH CALL
+//============================================================================================
+app.get("/api/branch-contacts", async (req,res)=>{
+
+try{
+
+const {branchCode} = req.query;
+
+const pool = await poolPromise;
+
+const result = await pool.request()
+.input("branchCode",branchCode)
+.query(`
+SELECT
+[Employee Name],
+[Designation],
+[Mobile number]
+FROM smart_call.dbo.employees_master
+WHERE [Br Code] = @branchCode
+`);
+
+res.json(result.recordset);
+
+}catch(err){
+
+console.log("Branch contacts error:",err);
+
+res.status(500).send("Server error");
+
+}
+
+});
+//============================================================================================
+//                                CUSTOMER CALL
+//============================================================================================
+app.get("/api/customer-contact", async (req,res)=>{
+
+try{
+
+const {accountNumber} = req.query;
+
+const pool = await poolPromise;
+
+const result = await pool.request()
+.input("accountNumber",accountNumber)
+.query(`
+SELECT
+firstname,
+mobileNumber
+FROM smart_call.dbo.Recovery_Raw_Data
+WHERE loanAccountNumber = @accountNumber
+`);
+
+res.json(result.recordset);
+
+}catch(err){
+
+console.log("Customer contact error:",err);
+
+res.status(500).send("Server error");
+
+}
+
+});
+
+app.get("/api/customer-numbers", async (req,res)=>{
+
+try{
+
+const {accountNumber} = req.query;
+
+const pool = await poolPromise;
+
+const result = await pool.request()
+.input("accountNumber",accountNumber)
+.query(`
+
+SELECT
+MAX(R.mobileNumber) as mobileNumber,
+MAX(A.AlternateNumber) as AlternateNumber
+
+FROM smart_call.dbo.Recovery_Raw_Data R
+
+FULL OUTER JOIN smart_call.dbo.Recovery_Alternate_Number A
+ON R.loanAccountNumber = A.LoanAccountNumber
+
+WHERE
+R.loanAccountNumber = @accountNumber
+OR
+A.LoanAccountNumber = @accountNumber
+
+`);
+
+res.json(result.recordset);
+
+}catch(err){
+
+console.log("Customer numbers error:",err);
+res.status(500).send("Server error");
+
+}
+
+});
+//=========================SMA START========================================
+app.post("/api/sma/session/start", async (req,res)=>{
+
+try{
+
+const {
+loanAccountNumber,
+userId,
+userName,
+sourceType,
+sourceId
+} = req.body;
+
+const pool = await poolPromise;
+
+const result = await pool.request()
+.input("loanAccountNumber",loanAccountNumber)
+.input("userId",userId)
+.input("userName",userName)
+.input("sourceType",sourceType)
+.input("sourceId",sourceId)
+
+.query(`
+
+INSERT INTO smart_call.dbo.SMA_Activity_Sessions
+(
+LoanAccountNumber,
+SessionType,
+StartedByUserId,
+StartedByUserName,
+SourceType,
+SourceId
+)
+
+OUTPUT INSERTED.SessionId
+
+VALUES
+(
+@loanAccountNumber,
+'CALL',
+@userId,
+@userName,
+@sourceType,
+@sourceId
+)
+
+`);
+
+res.json({sessionId: result.recordset[0].SessionId});
+
+}catch(err){
+
+console.log("SMA session start error:",err);
+res.status(500).send("Server error");
+
+}
+
+});
+
+//======================================SMA ACTIVITY===========================================
+//======================================SMA ACTIVITY===========================================
+app.post("/api/sma/log", async (req,res)=>{
+
+try{
+
+const {
+sessionId,
+parentLogId,
+actionCode,
+actionLabel,
+reasonCode,
+metadata,
+userId,
+userName,
+sourceType,
+sourceId
+} = req.body;
+
+const pool = await poolPromise;
+
+const metadataJson = metadata ? JSON.stringify(metadata) : null;
+
+
+//================ INSERT LOG ==================
+
+const result = await pool.request()
+
+.input("sessionId",sessionId)
+.input("parentLogId",parentLogId)
+.input("actionCode",actionCode)
+.input("actionLabel",actionLabel)
+.input("reasonCode",reasonCode)
+.input("metadata",metadataJson)
+.input("userId",userId)
+.input("userName",userName)
+.input("sourceType",sourceType)
+.input("sourceId",sourceId)
+
+.query(`
+
+INSERT INTO smart_call.dbo.SMA_Activity_Logs
+(
+SessionId,
+ParentLogId,
+ActionCode,
+ActionLabel,
+ReasonCode,
+MetadataJson,
+CreatedByUserId,
+CreatedByUserName,
+SourceType,
+SourceId
+)
+
+OUTPUT INSERTED.LogId
+
+VALUES
+(
+@sessionId,
+@parentLogId,
+@actionCode,
+@actionLabel,
+@reasonCode,
+@metadata,
+@userId,
+@userName,
+@sourceType,
+@sourceId
+)
+
+`);
+
+const logId = result.recordset[0].LogId;
+
+
+//================ INSERT NOTE IF USER ENTERED TEXT ==================
+
+let noteText = null;
+
+/*
+Only capture actual typed text.
+Ignore metadata.reason (like OTHERS)
+*/
+
+if(
+metadata &&
+metadata.note &&
+actionCode === "OTHER_REASON_CAPTURED"
+){
+noteText = metadata.note.trim();
+}
+
+if(noteText && noteText.length > 0){
+
+await pool.request()
+
+.input("logId",logId)
+.input("noteText",noteText)
+.input("userId",userId)
+.input("userName",userName)
+
+.query(`
+
+INSERT INTO smart_call.dbo.SMA_Activity_Notes
+(
+LogId,
+NoteText,
+CreatedAt,
+CreatedByUserId,
+CreatedByUserName
+)
+
+VALUES
+(
+@logId,
+@noteText,
+GETDATE(),
+@userId,
+@userName
+)
+
+`);
+
+}
+
+//===========================================================
+
+res.json({logId});
+
+}catch(err){
+
+console.log("SMA log error:",err);
+res.status(500).send("Server error");
+
+}
+
+});
+
+//======================================SMA END==================================
+app.post("/api/sma/session/end", async (req,res)=>{
+
+try{
+
+const {sessionId} = req.body;
+
+const pool = await poolPromise;
+
+await pool.request()
+.input("sessionId",sessionId)
+
+.query(`
+
+UPDATE smart_call.dbo.SMA_Activity_Sessions
+SET
+SessionStatus='COMPLETED',
+EndedAt=GETDATE(),
+IsActive=0
+
+WHERE SessionId=@sessionId
+
+`);
+
+res.json({success:true});
+
+}catch(err){
+
+console.log("SMA end session error:",err);
+res.status(500).send("Server error");
+
+}
+
+});
+//=========================== LEAD STATUS =======================================================================
+app.get("/api/leads/status/:userId", async (req,res)=>{
+
+try{
+
+const {userId} = req.params;
+
+const pool = await poolPromise;
+
+const result = await pool.request()
+.input("UserId",sql.VarChar,userId)
+
+.query(`
+
+SELECT
+L.SNo,
+
+LASTLOG.ActionCode
+
+FROM Leads_Data L
+
+OUTER APPLY(
+    SELECT TOP 1 ActionCode
+    FROM Activity_Logs
+    WHERE SourceType='LEAD'
+    AND SourceId=L.SNo
+    ORDER BY LogId DESC
+) LASTLOG
+
+WHERE L.UserID=@UserId
+
+`);
+
+res.json(result.recordset);
+
+}catch(err){
+
+console.log(err);
+res.status(500).send("Server error");
+
+}
+
 });
 //==================================================================================================================================================================================
 //                                                                         --------------------------------------------------------------------
@@ -1708,6 +2369,36 @@ app.post("/api/recovery-upload", async (req, res) => {
 
   try {
     const pool = await poolPromise;
+	
+	const userId = req.headers["x-user-id"];
+
+if (!userId) {
+  return res.status(401).json({ message: "Unauthorized" });
+}
+
+// Fetch user role from DB
+const roleResult = await pool.request()
+  .input("userId", sql.VarChar(50), userId)
+  .query(`
+    SELECT Role 
+    FROM UsersInfo
+    WHERE UserId = @userId
+  `);
+
+if (!roleResult.recordset.length) {
+  return res.status(403).json({ message: "User not found" });
+}
+
+const userRole = roleResult.recordset[0].Role;
+
+if (
+  userRole === "Branch Manager" ||
+  userRole.startsWith("Regional Manager")
+) {
+  return res.status(403).json({
+    message: "Access Denied. Please Contact Admin."
+  });
+}
 
     const todayCount = records.length;
 
@@ -1887,36 +2578,69 @@ const newRecords =
 app.get("/api/recovery-upload-status", async (req, res) => {
   try {
     const pool = await poolPromise;
+	
+	const userId = req.headers["x-user-id"];
 
-    // 🔹 Get Today's Latest Upload
-    const todayRes = await pool.request().query(`
-      SELECT TOP 1 record_count
-      FROM Recovery_Upload_Log
-      WHERE upload_date = CAST(GETDATE() AS DATE)
-      ORDER BY uploaded_at DESC
-    `);
+if (!userId) {
+  return res.status(401).json({ message: "Unauthorized" });
+}
 
-    const today = todayRes.recordset.length
-      ? todayRes.recordset[0].record_count
-      : 0;
+// Fetch user role from DB
+const roleResult = await pool.request()
+  .input("userId", sql.VarChar(50), userId)
+  .query(`
+    SELECT Role 
+    FROM UsersInfo
+    WHERE UserId = @userId
+  `);
 
-    // 🔹 Get Last Available Upload Before Today
-    const lastRes = await pool.request().query(`
-      SELECT TOP 1 record_count
-      FROM Recovery_Upload_Log
-      WHERE upload_date < CAST(GETDATE() AS DATE)
-      ORDER BY upload_date DESC, uploaded_at DESC
-    `);
+if (!roleResult.recordset.length) {
+  return res.status(403).json({ message: "User not found" });
+}
 
-    const last = lastRes.recordset.length
-      ? lastRes.recordset[0].record_count
-      : 0;
+const userRole = roleResult.recordset[0].Role;
 
-    res.json({
-      archived: today < last ? last - today : 0,
-      uploaded: today > last ? today - last : 0,
-      history_total: today
-    });
+if (
+  userRole === "Branch Manager" ||
+  userRole.startsWith("Regional Manager")
+) {
+  return res.status(403).json({
+    message: "Access Denied. Please Contact Admin."
+  });
+}
+
+// 🔹 Yesterday Last Upload
+const yesterdayRes = await pool.request().query(`
+SELECT TOP 1 record_count
+FROM Recovery_Upload_Log
+WHERE CAST(uploaded_at AS DATE) = CAST(DATEADD(DAY,-1,GETDATE()) AS DATE)
+ORDER BY uploaded_at DESC
+`);
+
+const yesterday = yesterdayRes.recordset.length
+  ? yesterdayRes.recordset[0].record_count
+  : 0;
+
+
+// 🔹 Today Last Upload
+const todayRes = await pool.request().query(`
+SELECT TOP 1 record_count
+FROM Recovery_Upload_Log
+WHERE CAST(uploaded_at AS DATE) = CAST(GETDATE() AS DATE)
+ORDER BY uploaded_at DESC
+`);
+
+const today = todayRes.recordset.length
+  ? todayRes.recordset[0].record_count
+  : 0;
+
+
+// 🔹 Difference Calculation
+res.json({
+  archived: today < yesterday ? yesterday - today : 0,
+  uploaded: today > yesterday ? today - yesterday : 0,
+  history_total: today
+});
 
   } catch (err) {
     console.error("❌ STATUS ERROR:", err);
@@ -1963,9 +2687,9 @@ const isDirectSearch =
 const userInfo = await pool.request()
   .input("userId", sql.VarChar, userId)
   .query(`
-    SELECT Role, BranchName
-    FROM UsersInfo
-    WHERE UserId = @userId
+    SELECT Role, BranchName, ClusterName
+FROM smart_call.dbo.UsersInfo
+WHERE UserId = @userId
   `);
 
 if (!userInfo.recordset.length) {
@@ -1973,7 +2697,19 @@ if (!userInfo.recordset.length) {
 }
 
 const { Role, BranchName: userBranch } = userInfo.recordset[0];
+
 const isBranchManager = Role === "Branch Manager";
+const isRegionalManager = Role?.startsWith("Regional Manager");
+
+// 🔥 Extract cluster from role
+let userCluster = null;
+
+if (isRegionalManager) {
+  const match = Role.match(/\((.*?)\)/);
+  if (match) {
+    userCluster = match[1];
+  }
+}
 
 
     let query = `
@@ -2002,6 +2738,17 @@ const isBranchManager = Role === "Branch Manager";
 if (isBranchManager) {
   query += ` AND R.branchName = @restrictedBranch`;
   request.input("restrictedBranch", sql.VarChar, userBranch);
+}
+
+// 🔒 Regional Manager restriction
+if (isRegionalManager) {
+  query += ` AND R.branchName IN (
+    SELECT branch_name
+    FROM Branch_Cluster_Master
+    WHERE cluster_name = @restrictedCluster
+  )`;
+
+  request.input("restrictedCluster", sql.VarChar, userCluster);
 }
 
     if (mobileNumber) {
@@ -2350,9 +3097,9 @@ app.get("/api/transaction/details/:loanAccountNumber", async (req, res) => {
     const userInfo = await pool.request()
       .input("userId", sql.VarChar, userId)
       .query(`
-        SELECT Role, BranchName
-        FROM UsersInfo
-        WHERE UserId = @userId
+        SELECT Role, BranchName, ClusterName
+FROM smart_call.dbo.UsersInfo
+WHERE UserId = @userId
       `);
 
     if (!userInfo.recordset.length) {
@@ -2360,6 +3107,17 @@ app.get("/api/transaction/details/:loanAccountNumber", async (req, res) => {
     }
 
     const { Role, BranchName: userBranch } = userInfo.recordset[0];
+
+let userCluster = null;
+
+if (Role?.startsWith("Regional Manager")) {
+  const match = Role.match(/\((.*?)\)/);
+  if (match) {
+    userCluster = match[1];
+  }
+}
+
+const isRegionalManager = Role?.startsWith("Regional Manager");
 
     let query = `
       SELECT TOP 1
@@ -2391,6 +3149,17 @@ app.get("/api/transaction/details/:loanAccountNumber", async (req, res) => {
       query += ` AND branchName = @restrictedBranch`;
       request.input("restrictedBranch", sql.VarChar, userBranch);
     }
+	
+	// 🔒 Regional Manager restriction
+if (isRegionalManager) {
+  query += ` AND branchName IN (
+      SELECT branch_name
+      FROM Branch_Cluster_Master
+      WHERE cluster_name = @restrictedCluster
+  )`;
+
+  request.input("restrictedCluster", sql.VarChar, userCluster);
+}
 
     const result = await request.query(query);
 
@@ -2637,7 +3406,7 @@ remainingCols.forEach(col => {
 app.use(cors({
   origin: "*",
   methods: ["GET", "POST", "PUT", "DELETE"],
-  allowedHeaders: ["Content-Type", "Authorization"]
+  allowedHeaders: ["Content-Type", "Authorization", "x-user-id"]
 }));
 
 
@@ -2646,66 +3415,103 @@ app.use(cors({
 // ======================
 app.post("/api/assignUsers/v2", async (req, res) => {
   try {
-	  const userId = req.headers["x-user-id"];
 
-if (!userId) {
-  return res.status(401).json({ message: "Unauthorized" });
-}
-	  
-    const pool = await poolPromise;
-	
-	const userInfo = await pool.request()
-  .input("userId", sql.VarChar, userId)
-  .query(`
-    SELECT Role, BranchName
-    FROM UsersInfo
-    WHERE UserId = @userId
-  `);
+    const userId = req.headers["x-user-id"];
 
-if (!userInfo.recordset.length) {
-  return res.status(403).json({ message: "User not found" });
-}
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
 
-const { Role, BranchName: userBranch } = userInfo.recordset[0];
-	
     const { branchName, cluster } = req.body;
 
-    let query = `
-      SELECT 
-        UserId AS userId,
-        UserName AS name,
-        BranchName AS branchName,
-        ClusterName AS clusterName,
-        Role AS role,
-        BranchCode AS branchCode
-      FROM UsersInfo
-      WHERE Role IN ('Admin','Branch Manager','Calling Agent', 'Regional Manager')
-    `;
+    const pool = await poolPromise;
 
-    const request = pool.request();
-	
-	// 🔒 Restrict branch manager to their branch only
-if (Role === "Branch Manager") {
-  query += ` AND BranchName = @restrictedBranch`;
-  request.input("restrictedBranch", sql.VarChar, userBranch);
+    // Get logged-in user role
+    const userInfo = await pool.request()
+      .input("userId", sql.VarChar, userId)
+      .query(`
+        SELECT Role, BranchName, ClusterName
+FROM smart_call.dbo.UsersInfo
+WHERE UserId = @userId
+      `);
+
+    if (!userInfo.recordset.length) {
+      return res.status(403).json({ message: "User not found" });
+    }
+
+const { Role, BranchName: userBranch } = userInfo.recordset[0];
+
+const isRegionalManager = Role?.startsWith("Regional Manager");
+
+// 🔥 Extract cluster from role
+let userCluster = null;
+
+if (isRegionalManager) {
+  const match = Role.match(/\((.*?)\)/);
+  if (match) {
+    userCluster = match[1];
+  }
 }
 
-    if (cluster && cluster !== "") {
-      query += ` AND ClusterName = @cluster`;
-      request.input("cluster", cluster);
-    }
+    let query = `
+  SELECT 
+    UserId AS userId,
+    UserName AS name,
+    BranchName AS branchName,
+    ClusterName AS clusterName,
+    Role AS role,
+    BranchCode AS branchCode
+  FROM smart_call.dbo.UsersInfo
+  WHERE 
+  (
+      Role LIKE '%Admin%'
+      OR Role LIKE '%Branch Manager%'
+      OR Role LIKE '%Calling Agent%'
+      OR Role LIKE '%Regional Manager%'
+  )
+`;
 
+    const request = pool.request();
+
+    // 🔒 Branch Manager restriction
+    if (Role === "Branch Manager") {
+      query += ` AND BranchName = @restrictedBranch`;
+      request.input("restrictedBranch", sql.VarChar, userBranch);
+    }
+	
+// 🔒 Regional Manager restriction
+if (isRegionalManager) {
+  query += ` AND ClusterName = @restrictedCluster`;
+  request.input("restrictedCluster", sql.VarChar, userCluster);
+}
+
+    // ✅ Cluster filter
+if (cluster && cluster !== "" && cluster !== "Corporate Office") {
+  query += ` AND ClusterName = @cluster`;
+  request.input("cluster", sql.VarChar, cluster);
+}
+
+    // ✅ Branch filter
     if (branchName && branchName !== "") {
       query += ` AND BranchName = @branchName`;
-      request.input("branchName", branchName);
+      request.input("branchName", sql.VarChar, branchName);
     }
 
+    query += ` ORDER BY UserName`;
+
     const result = await request.query(query);
+
     res.json(result.recordset);
 
   } catch (err) {
+
     console.error("assignUsers error:", err);
-    res.status(500).json({ message: "Server Error" });
+
+    res.status(500).json({
+      message: "Server Error",
+      error: err.message
+    });
+
   }
 });
 
@@ -3046,8 +3852,21 @@ app.post("/api/users/list", async (req, res) => {
     branch = "",
 	cluster = "" 
   } = req.body;
+  
+  const role = req.headers["x-user-role"];
+const loggedBranch = req.headers["x-user-branch"];
+const loggedCluster = req.headers["x-user-cluster"];
 
-  const offset = (page - 1) * pageSize;
+  let finalBranch = branch;
+let finalCluster = cluster;
+
+// 🔒 If Branch Manager → force restriction
+if (role === "Branch Manager") {
+  finalBranch = loggedBranch;
+  finalCluster = loggedCluster;
+}
+
+const offset = (page - 1) * pageSize;
 
   try {
     const pool = await poolPromise;
@@ -3085,7 +3904,7 @@ ISNULL((
         (@name = '' OR UserName LIKE '%' + @name + '%')
         AND (@branch = '' OR BranchName = @branch)
 		AND (@cluster = '' OR ClusterName = @cluster)
-      ORDER BY CreatedAt ASC
+      ORDER BY UserName ASC
       OFFSET @offset ROWS
       FETCH NEXT @pageSize ROWS ONLY
     `;
@@ -3100,9 +3919,9 @@ ISNULL((
     `;
 
     const request = pool.request()
-      .input("name", sql.VarChar, name)
-      .input("branch", sql.VarChar, branch)
-	  .input("cluster", sql.VarChar, cluster)
+  .input("name", sql.VarChar, name)
+  .input("branch", sql.VarChar, finalBranch || "")
+  .input("cluster", sql.VarChar, finalCluster || "")
       .input("offset", sql.Int, offset)
       .input("pageSize", sql.Int, pageSize);
 
@@ -3154,8 +3973,22 @@ app.post("/api/field-visit-report", async (req, res) => {
   const { user, cluster, branch, fromDate, toDate } = req.body;
 
   try {
-    const pool = await poolPromise;
+
+    const pool = await poolPromise;   // ✅ MOVE THIS UP
     const request = pool.request();
+
+    const userId = req.headers["x-user-id"];
+if (!userId) return res.status(401).json([]);
+
+    const roleResult = await pool.request()
+      .input("userId", userId)
+      .query(`
+        SELECT Role, BranchName, ClusterName
+        FROM UsersInfo
+        WHERE UserId = @userId
+      `);
+
+    const userInfo = roleResult.recordset[0];
 
     let query = `
       SELECT
@@ -3177,22 +4010,35 @@ app.post("/api/field-visit-report", async (req, res) => {
         f.Variance,
         f.Flow
       FROM smart_call.dbo.FieldVisitReport f
-
       INNER JOIN smart_call.dbo.Account_Assignments aa
         ON f.AccountNo = aa.LoanAccountNumber
         AND f.UserID = aa.AssignedToUserId
-
       WHERE 1 = 1
         AND aa.AssignmentStatus = 'ASSIGNED'
         AND aa.UnassignedAt IS NULL
     `;
+
+    if (userInfo?.Role === "Branch Manager") {
+      query += " AND aa.BranchName = @userBranch";
+      request.input("userBranch", userInfo.BranchName);
+    }
+	
+	// ================= REGIONAL MANAGER RESTRICTION =================
+if (userInfo?.Role?.startsWith("Regional Manager")) {
+
+  const match = userInfo.Role.match(/\((.*?)\)/);
+  const rmCluster = match ? match[1] : "";
+
+  query += " AND aa.ClusterName = @rmCluster";
+  request.input("rmCluster", rmCluster);
+
+}
 
     if (user) {
       query += " AND f.UserID = @user";
       request.input("user", user);
     }
 
-    // ✅ Cluster filter (skip Corporate Office)
     if (cluster && cluster !== "Corporate Office") {
       query += " AND aa.ClusterName = @cluster";
       request.input("cluster", cluster);
@@ -3217,6 +4063,7 @@ app.post("/api/field-visit-report", async (req, res) => {
 
     const result = await request.query(query);
     res.json(result.recordset || []);
+
   } catch (err) {
     console.error("FIELD VISIT REPORT ERROR:", err);
     res.status(500).json([]);
@@ -3372,6 +4219,92 @@ app.post("/api/field-visit-report/export-pdf", (req, res) => {
   doc.end();
 });
 
+// ====================================
+// FIELD VISIT REPORT EXPORT EXCEL
+// ====================================
+
+const ExcelJS = require("exceljs");
+
+app.post("/api/field-visit-report/export-excel", async (req, res) => {
+
+  const { columns, data } = req.body;
+
+  try {
+
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("Field Visit Report");
+
+    const HEADER_LABELS = {
+      sno: "S. No.",
+      UserName: "User Name",
+      AccountNo: "Account No",
+      CustomerName: "Customer Name",
+      BranchLatitude: "Branch Latitude",
+      BranchLongitude: "Branch Longitude",
+      MeetingDate: "Meeting Date",
+      StartLatitude: "Start Latitude",
+      StartLongitude: "Start Longitude",
+      MeetingLatitude: "Meeting Latitude",
+      MeetingLongitude: "Meeting Longitude",
+      MeetingAddress: "Meeting Address",
+      DistanceTravelled: "Distance Travelled",
+      CustomerLatitude: "Customer Latitude",
+      CustomerLongitude: "Customer Longitude",
+      Variance: "Variance",
+      Flow: "Flow"
+    };
+
+    const excelColumns = ["sno", ...columns];
+
+    sheet.columns = excelColumns.map(col => ({
+      header: HEADER_LABELS[col] || col,
+      key: col,
+      width: 25
+    }));
+
+    data.forEach((row, index) => {
+
+      const newRow = {};
+
+      excelColumns.forEach(col => {
+
+        if (col === "sno") newRow[col] = index + 1;
+        else if (col === "MeetingDate" && row[col])
+          newRow[col] = row[col].split("T")[0];
+        else newRow[col] = row[col] ?? "";
+
+      });
+
+      sheet.addRow(newRow);
+
+    });
+
+    // Header style
+    sheet.getRow(1).font = { bold: true };
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+
+    res.setHeader(
+      "Content-Disposition",
+      "attachment; filename=Field_Visit_Report.xlsx"
+    );
+
+    await workbook.xlsx.write(res);
+
+    res.end();
+
+  } catch (err) {
+
+    console.error("EXCEL EXPORT ERROR:", err);
+    res.status(500).send("Excel export failed");
+
+  }
+
+});
+
 
 // =============================
 // Activity Summary
@@ -3380,7 +4313,34 @@ app.post("/api/activity-summary", async (req, res) => {
   const { user, branch, cluster, fromDate, toDate } = req.body;
 
   try {
-    const pool = await sql.connect(dbConfig);
+
+    // ================= USER VALIDATION =================
+    const rawUserId = req.headers["x-user-id"];
+
+    if (!rawUserId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    // ✅ FIXED: No parseInt
+    const userId = rawUserId;
+
+    const pool = await poolPromise;
+
+    // 🔹 Fetch role
+    const roleResult = await pool.request()
+      .input("userId", sql.VarChar(50), userId)   // ✅ FIXED
+      .query(`
+        SELECT Role, BranchName
+        FROM UsersInfo
+        WHERE UserId = @userId
+      `);
+
+    if (!roleResult.recordset.length) {
+      return res.json([]);
+    }
+
+    const userInfo = roleResult.recordset[0];
+
     const request = pool.request();
 
     request.input("fromDate", sql.Date, fromDate || null);
@@ -3416,52 +4376,72 @@ app.post("/api/activity-summary", async (req, res) => {
           AND aa.UnassignedAt IS NULL
     `;
 
+    // ================= BRANCH MANAGER RESTRICTION =================
+    if (userInfo.Role === "Branch Manager") {
+      query += ` AND aa.BranchName = @userBranch`;
+      request.input("userBranch", sql.NVarChar, userInfo.BranchName);
+    }
+	
+	// ================= REGIONAL MANAGER RESTRICTION =================
+if (userInfo.Role.startsWith("Regional Manager")) {
+
+  const match = userInfo.Role.match(/\((.*?)\)/);
+  const rmCluster = match ? match[1] : "";
+
+  query += ` AND aa.ClusterName = @rmCluster`;
+  request.input("rmCluster", sql.NVarChar, rmCluster);
+
+}
+
+    // ================= USER FILTER =================
     if (user) {
-  query += ` AND aa.AssignedToUserName = @user`;
-  request.input("user", sql.NVarChar, user);
-}
+      query += ` AND aa.AssignedToUserId = @user`;
+      request.input("user", sql.VarChar(50), user);
+    }
 
-if (branch) {
-  query += ` AND aa.BranchName = @branch`;
-  request.input("branch", sql.NVarChar, branch);
-}
+    // ================= BRANCH FILTER =================
+    if (branch) {
+      query += ` AND aa.BranchName = @branch`;
+      request.input("branch", sql.NVarChar, branch);
+    }
 
-if (cluster && cluster !== "Corporate Office") {
-  query += ` AND aa.ClusterName = @cluster`;
-  request.input("cluster", sql.NVarChar, cluster);
-}
+    // ================= CLUSTER FILTER =================
+    if (cluster && cluster !== "Corporate Office") {
+      query += ` AND aa.ClusterName = @cluster`;
+      request.input("cluster", sql.NVarChar, cluster);
+    }
 
     query += `
         GROUP BY
           aa.AssignedToUserName,
           aa.BranchName,
-		  aa.ClusterName,
+          aa.ClusterName,
           aa.LoanAccountNumber
       )
 
       SELECT
-  UserName,
-  BranchName,
-  COUNT(*) AS Assigned,
+        UserName,
+        BranchName,
+        COUNT(*) AS Assigned,
 
-  -- cumulative call logic
-  SUM(CASE WHEN CallCount >= 1 THEN 1 ELSE 0 END) AS CalledOnce,
-  SUM(CASE WHEN CallCount >= 2 THEN 1 ELSE 0 END) AS CalledTwice,
-  SUM(CASE WHEN CallCount >= 3 THEN 1 ELSE 0 END) AS CalledThrice,
+        SUM(CASE WHEN CallCount >= 1 THEN 1 ELSE 0 END) AS CalledOnce,
+        SUM(CASE WHEN CallCount >= 2 THEN 1 ELSE 0 END) AS CalledTwice,
+        SUM(CASE WHEN CallCount >= 3 THEN 1 ELSE 0 END) AS CalledThrice,
 
-  -- ✅ TOTAL calls (ALL CALL_SPOKE logs)
-  SUM(CallCount) AS NoOfTimesCalled,
+        SUM(CallCount) AS NoOfTimesCalled,
 
-  SUM(CASE WHEN CallCount = 0 THEN 1 ELSE 0 END) AS NotCalled,
-  SUM(VisitCount) AS NoOfVisits
+        SUM(CASE WHEN CallCount = 0 THEN 1 ELSE 0 END) AS NotCalled,
+        SUM(VisitCount) AS NoOfVisits
 
-FROM CallVisitCounts
-GROUP BY UserName, BranchName
-ORDER BY UserName, BranchName;
+      FROM CallVisitCounts
+      GROUP BY UserName, BranchName
+      ORDER BY UserName, BranchName;
     `;
 
     const result = await request.query(query);
+
     res.json(result.recordset || []);
+
   } catch (err) {
     console.error("Activity Summary Error:", err);
     res.status(500).json([]);
@@ -3589,84 +4569,143 @@ app.post("/api/activity-summary/export-pdf", async (req, res) => {
 
 
 // =====================================================================
-// ASSIGNMENT SUMMARY 
+// ASSIGNMENT SUMMARY
 // =====================================================================
 
 app.post("/api/assignment-summary/search", async (req, res) => {
+
   const { userName, cluster, branch, fromDate, toDate } = req.body;
+
+  const role = req.headers["x-user-role"];
+  const loggedBranch = req.headers["x-user-branch"];
+  const loggedCluster = req.headers["x-user-cluster"];
+
   if (!userName && !cluster && !branch && !fromDate && !toDate) {
-  return res.json([]); // 🚫 Return empty
-}
+    return res.json([]);
+  }
 
   try {
+
     const pool = await poolPromise;
     const request = pool.request();
 
     request.input("UserName", sql.VarChar, userName || "");
-    let selectedCluster = cluster;
 
-if (cluster === "Corporate Office") {
-  selectedCluster = "";   // Treat Corporate Office as ALL
+    let finalCluster = cluster;
+    let finalBranch = branch;
+
+    // 🔒 Branch Manager restriction
+    if (role === "Branch Manager") {
+      finalCluster = loggedCluster;
+      finalBranch = loggedBranch;
+    }
+	
+	// 🔒 Regional Manager restriction
+if (role && role.startsWith("Regional Manager")) {
+
+  const match = role.match(/\((.*?)\)/);
+  const rmCluster = match ? match[1] : "";
+
+  finalCluster = rmCluster;
+
 }
 
-request.input("Cluster", sql.VarChar, selectedCluster || "");
-    request.input("Branch", sql.VarChar, branch || "");
+    // Corporate Office → show all clusters
+    if (finalCluster === "Corporate Office") {
+      finalCluster = "";
+    }
+
+    request.input("Cluster", sql.VarChar, finalCluster || "");
+    request.input("Branch", sql.VarChar, finalBranch || "");
     request.input("FromDate", sql.Date, fromDate || null);
     request.input("ToDate", sql.Date, toDate || null);
 
     const result = await request.query(`
+
       SELECT 
-    A.AssignedByAdminId     AS AssignedByUserId,
-    A.AssignedByAdminName   AS AssignedByUserName,
-    A.AssignedToUserId      AS AssignedToUserId,
-    A.AssignedToUserName    AS AssignedToUserName,
+          A.AssignedByAdminId     AS AssignedByUserId,
+          A.AssignedByAdminName   AS AssignedByUserName,
+          A.AssignedToUserId      AS AssignedToUserId,
+          A.AssignedToUserName    AS AssignedToUserName,
+          A.BranchCode,
+          A.BranchName,
+          A.LoanAccountNumber     AS AccountNumber,
+          R.firstname             AS CustomerName,
+          R.dpdQueue              AS DpdQueue,
+          ISNULL(C.CallCount,0)   AS NoOfCalls
 
-    A.BranchCode,
-    A.BranchName,
+      FROM Account_Assignments A
 
-    A.LoanAccountNumber     AS AccountNumber,
-    R.firstname             AS CustomerName,
-    R.dpdQueue              AS DpdQueue,
+      INNER JOIN Recovery_Raw_Data R
+          ON A.LoanAccountNumber = R.loanAccountNumber
 
-    COUNT(A.LoanAccountNumber) 
-        OVER (PARTITION BY A.AssignedByAdminId) AS NoOfAccounts,
+      OUTER APPLY (
+          SELECT COUNT(AL.LogId) AS CallCount
+          FROM Activity_Sessions S
+          INNER JOIN Activity_Logs AL
+              ON S.SessionId = AL.SessionId
+          WHERE 
+              S.LoanAccountNumber = A.LoanAccountNumber
+              AND AL.ActionCode = 'CALL_SPOKE'
+              AND AL.ActionLabel = 'Spoke to Customer'
+      ) AS C
 
-    ISNULL(C.CallCount, 0)  AS NoOfCalls,
+      WHERE 
+          (@UserName = '' OR A.AssignedByAdminName = @UserName)
+          AND (@Cluster = '' OR A.ClusterName = @Cluster)
+          AND (@Branch = '' OR A.BranchName = @Branch)
+          AND (@FromDate IS NULL OR CAST(A.AssignedAt AS DATE) >= @FromDate)
+          AND (@ToDate IS NULL OR CAST(A.AssignedAt AS DATE) <= @ToDate)
 
-    A.AssignedAt
+      ORDER BY A.AssignedAt DESC
 
-FROM Account_Assignments A
-
-INNER JOIN Recovery_Raw_Data R
-    ON A.LoanAccountNumber = R.loanAccountNumber
-
-OUTER APPLY (
-    SELECT COUNT(AL.LogId) AS CallCount
-    FROM Activity_Sessions S
-    INNER JOIN Activity_Logs AL
-        ON S.SessionId = AL.SessionId
-    WHERE 
-        S.LoanAccountNumber = A.LoanAccountNumber
-        AND AL.ActionCode = 'CALL_SPOKE'
-        AND AL.ActionLabel = 'Spoke to Customer'
-) C
-
-WHERE 
-    (@UserName = '' OR A.AssignedByAdminName = @UserName)
-    AND (@Cluster = '' OR A.ClusterName = @Cluster)
-    AND (@Branch = '' OR A.BranchName = @Branch)
-    AND (@FromDate IS NULL OR CAST(A.AssignedAt AS DATE) >= @FromDate)
-    AND (@ToDate IS NULL OR CAST(A.AssignedAt AS DATE) <= @ToDate)
-
-ORDER BY A.AssignedAt DESC
     `);
 
-    res.json(result.recordset);
+    const rows = result.recordset;
+
+    // ================= GROUP DATA =================
+
+    const grouped = {};
+
+    rows.forEach(row => {
+
+      const key = `${row.AssignedByUserId}_${row.AssignedToUserId}_${row.BranchCode}`;
+
+      if (!grouped[key]) {
+
+        grouped[key] = {
+          AssignedByUserId: row.AssignedByUserId,
+          AssignedByUserName: row.AssignedByUserName,
+          AssignedToUserId: row.AssignedToUserId,
+          AssignedToUserName: row.AssignedToUserName,
+          BranchCode: row.BranchCode,
+          BranchName: row.BranchName,
+          AccountCount: 0,
+          accounts: []
+        };
+
+      }
+
+      grouped[key].AccountCount++;
+
+      grouped[key].accounts.push({
+        AccountNumber: row.AccountNumber,
+        CustomerName: row.CustomerName,
+        DpdQueue: row.DpdQueue,
+        NoOfCalls: row.NoOfCalls
+      });
+
+    });
+
+    res.json(Object.values(grouped));
 
   } catch (err) {
+
     console.error("Assignment summary error:", err);
     res.status(500).send("Server error");
+
   }
+
 });
 
 // ============================================================
@@ -3888,11 +4927,34 @@ doc.font("Helvetica").fontSize(9);
 // BORROWERS CONTACTED BY PHONE 
 // ======================================================
 app.post("/api/borrowers-contacted/search", async (req, res) => {
+
+  const loggedInUserId = req.headers["x-user-id"];
+
+  if (!loggedInUserId) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+
   const { cluster, branch, userId, fromDate, toDate } = req.body;
 
   try {
     const pool = await poolPromise;
-    const request = pool.request();
+
+// 🔥 Get logged-in user role & branch
+const userInfo = await pool.request()
+  .input("userId", sql.VarChar, loggedInUserId)
+  .query(`
+    SELECT Role, BranchName
+    FROM UsersInfo
+    WHERE UserId = @userId
+  `);
+
+if (!userInfo.recordset.length) {
+  return res.status(403).json({ message: "User not found" });
+}
+
+const { Role, BranchName: userBranch } = userInfo.recordset[0];
+
+const request = pool.request();
 
     let query = `
     WITH SpokeSessions AS (
@@ -3956,6 +5018,23 @@ app.post("/api/borrowers-contacted/search", async (req, res) => {
     FROM OrderedLogs
     WHERE 1=1
     `;
+	
+	// 🔒 FORCE BRANCH RESTRICTION
+if (Role === "Branch Manager") {
+  query += ` AND BranchName = @restrictedBranch`;
+  request.input("restrictedBranch", sql.VarChar, userBranch);
+}
+
+// 🔒 FORCE CLUSTER RESTRICTION FOR REGIONAL MANAGER
+if (Role.startsWith("Regional Manager")) {
+
+  const match = Role.match(/\((.*?)\)/);
+  const rmCluster = match ? match[1] : "";
+
+  query += ` AND ClusterName = @rmCluster`;
+  request.input("rmCluster", sql.VarChar, rmCluster);
+
+}
 
     // ================= USER FILTER =================
     if (userId) {
@@ -4184,13 +5263,35 @@ app.post("/api/borrowers-contacted/export-pdf", async (req, res) => {
 app.post("/api/cash-collection-report/search", async (req, res) => {
   const { user, cluster, branch, fromDate, toDate } = req.body;
 
-// ✅ BLOCK EMPTY SEARCH
-if (!user && !cluster && !branch && !fromDate && !toDate) {
-  return res.json([]);  // Return empty data
-}
+  const userIdFromHeader = req.headers["x-user-id"];
+
+  if (!userIdFromHeader) {
+    return res.status(401).json([]);
+  }
+
+  // ✅ Block empty search
+  if (!user && !cluster && !branch && !fromDate && !toDate) {
+    return res.json([]);
+  }
 
   try {
     const pool = await poolPromise;
+
+    // 🔍 Get logged-in user details
+    const userCheck = await pool.request()
+      .input("userId", sql.VarChar(50), userIdFromHeader)
+      .query(`
+        SELECT Role, BranchName, ClusterName
+        FROM UsersInfo
+        WHERE UserId = @userId
+      `);
+
+    if (userCheck.recordset.length === 0) {
+      return res.status(403).json([]);
+    }
+
+    const loggedUser = userCheck.recordset[0];
+
     const request = pool.request();
 
     let query = `
@@ -4226,22 +5327,39 @@ if (!user && !cluster && !branch && !fromDate && !toDate) {
         AND P.type = 'CASH'
     `;
 
+    // 🔒 Branch Manager restriction (INSIDE WHERE)
+    if (loggedUser.Role === "Branch Manager") {
+      query += ` AND A.BranchName = @restrictedBranch`;
+      request.input("restrictedBranch", sql.VarChar(100), loggedUser.BranchName);
+    }
+	
+	// 🔒 Regional Manager restriction
+if (loggedUser.Role.startsWith("Regional Manager")) {
+
+  const match = loggedUser.Role.match(/\((.*?)\)/);
+  const rmCluster = match ? match[1] : "";
+
+  query += ` AND A.ClusterName = @rmCluster`;
+  request.input("rmCluster", sql.VarChar(100), rmCluster);
+
+}
+
     // ================= USER FILTER =================
     if (user) {
       query += ` AND A.AssignedToUserId = @user`;
-      request.input("user", sql.VarChar, user);
+      request.input("user", sql.VarChar(50), user);
     }
 
     // ================= CLUSTER FILTER =================
     if (cluster && cluster !== "Corporate Office") {
       query += ` AND A.ClusterName = @cluster`;
-      request.input("cluster", sql.VarChar, cluster);
+      request.input("cluster", sql.VarChar(100), cluster);
     }
 
     // ================= BRANCH FILTER =================
     if (branch) {
       query += ` AND A.BranchName = @branch`;
-      request.input("branch", sql.VarChar, branch);
+      request.input("branch", sql.VarChar(100), branch);
     }
 
     // ================= DATE FILTER =================
@@ -4457,12 +5575,30 @@ app.post("/api/cash-collection-report/export-pdf", async (req, res) => {
 app.post("/api/user-trips", async (req, res) => {
   const { cluster, branch, fromDate, toDate } = req.body;
 
+const role = req.headers["x-user-role"];
+const loggedBranch = req.headers["x-user-branch"];
+const loggedCluster = req.headers["x-user-cluster"];
+
   if (!cluster && !branch && !fromDate && !toDate) {
     return res.status(200).json([]);
   }
 
   try {
     const pool = await poolPromise;
+	let finalCluster = cluster;
+let finalBranch = branch;
+
+// 🔒 If Branch Manager → force restriction
+if (role === "Branch Manager") {
+  finalCluster = loggedCluster;
+  finalBranch = loggedBranch;
+}
+
+// 🔒 Regional Manager restriction
+if (role?.startsWith("Regional Manager")) {
+  finalCluster = loggedCluster;
+}
+
     const request = pool.request();
 
     let query = `
@@ -4494,16 +5630,17 @@ app.post("/api/user-trips", async (req, res) => {
     `;
 
     // ================= CLUSTER FILTER =================
-    if (cluster && cluster !== "Corporate Office") {
-      query += " AND AA.ClusterName = @cluster";
-      request.input("cluster", sql.VarChar, cluster);
-    }
+    if (finalCluster && finalCluster !== "Corporate Office") {
+  query += " AND AA.ClusterName = @cluster";
+  request.input("cluster", sql.VarChar, finalCluster);
+}
+    
 
     // ================= BRANCH FILTER =================
-    if (branch) {
-      query += " AND AA.BranchName = @branch";
-      request.input("branch", sql.VarChar, branch);
-    }
+    if (finalBranch) {
+  query += " AND AA.BranchName = @branch";
+  request.input("branch", sql.VarChar, finalBranch);
+}
 
     // ================= FROM DATE =================
     if (fromDate) {
@@ -4727,83 +5864,260 @@ app.post("/api/user-trips/export-pdf", async (req, res) => {
 });
 
 
+// ============================================================
+// USER TRIPS → EXPORT EXCEL
+// ============================================================
+
+app.post("/api/user-trips/export-excel", async (req, res) => {
+
+  const { selectedIndexes, columns, fileName, fullData } = req.body;
+
+  try {
+
+    const data = selectedIndexes.map(i => fullData[i]).filter(Boolean);
+
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("User Trips");
+
+    const COLUMN_LABELS = {
+      serialNumber: "S. No.",
+      UserName: "User Name",
+      UserId: "User Id",
+      MemberName: "Member Name",
+      AccountNumber: "Account Number",
+      BranchName: "Branch Name",
+      MonthYear: "Month Year",
+      VisitDate: "Date",
+      TotalDistance: "Total Distance",
+      DistanceTravelled: "Distance Travelled",
+      StartLocation: "Start Location",
+      EndLocation: "End Location"
+    };
+
+    // ===== HEADER =====
+    sheet.columns = columns.map(col => ({
+      header: COLUMN_LABELS[col] || col,
+      key: col,
+      width: 25
+    }));
+
+    // ===== DATA =====
+    data.forEach((row, index) => {
+
+      const newRow = {};
+
+      columns.forEach(col => {
+
+        if (col === "serialNumber") {
+          newRow[col] = selectedIndexes[index] + 1;
+        }
+        else if (col === "VisitDate" && row[col]) {
+          newRow[col] = row[col].toString().split("T")[0];
+        }
+        else {
+          newRow[col] = row[col] ?? "";
+        }
+
+      });
+
+      sheet.addRow(newRow);
+
+    });
+
+    // Header Style
+    sheet.getRow(1).font = { bold: true };
+
+    const safeName = (fileName || "User_Trips_Report").replace(/\s+/g, "_");
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${safeName}.xlsx"`
+    );
+
+    // 🔥 IMPORTANT FIX
+    await workbook.xlsx.write(res);
+    res.end();
+
+  } catch (err) {
+
+    console.error("❌ EXCEL EXPORT ERROR:", err);
+    res.status(500).send("Excel export failed");
+
+  }
+
+});
+
+
 // =====================================================================
 // LEAD DATA REPORT
 // =====================================================================
 app.post("/api/lead-data-report", async (req, res) => {
+
+  const loggedUserId = req.headers["x-user-id"];
+
   const { userId, cluster, branch, fromDate, toDate } = req.body;
+
+  if (!loggedUserId) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
 
   if (!userId && !cluster && !branch && !fromDate && !toDate) {
     return res.json([]);
   }
 
   try {
+
     const pool = await poolPromise;
     const request = pool.request();
 
+    // ================= GET LOGGED USER ROLE =================
+    const userInfo = await pool.request()
+      .input("userId", sql.VarChar, loggedUserId)
+      .query(`
+        SELECT Role, BranchName
+        FROM UsersInfo
+        WHERE UserId = @userId
+      `);
+
+    if (!userInfo.recordset.length) {
+      return res.status(403).json({ message: "User not found" });
+    }
+
+    const { Role, BranchName: userBranch } = userInfo.recordset[0];
+
+    const isBranchManager = Role === "Branch Manager";
+	const isRegionalManager = Role?.startsWith("Regional Manager");
+
+    // ================= MAIN QUERY =================
     let query = `
-      SELECT
-        Name,
-        BranchName,
-        UserName,
-        MemberName,
-        MemberAddress,
-        MemberMobileNumber,
-        ProductCategory,
-        InitialProduct,
-        InterestedProduct,
-        CONVERT(VARCHAR, DateOfEntry, 105) AS DateOfEntry,
-        CONVERT(VARCHAR, DateOfVisit, 105) AS DateOfVisit,
-        ActivityStatus
-      FROM smart_call.dbo.Lead_Data_Report
-      WHERE 1 = 1
-    `;
+
+SELECT
+
+L.BranchName,
+L.UserName AS LeadGeneratedBy,
+LA.LeadAssignedToUserName AS LeadAssignedTo,
+L.FullName AS MemberName,
+L.Address AS MemberAddress,
+L.MobileNumber AS MemberMobileNumber,
+L.ProductCategory,
+L.SelectProduct AS InitialProduct,
+'' AS InterestedProduct,
+CONVERT(VARCHAR, L.TimeStamp, 105) AS DateOfEntry,
+'' AS DateOfVisit,
+
+CASE
+  WHEN EXISTS (
+    SELECT 1
+    FROM smart_call.dbo.Activity_Logs AL
+    WHERE AL.SourceId = CAST(L.SNo AS VARCHAR(50))
+      AND AL.ActionCode = 'LEAD_NOT_INTERESTED'
+      AND AL.ActionLabel = 'Lead Not Interested'
+  )
+  THEN 'NOT INTERESTED'
+
+  WHEN EXISTS (
+    SELECT 1
+    FROM smart_call.dbo.Activity_Logs AL
+    WHERE AL.SourceId = CAST(L.SNo AS VARCHAR(50))
+      AND AL.ActionCode = 'LEAD_LOS_CAPTURED'
+      AND AL.ActionLabel = 'LOS Number Captured'
+  )
+  THEN 'OPEN'
+
+  WHEN EXISTS (
+    SELECT 1
+    FROM smart_call.dbo.Activity_Logs AL
+    WHERE AL.SourceId = CAST(L.SNo AS VARCHAR(50))
+  )
+  THEN 'WORKING'
+
+  ELSE 'PENDING'
+END AS ActivityStatus
+
+FROM smart_call.dbo.Leads_Data L
+
+LEFT JOIN smart_call.dbo.Lead_Assignments LA
+ON L.SNo = LA.LeadSNo
+
+WHERE 1 = 1
+`;
+
+   // 🔒 Branch Manager restriction
+if (isBranchManager) {
+  query += ` AND L.BranchName = @restrictedBranch `;
+  request.input("restrictedBranch", sql.VarChar, userBranch);
+}
+
+// 🔒 Regional Manager restriction
+if (isRegionalManager) {
+
+  query += `
+  AND L.BranchName IN (
+    SELECT branch_name
+    FROM Branch_Cluster_Master
+    WHERE cluster_name = @rmCluster
+  )
+  `;
+
+  const match = Role.match(/\((.*?)\)/);
+  const rmCluster = match ? match[1] : "";
+
+  request.input("rmCluster", sql.VarChar, rmCluster);
+}
 
     // ================= USER FILTER =================
     if (userId) {
-      query += " AND UserName = @userId";
+      query += ` AND LA.LeadAssignedToUserId = @userId `;
       request.input("userId", sql.VarChar, userId);
     }
 
     // ================= CLUSTER FILTER =================
     if (cluster && cluster !== "Corporate Office") {
       query += `
-        AND BranchName IN (
-          SELECT branch_name
-          FROM Branch_Cluster_Master
-          WHERE cluster_name = @cluster
-        )
+      AND L.BranchName IN (
+        SELECT branch_name
+        FROM Branch_Cluster_Master
+        WHERE cluster_name = @cluster
+      )
       `;
       request.input("cluster", sql.VarChar, cluster);
     }
 
     // ================= BRANCH FILTER =================
     if (branch) {
-      query += " AND BranchName = @branch";
+      query += ` AND L.BranchName = @branch `;
       request.input("branch", sql.VarChar, branch);
     }
 
-    // ================= FROM DATE =================
+    // ================= DATE FILTER =================
     if (fromDate) {
-      query += " AND CAST(DateOfEntry AS DATE) >= @fromDate";
+      query += ` AND CAST(L.TimeStamp AS DATE) >= @fromDate `;
       request.input("fromDate", sql.Date, fromDate);
     }
 
-    // ================= TO DATE =================
     if (toDate) {
-      query += " AND CAST(DateOfEntry AS DATE) <= @toDate";
+      query += ` AND CAST(L.TimeStamp AS DATE) <= @toDate `;
       request.input("toDate", sql.Date, toDate);
     }
 
-    query += " ORDER BY DateOfEntry DESC";
+    query += ` ORDER BY L.TimeStamp DESC`;
 
     const result = await request.query(query);
 
     res.json(result.recordset || []);
+
   } catch (err) {
+
     console.error("❌ LEAD DATA REPORT ERROR:", err);
     res.status(500).json([]);
+
   }
+
 });
 
 // ============================================================
@@ -4883,20 +6197,21 @@ columns.forEach(col => {
   }
 });
 
-    const COLUMN_LABELS = {
-      serialNumber: "S. No.",
-      BranchName: "Branch Name",
-      UserName: "User Name",
-      MemberName: "Member Name",
-      MemberAddress: "Member Address",
-      MemberMobileNumber: "Member Mobile Number",
-      ProductCategory: "Product Category",
-      InitialProduct: "Initial Product",
-      InterestedProduct: "Interested Product",
-      DateOfEntry: "Date Of Entry",
-      DateOfVisit: "Date Of Visit",
-      ActivityStatus: "Activity Status"
-    };
+const COLUMN_LABELS = {
+  serialNumber: "S. No.",
+  BranchName: "Branch Name",
+  LeadGeneratedBy: "Lead Generated By",
+  LeadAssignedTo: "Lead Assigned To",
+  MemberName: "Member Name",
+  MemberAddress: "Member Address",
+  MemberMobileNumber: "Member Mobile Number",
+  ProductCategory: "Product Category",
+  InitialProduct: "Initial Product",
+  InterestedProduct: "Interested Product",
+  DateOfEntry: "Date Of Entry",
+  DateOfVisit: "Date Of Visit",
+  ActivityStatus: "Activity Status"
+};
 
     let y = doc.y;
 
@@ -4994,10 +6309,104 @@ columns.forEach(col => {
 });
 
 
+// ============================================================
+// LEAD DATA REPORT → EXPORT EXCEL
+// ============================================================
+
+app.post("/api/lead-data-report/export-excel", async (req, res) => {
+
+  const { selectedIndexes, columns, fileName, fullData } = req.body;
+
+  if (!selectedIndexes || selectedIndexes.length === 0) {
+    return res.status(400).json({ message: "No records selected" });
+  }
+
+  if (!columns || columns.length === 0) {
+    return res.status(400).json({ message: "No columns selected" });
+  }
+
+  try {
+
+    const data = selectedIndexes.map(i => fullData[i]).filter(Boolean);
+
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("Lead Data Report");
+
+    const COLUMN_LABELS = {
+      serialNumber: "S. No.",
+      BranchName: "Branch Name",
+      LeadGeneratedBy: "Lead Generated By",
+      LeadAssignedTo: "Lead Assigned To",
+      MemberName: "Member Name",
+      MemberAddress: "Member Address",
+      MemberMobileNumber: "Member Mobile Number",
+      ProductCategory: "Product Category",
+      InitialProduct: "Initial Product",
+      InterestedProduct: "Interested Product",
+      DateOfEntry: "Date Of Entry",
+      DateOfVisit: "Date Of Visit",
+      ActivityStatus: "Activity Status"
+    };
+
+    // ===== CREATE HEADERS =====
+    sheet.columns = columns.map(col => ({
+      header: COLUMN_LABELS[col] || col,
+      key: col,
+      width: 25
+    }));
+
+    // ===== INSERT DATA =====
+    data.forEach((row, index) => {
+
+      const newRow = {};
+
+      columns.forEach(col => {
+
+        if (col === "serialNumber") {
+          newRow[col] = selectedIndexes[index] + 1;
+        } else {
+          newRow[col] = row[col] ?? "";
+        }
+
+      });
+
+      sheet.addRow(newRow);
+
+    });
+
+    // Header Style
+    sheet.getRow(1).font = { bold: true };
+
+    const safeName = (fileName || "Lead_Data_Report")
+      .replace(/\s+/g, "_");
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${safeName}.xlsx"`
+    );
+
+    await workbook.xlsx.write(res);
+    res.end();
+
+  } catch (err) {
+
+    console.error("❌ LEAD DATA EXCEL ERROR:", err);
+    res.status(500).json({ message: "Excel export failed" });
+
+  }
+
+});
+
+
+
 // =============================
 // LEAD DATA UPLOAD (UPDATED SCHEMA)
 // =============================
-
 const parseDate = (value) => {
   if (!value) return null;
   const d = new Date(value);
@@ -5013,6 +6422,13 @@ const ALLOWED_LEAD_CATEGORIES = ["Known Lead", "Unknown Lead"];
 const ALLOWED_LEAD_TYPES = ["Hot Lead", "Warm Lead", "Cold Lead"];
 
 app.post("/api/leads/upload", async (req, res) => {
+	
+	const userId = req.headers["x-user-id"];
+
+if (!userId) {
+  return res.status(401).json({ message: "Unauthorized" });
+}
+
   const leads = req.body;
 
   if (!Array.isArray(leads) || leads.length === 0) {
@@ -5020,22 +6436,46 @@ app.post("/api/leads/upload", async (req, res) => {
   }
 
   const pool = await poolPromise;
+  
+  const userInfo = await pool.request()
+  .input("userId", sql.VarChar, userId)
+  .query(`
+    SELECT Role
+    FROM UsersInfo
+    WHERE UserId = @userId
+  `);
+
+if (!userInfo.recordset.length) {
+  return res.status(403).json({ message: "User not found" });
+}
+
+const { Role } = userInfo.recordset[0];
+
+const isAdmin =
+  Role === "Admin" || Role === "Super Admin";
+
+if (!isAdmin) {
+  return res.status(403).json({
+    message: "Only Admin can upload leads"
+  });
+}
+  
   const transaction = new sql.Transaction(pool);
 
   try {
+
     await transaction.begin();
-
-    // STEP 1 — DELETE OLD DATA
-    await new sql.Request(transaction).query(`
-      DELETE FROM dbo.Leads_Data
-    `);
-
+	
+    // =============================
     // STEP 2 — INSERT NEW DATA
+    // =============================
     for (const lead of leads) {
-      const request = new sql.Request(transaction);
 
       const leadCategory = normalizeText(lead.LeadCategory);
       const leadType = normalizeText(lead.SelectLeadType);
+      const userId = normalizeText(lead.UserID || lead.UserId);
+      const branchCode = normalizeText(lead.BranchCode);
+	  const mobileNumber = normalizeText(lead.MobileNumber);
 
       if (!ALLOWED_LEAD_CATEGORIES.includes(leadCategory)) {
         throw new Error(`Invalid LeadCategory`);
@@ -5045,60 +6485,134 @@ app.post("/api/leads/upload", async (req, res) => {
         throw new Error(`Invalid SelectLeadType`);
       }
 
-      request.input("BranchCode", sql.VarChar, normalizeText(lead.BranchCode));
+      if (!userId) {
+        throw new Error(`UserID missing in upload file`);
+      }
+
+      if (!branchCode) {
+        throw new Error(`BranchCode missing in upload file`);
+      }
+	  
+	  if (!mobileNumber) {                     
+  throw new Error(`MobileNumber missing in upload file`);
+}
+
+      // ==================================
+      // FETCH CLUSTER FROM BRANCH MASTER
+      // ==================================
+      const clusterResult = await new sql.Request(transaction)
+        .input("BranchCode", sql.VarChar, branchCode)
+        .query(`
+          SELECT TOP 1 cluster_name
+          FROM smart_call.dbo.Branch_Cluster_Master
+          WHERE branch_code = @BranchCode
+        `);
+
+      if (!clusterResult.recordset.length) {
+        throw new Error(`Cluster not found for BranchCode: ${branchCode}`);
+      }
+
+      const clusterName = clusterResult.recordset[0].cluster_name;
+
+      // =============================
+      // CREATE SQL REQUEST
+      // =============================
+      const request = new sql.Request(transaction);
+
+      request.input("BranchCode", sql.VarChar, branchCode);
       request.input("BranchName", sql.VarChar, normalizeText(lead.BranchName));
-      request.input("ClusterName", sql.VarChar, normalizeText(lead.ClusterName));
-      request.input("UserID", sql.VarChar, normalizeText(lead.UserID));
+      request.input("UserID", sql.VarChar, userId);
       request.input("UserName", sql.VarChar, normalizeText(lead.UserName));
       request.input("LeadCategory", sql.VarChar, leadCategory);
       request.input("FullName", sql.VarChar, normalizeText(lead.FullName || lead.FirstName));
-      request.input("MobileNumber", sql.VarChar, normalizeText(lead.MobileNumber));
+      request.input("MobileNumber", sql.VarChar, mobileNumber);
       request.input("Address", sql.VarChar, normalizeText(lead.Address));
       request.input("PinCode", sql.VarChar, normalizeText(lead.PinCode));
       request.input("DOB", sql.Date, parseDate(lead.DOB));
       request.input("ProductCategory", sql.VarChar, normalizeText(lead.ProductCategory));
       request.input("SelectProduct", sql.VarChar, normalizeText(lead.SelectProduct));
       request.input("SelectLeadType", sql.VarChar, leadType);
+      request.input("ClusterName", sql.VarChar, clusterName);
 
-      // MAIN TABLE
-      await request.query(`
-        INSERT INTO dbo.Leads_Data (
-          BranchCode,
-          BranchName,
-          UserID,
-          UserName,
-          LeadCategory,
-          FullName,
-          MobileNumber,
-          Address,
-          PinCode,
-          DOB,
-          ProductCategory,
-          SelectProduct,
-          SelectLeadType,
-          TimeStamp,
-          ClusterName
-        )
-        VALUES (
-          @BranchCode,
-          @BranchName,
-          @UserID,
-          @UserName,
-          @LeadCategory,
-          @FullName,
-          @MobileNumber,
-          @Address,
-          @PinCode,
-          @DOB,
-          @ProductCategory,
-          @SelectProduct,
-          @SelectLeadType,
-          GETDATE(),
-          @ClusterName
-        )
-      `);
+      // =============================
+// UPSERT INTO MAIN TABLE
+// =============================
+await request.query(`
 
-      // HISTORY TABLE
+IF EXISTS (
+  SELECT 1 
+  FROM dbo.Leads_Data 
+  WHERE MobileNumber = @MobileNumber
+)
+
+BEGIN
+
+  UPDATE dbo.Leads_Data
+  SET
+    BranchCode = @BranchCode,
+    BranchName = @BranchName,
+    UserID = @UserID,
+    UserName = @UserName,
+    LeadCategory = @LeadCategory,
+    FullName = @FullName,
+    Address = @Address,
+    PinCode = @PinCode,
+    DOB = @DOB,
+    ProductCategory = @ProductCategory,
+    SelectProduct = @SelectProduct,
+    SelectLeadType = @SelectLeadType,
+    ClusterName = @ClusterName,
+    TimeStamp = GETDATE()
+  WHERE MobileNumber = @MobileNumber
+
+END
+
+ELSE
+
+BEGIN
+
+  INSERT INTO dbo.Leads_Data (
+    BranchCode,
+    BranchName,
+    UserID,
+    UserName,
+    LeadCategory,
+    FullName,
+    MobileNumber,
+    Address,
+    PinCode,
+    DOB,
+    ProductCategory,
+    SelectProduct,
+    SelectLeadType,
+    TimeStamp,
+    ClusterName
+  )
+  VALUES (
+    @BranchCode,
+    @BranchName,
+    @UserID,
+    @UserName,
+    @LeadCategory,
+    @FullName,
+    @MobileNumber,
+    @Address,
+    @PinCode,
+    @DOB,
+    @ProductCategory,
+    @SelectProduct,
+    @SelectLeadType,
+    GETDATE(),
+    @ClusterName
+  )
+
+END
+
+`);
+
+      // =============================
+      // INSERT INTO HISTORY TABLE
+      // =============================
       await request.query(`
         INSERT INTO dbo.Leads_Data_History (
           BranchCode,
@@ -5137,6 +6651,7 @@ app.post("/api/leads/upload", async (req, res) => {
           @ClusterName
         )
       `);
+
     }
 
     await transaction.commit();
@@ -5147,14 +6662,18 @@ app.post("/api/leads/upload", async (req, res) => {
     });
 
   } catch (err) {
+
     await transaction.rollback();
+
     console.error("LEADS UPLOAD ERROR:", err.message);
 
     res.status(500).json({
       message: "Upload failed",
       error: err.message
     });
+
   }
+
 });
 
 
@@ -5165,31 +6684,106 @@ app.post("/api/leads/upload", async (req, res) => {
 app.post("/api/lead/list/search", async (req, res) => {
   try {
     const {
-      memberName,
-      mobileNumber,
-      pincode,
-      cluster,
-      branch,
-      product,
-      leadType
-    } = req.body;
+  memberName,
+  mobileNumber,
+  pincode,
+  cluster,
+  branch,
+  product,
+  leadType,
+  assignedTo
+} = req.body;
+	
+	// 🔐 Get logged-in user
+const loggedUserId = req.headers["x-user-id"];
 
-    const pool = await sql.connect(dbConfig);
+if (!loggedUserId) {
+  return res.status(401).json([]);
+}
+
+    const pool = await poolPromise;
     const request = pool.request();
+	
+	// 🔐 Get role and branch of logged user
+const userInfo = await pool.request()
+  .input("userId", sql.VarChar, loggedUserId)
+  .query(`
+    SELECT Role, BranchName, ClusterName
+    FROM smart_call.dbo.UsersInfo
+    WHERE UserId = @userId
+  `);
+
+if (!userInfo.recordset.length) {
+  return res.status(403).json([]);
+}
+
+const { Role, BranchName: userBranch, ClusterName: userCluster } = userInfo.recordset[0];
+const isBranchManager = Role === "Branch Manager";
+const isRegionalManager = Role?.startsWith("Regional Manager");
 
     let sqlQuery = `
-      SELECT
-        L.SNo,
-        L.FullName        AS firstName,
-        L.MobileNumber    AS mobileNumber,
-        L.BranchName      AS branch,
-        L.SelectLeadType  AS leadType,
-        L.ClusterName     AS cluster,
-        L.SelectProduct   AS product,
-        L.TimeStamp
-      FROM smart_call.dbo.Leads_Data L
-      WHERE 1 = 1
-    `;
+SELECT
+  L.SNo,
+  L.FullName AS firstName,
+  L.MobileNumber AS mobileNumber,
+  L.BranchName AS branch,
+  L.SelectLeadType AS leadType,
+
+  CASE
+    WHEN AL_NOT_INTERESTED.SourceId IS NOT NULL THEN 'NOT INTERESTED'
+    WHEN AL_LOS.SourceId IS NOT NULL THEN 'OPEN'
+    WHEN AL_ANY.SourceId IS NOT NULL THEN 'WORKING'
+    ELSE 'PENDING'
+  END AS status
+
+FROM smart_call.dbo.Leads_Data L
+
+LEFT JOIN smart_call.dbo.Lead_Assignments LA
+ON L.SNo = LA.LeadSNo
+
+-- Any activity log
+LEFT JOIN (
+    SELECT DISTINCT SourceId
+    FROM smart_call.dbo.Activity_Logs
+) AL_ANY
+ON AL_ANY.SourceId = CAST(L.SNo AS VARCHAR(50))
+
+-- LOS Captured
+LEFT JOIN (
+    SELECT DISTINCT SourceId
+    FROM smart_call.dbo.Activity_Logs
+    WHERE ActionCode = 'LEAD_LOS_CAPTURED'
+      AND ActionLabel = 'LOS Number Captured'
+) AL_LOS
+ON AL_LOS.SourceId = CAST(L.SNo AS VARCHAR(50))
+
+-- Not Interested
+LEFT JOIN (
+    SELECT DISTINCT SourceId
+    FROM smart_call.dbo.Activity_Logs
+    WHERE ActionCode = 'LEAD_NOT_INTERESTED'
+      AND ActionLabel = 'Lead Not Interested'
+) AL_NOT_INTERESTED
+ON AL_NOT_INTERESTED.SourceId = CAST(L.SNo AS VARCHAR(50))
+
+WHERE 1 = 1
+`;
+
+// 🔒 Branch Manager Restriction
+if (isBranchManager) {
+  sqlQuery += `
+    AND LTRIM(RTRIM(LOWER(L.BranchName))) = LOWER(@restrictedBranch)
+  `;
+  request.input("restrictedBranch", sql.VarChar, userBranch.trim());
+}
+
+// 🔒 Regional Manager Restriction
+if (isRegionalManager) {
+  sqlQuery += `
+    AND LTRIM(RTRIM(LOWER(L.ClusterName))) = LOWER(@restrictedCluster)
+  `;
+  request.input("restrictedCluster", sql.VarChar, userCluster.trim());
+}
 
     let filterApplied = false;
 
@@ -5200,12 +6794,12 @@ app.post("/api/lead/list/search", async (req, res) => {
       filterApplied = true;
     }
 
-    // 🔎 Mobile
-    if (mobileNumber) {
-      sqlQuery += " AND L.MobileNumber LIKE @mobileNumber";
-      request.input("mobileNumber", sql.VarChar, `%${mobileNumber}%`);
-      filterApplied = true;
-    }
+   // 🔎 Mobile
+if (mobileNumber) {
+  sqlQuery += " AND CAST(L.MobileNumber AS VARCHAR(20)) LIKE @mobileNumber";
+  request.input("mobileNumber", sql.VarChar, `%${mobileNumber}%`);
+  filterApplied = true;
+}
 
     // 🔎 Pincode
     if (pincode) {
@@ -5244,15 +6838,28 @@ app.post("/api/lead/list/search", async (req, res) => {
       request.input("leadType", sql.VarChar, leadType);
       filterApplied = true;
     }
+	
+	// 🔎 Assigned To
+if (assignedTo) {
+
+  // Show only leads assigned to that user
+  sqlQuery += " AND LA.LeadAssignedToUserId = @assignedTo";
+  request.input("assignedTo", sql.VarChar, assignedTo);
+  filterApplied = true;
+
+} else {
+
+  // If Assigned To NOT selected → show only PENDING leads
+  sqlQuery += " AND LA.LeadSNo IS NULL";
+
+}
 
     // ✅ IMPORTANT: If no filter applied → return empty
     if (!filterApplied) {
       return res.json([]);
     }
-
+	
     sqlQuery += " ORDER BY L.TimeStamp DESC";
-
-    console.log("FINAL SQL:", sqlQuery);
 
     const result = await request.query(sqlQuery);
     res.json(result.recordset);
@@ -5263,12 +6870,236 @@ app.post("/api/lead/list/search", async (req, res) => {
   }
 });
 
-
 // =============================
-// LEAD ACTIVITY STATUS (STRICT MODE)
+// LEAD DETAILS
 // =============================
-app.post("/api/leads-data/search", async (req, res) => {
+app.get("/api/lead/details/:sno", async (req, res) => {
   try {
+
+    const { sno } = req.params;
+
+    const pool = await poolPromise;
+
+    const result = await pool.request()
+      .input("sno", sql.Int, sno)
+      .query(`
+        SELECT
+          FullName,
+          MobileNumber,
+          Address,
+          PinCode,
+          DOB,
+          SelectProduct
+        FROM smart_call.dbo.Leads_Data
+        WHERE SNo = @sno
+      `);
+
+    if (!result.recordset.length) {
+      return res.json({});
+    }
+
+    res.json(result.recordset[0]);
+
+  } catch (err) {
+    console.error("Lead Details Error:", err);
+    res.status(500).json({});
+  }
+});
+
+
+// =====================================
+// ASSIGN LEADS (LEAD LIST)
+// =====================================
+
+app.post("/api/lead/assign", async (req, res) => {
+
+  try {
+
+    const { mobileNumbers, assignedUserId } = req.body;
+    const adminUserId = req.headers["x-user-id"];
+
+    if (!adminUserId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    if (!mobileNumbers || mobileNumbers.length === 0) {
+      return res.json({ message: "No leads selected" });
+    }
+
+    // ✅ CONNECT FIRST
+   const pool = await poolPromise;
+
+    // 🔐 Get admin role and branch
+    const adminInfoFull = await pool.request()
+      .input("userId", sql.VarChar, adminUserId)
+      .query(`
+        SELECT Role, BranchName
+        FROM smart_call.dbo.UsersInfo
+        WHERE UserId = @userId
+      `);
+
+    if (!adminInfoFull.recordset.length) {
+      return res.status(403).json({ message: "User not found" });
+    }
+
+    const { Role, BranchName: adminBranch } = adminInfoFull.recordset[0];
+    const isBranchManager = Role === "Branch Manager";
+
+    // Get Admin Info
+    const adminInfo = await pool.request()
+      .input("userId", sql.VarChar, adminUserId)
+      .query(`
+        SELECT UserId, UserName
+        FROM smart_call.dbo.UsersInfo
+        WHERE UserId = @userId
+      `);
+
+    const adminName = adminInfo.recordset[0].UserName;
+
+    // Get Assigned User Info
+    const userInfo = await pool.request()
+      .input("userId", sql.VarChar, assignedUserId)
+      .query(`
+        SELECT UserId, UserName, BranchCode, BranchName, ClusterName
+        FROM smart_call.dbo.UsersInfo
+        WHERE UserId = @userId
+      `);
+
+    if (!userInfo.recordset.length) {
+      return res.json({ message: "Assigned user not found" });
+    }
+
+    const assignedUser = userInfo.recordset[0];
+
+    let assignedCount = 0;
+
+    for (const mobile of mobileNumbers) {
+
+      let leadQuery = `
+      SELECT TOP 1
+        SNo,
+        MobileNumber,
+        FullName,
+        ProductCategory,
+        SelectProduct,
+        BranchName
+      FROM smart_call.dbo.Leads_Data
+      WHERE MobileNumber = @mobile
+      `;
+
+      const leadRequest = pool.request();
+      leadRequest.input("mobile", sql.VarChar, mobile);
+
+      if (isBranchManager) {
+        leadQuery += " AND LOWER(LTRIM(RTRIM(BranchName))) = LOWER(@restrictedBranch)";
+        leadRequest.input("restrictedBranch", sql.VarChar, adminBranch.trim());
+      }
+
+      const leadData = await leadRequest.query(leadQuery);
+
+      if (!leadData.recordset.length) continue;
+
+      const lead = leadData.recordset[0];
+	  
+	  // 🚫 Do not allow assignment if lead is OPEN or NOT INTERESTED
+const activityCheck = await pool.request()
+  .input("sourceId", sql.VarChar, String(lead.SNo))
+  .query(`
+    SELECT TOP 1 ActionCode
+    FROM smart_call.dbo.Activity_Logs
+    WHERE SourceId = @sourceId
+    AND ActionCode IN ('LEAD_LOS_CAPTURED','LEAD_NOT_INTERESTED')
+  `);
+
+if (activityCheck.recordset.length > 0) {
+  continue; // skip this lead
+}
+
+      if (!lead || !lead.SNo) {
+        console.log("Lead not found for mobile:", mobile);
+        continue;
+      }
+
+      await pool.request()
+        .input("LeadSNo", sql.Int, lead.SNo)
+        .input("LeadMobileNumber", sql.VarChar(20), lead.MobileNumber)
+        .input("LeadFullName", sql.VarChar(200), lead.FullName)
+        .input("LeadProductCategory", sql.VarChar(100), lead.ProductCategory)
+        .input("LeadSelectProduct", sql.VarChar(100), lead.SelectProduct)
+        .input("LeadAssignedToUserId", sql.VarChar(50), assignedUser.UserId)
+        .input("LeadAssignedToUserName", sql.VarChar(200), assignedUser.UserName)
+        .input("LeadAssignedByAdminId", sql.VarChar(50), adminUserId)
+        .input("LeadAssignedByAdminName", sql.VarChar(200), adminName)
+        .input("BranchCode", sql.VarChar(20), assignedUser.BranchCode)
+        .input("BranchName", sql.VarChar(200), assignedUser.BranchName)
+        .input("ClusterName", sql.VarChar(200), assignedUser.ClusterName)
+        .query(`
+          INSERT INTO smart_call.dbo.Lead_Assignments
+          (
+            LeadSNo,
+            LeadMobileNumber,
+            LeadFullName,
+            LeadProductCategory,
+            LeadSelectProduct,
+            LeadAssignedToUserId,
+            LeadAssignedToUserName,
+            LeadAssignedByAdminId,
+            LeadAssignedByAdminName,
+            BranchCode,
+            BranchName,
+            ClusterName,
+            LeadAssignmentStatus,
+            LeadWorkStatus,
+            LeadAssignedAt
+          )
+          VALUES
+          (
+            @LeadSNo,
+            @LeadMobileNumber,
+            @LeadFullName,
+            @LeadProductCategory,
+            @LeadSelectProduct,
+            @LeadAssignedToUserId,
+            @LeadAssignedToUserName,
+            @LeadAssignedByAdminId,
+            @LeadAssignedByAdminName,
+            @BranchCode,
+            @BranchName,
+            @ClusterName,
+            'ASSIGNED',
+            'PENDING',
+            GETDATE()
+          )
+        `);
+
+      assignedCount++;
+
+    }
+
+    res.json({
+      message: `${assignedCount} lead(s) assigned successfully`
+    });
+
+  } catch (err) {
+    console.error("Lead Assign Error:", err);
+    res.status(500).json({ message: "Assignment failed" });
+  }
+
+});
+
+// ============================================================
+// LEAD ACTIVITY STATUS PAGE
+// ============================================================
+app.post("/api/leads-data/search", async (req, res) => {
+
+  const userId = req.headers["x-user-id"];
+
+  if (!userId) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+
+  try {
+
     const {
       memberName = "",
       mobileNumber = "",
@@ -5283,118 +7114,1690 @@ app.post("/api/leads-data/search", async (req, res) => {
     } = req.body;
 
     const pool = await poolPromise;
+
+    // 🔒 Get logged-in user role
+    const userInfo = await pool.request()
+      .input("userId", sql.VarChar, userId)
+      .query(`
+        SELECT Role, BranchName, ClusterName
+        FROM UsersInfo
+        WHERE UserId = @userId
+      `);
+
+    if (!userInfo.recordset.length) {
+      return res.status(403).json({ message: "User not found" });
+    }
+
+    const { Role, BranchName: userBranch, ClusterName: userCluster } = userInfo.recordset[0];
+
+const isBranchManager = Role === "Branch Manager";
+const isRegionalManager = Role?.startsWith("Regional Manager");
+
     const request = pool.request();
 
     let query = `
-      SELECT
-        L.SNo,
-        L.FullName        AS memberName,
-        L.MobileNumber    AS mobileNumber,
-        L.BranchName      AS branchName,
-        L.SelectProduct   AS product,
-        L.SelectLeadType  AS leadType,
-        L.ClusterName     AS cluster,
-        A.LeadStatus      AS leadStatus,
-        A.AssignedTo      AS assignedTo,
-        A.ClosedBy        AS closedBy,
-        L.TimeStamp
-      FROM smart_call.dbo.Leads_Data L
-      LEFT JOIN smart_call.dbo.Lead_Activity_Status A
-        ON L.SNo = A.SNo
-      WHERE 1 = 1
-    `;
+SELECT
 
-    let filterApplied = false;
+AL.SourceId AS loanAccountNumber,
 
-    // 🔎 Member Name
-    if (memberName.trim()) {
-      query += " AND LOWER(L.FullName) LIKE LOWER(@memberName)";
-      request.input("memberName", sql.VarChar, `%${memberName.trim()}%`);
-      filterApplied = true;
+ISNULL(LD.FullName,'-') AS memberName,
+ISNULL(LD.MobileNumber,'-') AS mobileNumber,
+
+COALESCE(LA.BranchName,LD.BranchName) AS branchName,
+COALESCE(LA.ClusterName,LD.ClusterName) AS clusterName,
+
+ISNULL(LA.LeadAssignedToUserName,'-') AS assignedTo,
+
+COALESCE(LA.LeadAssignedToUserName,LD.UserName) AS closedBy,
+
+FORMAT(MAX(AL.CreatedAt),'dd-MM-yyyy') AS activityDate,
+FORMAT(MAX(AL.CreatedAt),'hh:mm tt') AS activityTime
+
+FROM smart_call.dbo.Activity_Logs AL
+
+LEFT JOIN smart_call.dbo.Leads_Data LD
+ON LD.SNo = AL.SourceId
+
+LEFT JOIN smart_call.dbo.Lead_Assignments LA
+ON LA.LeadSNo = AL.SourceId
+
+WHERE
+AL.SourceType='LEAD'
+`;
+
+    // 🔒 Branch Manager restriction
+    if (isBranchManager) {
+
+      query += `
+AND COALESCE(LA.BranchName,LD.BranchName)=@restrictedBranch
+`;
+
+      request.input("restrictedBranch", sql.VarChar, userBranch);
+    }
+	
+	// 🔒 Regional Manager restriction
+if (isRegionalManager) {
+
+  query += `
+AND COALESCE(LA.ClusterName,LD.ClusterName)=@restrictedCluster
+`;
+
+  request.input("restrictedCluster", sql.VarChar, userCluster);
+}	
+
+    // Member Name
+    if (memberName) {
+
+      query += `
+AND LD.FullName LIKE @memberName
+`;
+
+      request.input("memberName", sql.VarChar, `%${memberName}%`);
     }
 
-    // 🔎 Mobile
-    if (mobileNumber.trim()) {
-      query += " AND L.MobileNumber LIKE @mobileNumber";
-      request.input("mobileNumber", sql.VarChar, `%${mobileNumber.trim()}%`);
-      filterApplied = true;
+    // Mobile Number
+    if (mobileNumber) {
+
+      query += `
+AND LD.MobileNumber LIKE @mobileNumber
+`;
+
+      request.input("mobileNumber", sql.VarChar, `%${mobileNumber}%`);
     }
 
-    // 🔎 Pincode
-    if (pincode.trim()) {
-      query += " AND L.PinCode = @pincode";
-      request.input("pincode", sql.VarChar, pincode.trim());
-      filterApplied = true;
+    // Pincode
+    if (pincode) {
+
+      query += `
+AND LD.PinCode=@pincode
+`;
+
+      request.input("pincode", sql.VarChar, pincode);
     }
 
-    // 🔎 Cluster
-    if (cluster.trim()) {
-      filterApplied = true;
+    // Cluster (Assigned + Unassigned)
+    if (cluster && cluster !== "Corporate Office") {
 
-      if (cluster !== "Corporate Office") {
-        query += " AND LOWER(L.ClusterName) LIKE LOWER(@cluster)";
-        request.input("cluster", sql.VarChar, `%${cluster.trim()}%`);
-      }
+      query += `
+AND COALESCE(LA.ClusterName,LD.ClusterName)=@cluster
+`;
+
+      request.input("cluster", sql.VarChar, cluster);
     }
 
-    // 🔎 Branch
-    if (branchName.trim()) {
-      query += " AND LOWER(L.BranchName) LIKE LOWER(@branchName)";
-      request.input("branchName", sql.VarChar, `%${branchName.trim()}%`);
-      filterApplied = true;
+    // Branch (Assigned + Unassigned)
+    if (branchName) {
+
+      query += `
+AND COALESCE(LA.BranchName,LD.BranchName)=@branchName
+`;
+
+      request.input("branchName", sql.VarChar, branchName);
     }
 
-    // 🔎 Product
-    if (product.trim()) {
-      query += " AND LOWER(L.SelectProduct) LIKE LOWER(@product)";
-      request.input("product", sql.VarChar, `%${product.trim()}%`);
-      filterApplied = true;
+    // Product
+    if (product) {
+
+      query += `
+AND LD.SelectProduct=@product
+`;
+
+      request.input("product", sql.VarChar, product);
     }
 
-    // 🔎 Lead Type
-    if (leadType.trim()) {
-      query += " AND L.SelectLeadType = @leadType";
-      request.input("leadType", sql.VarChar, leadType.trim());
-      filterApplied = true;
+    // Lead Type
+    if (leadType) {
+
+      query += `
+AND LD.SelectLeadType=@leadType
+`;
+
+      request.input("leadType", sql.VarChar, leadType);
     }
 
-    // 🔎 Lead Status
-    if (leadStatus.trim()) {
-      query += " AND A.LeadStatus = @leadStatus";
-      request.input("leadStatus", sql.VarChar, leadStatus.trim());
-      filterApplied = true;
+    // Assigned To
+    if (assignedTo) {
+
+      query += `
+AND LA.LeadAssignedToUserName=@assignedTo
+`;
+
+      request.input("assignedTo", sql.VarChar, assignedTo);
     }
 
-    // 🔎 Assigned To
-    if (assignedTo.trim()) {
-      query += " AND A.AssignedTo = @assignedTo";
-      request.input("assignedTo", sql.VarChar, assignedTo.trim());
-      filterApplied = true;
+    // Closed By
+    if (closedBy) {
+
+      query += `
+AND COALESCE(LA.LeadAssignedToUserName,LD.UserName)=@closedBy
+`;
+
+      request.input("closedBy", sql.VarChar, closedBy);
     }
 
-    // 🔎 Closed By
-    if (closedBy.trim()) {
-      query += " AND A.ClosedBy = @closedBy";
-      request.input("closedBy", sql.VarChar, closedBy.trim());
-      filterApplied = true;
-    }
+ // ============================================================
+// Lead Status Logic (Activity Logs Based)
+// ============================================================
 
-    // ✅ No filter selected → return empty
-    if (!filterApplied) {
+if (leadStatus === "Open") {
+
+  query += `
+AND EXISTS (
+SELECT 1
+FROM smart_call.dbo.Activity_Logs A2
+WHERE A2.SourceType='LEAD'
+AND A2.SourceId = LD.SNo
+AND A2.ActionCode='LEAD_LOS_CAPTURED'
+)
+`;
+
+}
+
+if (leadStatus === "Closed-Converted") {
+
+  query += `
+AND EXISTS (
+SELECT 1
+FROM smart_call.dbo.Activity_Logs A2
+WHERE A2.SourceType='LEAD'
+AND A2.SourceId = LD.SNo
+AND A2.ActionCode='LEAD_LOS_CAPTURED'
+)
+`;
+
+}
+
+if (leadStatus === "Closed-Not Converted") {
+
+  query += `
+AND EXISTS (
+SELECT 1
+FROM smart_call.dbo.Activity_Logs A2
+WHERE A2.SourceType='LEAD'
+AND A2.SourceId = LD.SNo
+AND A2.ActionCode='LEAD_NOT_INTERESTED'
+)
+`;
+
+}
+
+if (leadStatus === "Working") {
+
+  query += `
+AND EXISTS (
+SELECT 1
+FROM smart_call.dbo.Activity_Logs A2
+WHERE A2.SourceType='LEAD'
+AND A2.SourceId = LD.SNo
+)
+AND NOT EXISTS (
+SELECT 1
+FROM smart_call.dbo.Activity_Logs A3
+WHERE A3.SourceType='LEAD'
+AND A3.SourceId = LD.SNo
+AND A3.ActionCode IN ('LEAD_LOS_CAPTURED','LEAD_NOT_INTERESTED')
+)
+`;
+
+}
+
+    query += `
+GROUP BY
+
+AL.SourceId,
+LD.FullName,
+LD.MobileNumber,
+LD.UserName,
+
+LA.LeadAssignedToUserName,
+
+LA.BranchName,
+LD.BranchName,
+
+LA.ClusterName,
+LD.ClusterName
+
+ORDER BY MAX(AL.CreatedAt) DESC
+`;
+
+    const result = await request.query(query);
+
+    res.json(result.recordset);
+
+  }
+
+  catch (err) {
+
+    console.error("❌ LEAD ACTIVITY STATUS ERROR:", err);
+    res.status(500).json([]);
+
+  }
+
+});
+
+// ============================================================
+// LEAD ACTIVITY DETAILS POPUP
+// ============================================================
+
+app.post("/api/lead-activity-details", async (req, res) => {
+
+  const userId = req.headers["x-user-id"];
+
+  if (!userId) {
+    return res.status(401).json([]);
+  }
+
+  try {
+
+    const leadSNo = req.body.leadSNo ? String(req.body.leadSNo) : "";
+
+    if (!leadSNo) {
       return res.json([]);
     }
 
-    query += " ORDER BY L.TimeStamp DESC";
+    const pool = await poolPromise;
+
+    // 🔒 Get logged-in user role + branch
+    const userInfo = await pool.request()
+      .input("userId", sql.VarChar, userId)
+      .query(`
+        SELECT Role, BranchName, ClusterName
+        FROM UsersInfo
+        WHERE UserId = @userId
+      `);
+
+    if (!userInfo.recordset.length) {
+      return res.status(403).json([]);
+    }
+
+    const { Role, BranchName: userBranch, ClusterName: userCluster } = userInfo.recordset[0];
+
+const isBranchManager = Role === "Branch Manager";
+const isRegionalManager = Role?.startsWith("Regional Manager");
+
+    const request = pool.request();
+
+    let query = `
+        SELECT
+          FORMAT(MAX(AL.CreatedAt),'dd-MM-yyyy') AS activityDate,
+          FORMAT(MAX(AL.CreatedAt),'hh:mm tt') AS activityTime,
+
+          MAX(AL.CreatedByUserName) AS userName,
+
+          CASE
+            WHEN MAX(AL.ActionCode) = 'LEAD_SPOKE'
+            THEN 'Call'
+            ELSE MAX(AL.ActionLabel)
+          END AS activityType,
+
+          STRING_AGG(AL.ActionLabel,' -> ') AS activityStatus,
+
+          MAX(AL.MetadataJson) AS notes
+
+        FROM smart_call.dbo.Activity_Logs AL
+
+        WHERE
+          AL.SourceType = 'LEAD'
+          AND AL.SourceId = @leadSNo
+    `;
+
+    request.input("leadSNo", sql.VarChar, leadSNo);
+
+    // 🔒 Branch Manager restriction
+    if (isBranchManager) {
+
+  query += `
+    AND EXISTS (
+      SELECT 1
+      FROM smart_call.dbo.Leads_Data LD
+      LEFT JOIN smart_call.dbo.Lead_Assignments LA
+      ON LA.LeadSNo = LD.SNo
+      WHERE LD.SNo = AL.SourceId
+      AND COALESCE(LA.BranchName,LD.BranchName) = @restrictedBranch
+    )
+  `;
+
+  request.input("restrictedBranch", sql.VarChar, userBranch);
+}
+
+// 🔒 Regional Manager restriction
+if (isRegionalManager) {
+
+  query += `
+    AND EXISTS (
+      SELECT 1
+      FROM smart_call.dbo.Leads_Data LD
+      LEFT JOIN smart_call.dbo.Lead_Assignments LA
+      ON LA.LeadSNo = LD.SNo
+      WHERE LD.SNo = AL.SourceId
+      AND COALESCE(LA.ClusterName,LD.ClusterName) = @restrictedCluster
+    )
+  `;
+
+  request.input("restrictedCluster", sql.VarChar, userCluster);
+
+}
+
+    query += `
+        GROUP BY AL.SessionId
+        ORDER BY MAX(AL.CreatedAt) DESC
+    `;
 
     const result = await request.query(query);
-    return res.json(result.recordset || []);
+
+    res.json(result.recordset);
 
   } catch (err) {
-    console.error("❌ LEADS SEARCH ERROR:", err);
-    return res.status(500).json([]);
+
+    console.error("❌ ACTIVITY DETAILS ERROR:", err);
+    res.status(500).json([]);
+
   }
+
 });
 
+
+function convertExcelDate(value) {
+
+  if (!value) return "";
+
+  if (typeof value === "number") {
+
+    const excelEpoch = new Date(1899, 11, 30);
+
+    const jsDate = new Date(excelEpoch.getTime() + value * 86400000);
+
+    const day = String(jsDate.getDate()).padStart(2,'0');
+    const month = String(jsDate.getMonth()+1).padStart(2,'0');
+    const year = jsDate.getFullYear();
+
+    return `${day}-${month}-${year}`;
+  }
+
+  return value;
+}
+
+// ======================================================================
+// SMA REPORT UPLOAD (STORE VALUES EXACTLY AS IN EXCEL)
+// ======================================================================
+
+const multer = require("multer");
+const XLSX = require("xlsx");
+const path = require("path");
+
+const upload = multer({
+  storage: multer.memoryStorage()
+});
+
+function safeString(value, maxLength = 255) {
+
+  if (value === undefined || value === null) return "";
+
+  let str = String(value).trim();
+
+  if (str.length > maxLength) {
+    str = str.substring(0, maxLength);
+  }
+
+  return str;
+}
+
+app.post("/api/sma/upload", upload.single("file"), async (req, res) => {
+	
+	const userId = req.headers["x-user-id"];
+
+  if (!userId) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+  
+  const pool = await poolPromise;
+
+  // 🔒 Check user role
+  const userInfo = await pool.request()
+    .input("userId", sql.VarChar, userId)
+    .query(`
+      SELECT Role
+      FROM UsersInfo
+      WHERE UserId = @userId
+    `);
+
+  if (!userInfo.recordset.length) {
+    return res.status(403).json({ message: "User not found" });
+  }
+
+  const { Role } = userInfo.recordset[0];
+
+  const isAdmin =
+    Role === "Admin" || Role === "Super Admin";
+
+  if (!isAdmin) {
+    return res.status(403).json({
+      message: "Only Admin can upload SMA file"
+    });
+  }
+
+  try {
+
+    const fileBuffer = req.file.buffer;
+    const extension = path.extname(req.file.originalname).toLowerCase();
+
+    let rows = [];
+
+
+// ================= READ EXCEL =================
+
+    if (extension === ".xlsx" || extension === ".xls") {
+
+      const workbook = XLSX.read(fileBuffer, { type: "buffer" });
+
+      const sheetName = workbook.SheetNames[0];
+      const sheet = workbook.Sheets[sheetName];
+
+      rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+
+      rows = rows.filter(r => r["Account Name"] && r["Account No."]);
+    }
+
+
+// ================= READ CSV =================
+
+    else if (extension === ".csv") {
+
+      const csvText = fileBuffer.toString("utf8");
+
+      const lines = csvText.split("\n");
+
+      const headers = lines[0].split(",");
+
+      rows = lines.slice(1).map(line => {
+
+        const values = line.split(",");
+
+        let obj = {};
+
+        headers.forEach((h, i) => {
+          obj[h.trim()] = values[i] ?? "";
+        });
+
+        return obj;
+      });
+
+      rows = rows.filter(r => r["Account Name"] && r["Account No."]);
+    }
+
+    else {
+      return res.status(400).json({ message: "Invalid file format" });
+    }
+
+
+    const pool = await poolPromise;
+
+
+// ================= CLEAR OLD DATA =================
+
+    await pool.request().query(`DELETE FROM dbo.SMA_Report`);
+
+
+// ================= CREATE BULK TABLE =================
+
+    const table = new sql.Table("SMA_Report");
+
+    table.create = false;
+
+    table.columns.add("SNo.", sql.VarChar(20), { nullable: true });
+    table.columns.add("Br Code", sql.VarChar(20), { nullable: true });
+    table.columns.add("Branch Name", sql.VarChar(150), { nullable: true });
+    table.columns.add("Cluster Code", sql.VarChar(50), { nullable: true });
+    table.columns.add("Account No.", sql.VarChar(50), { nullable: true });
+    table.columns.add("Account Name", sql.VarChar(200), { nullable: true });
+    table.columns.add("Account Type Description", sql.VarChar(200), { nullable: true });
+
+    table.columns.add("Limit", sql.VarChar(50), { nullable: true });
+    table.columns.add("Drawing Power", sql.VarChar(50), { nullable: true });
+    table.columns.add("Int Rate", sql.VarChar(50), { nullable: true });
+
+    table.columns.add("Theo Balance", sql.VarChar(50), { nullable: true });
+    table.columns.add("Cleared Balance", sql.VarChar(50), { nullable: true });
+    table.columns.add("Uncleared Balance", sql.VarChar(50), { nullable: true });
+    table.columns.add("Outstanding Balance", sql.VarChar(50), { nullable: true });
+
+    table.columns.add("Overdue", sql.VarChar(50), { nullable: true });
+
+    table.columns.add("Sanction Date", sql.VarChar(50), { nullable: true });
+    table.columns.add("Expiry Date", sql.VarChar(50), { nullable: true });
+
+    table.columns.add("EMIs Due", sql.VarChar(20), { nullable: true });
+    table.columns.add("EMIs Paid", sql.VarChar(20), { nullable: true });
+    table.columns.add("EMIs OD", sql.VarChar(20), { nullable: true });
+
+    table.columns.add("NEW IRAC", sql.VarChar(20), { nullable: true });
+    table.columns.add("OLD IRAC", sql.VarChar(20), { nullable: true });
+
+    table.columns.add("NPA Date", sql.VarChar(50), { nullable: true });
+
+    table.columns.add("Arrear Condition", sql.VarChar(50), { nullable: true });
+    table.columns.add("Arrear Description", sql.VarChar(200), { nullable: true });
+
+    table.columns.add("Loan Type", sql.VarChar(100), { nullable: true });
+    table.columns.add("Product Group", sql.VarChar(100), { nullable: true });
+
+
+// ================= ADD ROWS =================
+
+    rows.forEach((row, index) => {
+
+      table.rows.add(
+
+        safeString(index + 1,20),
+
+        safeString(row["Br Code"],20),
+        safeString(row["Branch Name"],150),
+        safeString(row["Cluster Code"],50),
+        safeString(row["Account No."],50),
+        safeString(row["Account Name"],200),
+        safeString(row["Account Type Description"],200),
+
+        safeString(row["Limit"],50),
+        safeString(row["Drawing Power"],50),
+        safeString(row["Int Rate"],50),
+
+        safeString(row["Theo Balance"],50),
+        safeString(row["Cleared Balance"],50),
+        safeString(row["Uncleared Balance"],50),
+        safeString(row["Outstanding Balance"],50),
+
+        safeString(row["Overdue"],50),
+
+       convertExcelDate(row["Sanction Date"]),
+        convertExcelDate(row["Expiry Date"]),
+
+        safeString(row["EMIs Due"],20),
+        safeString(row["EMIs Paid"],20),
+        safeString(row["EMIs OD"],20),
+
+        safeString(row["NEW IRAC"],20),
+        safeString(row["OLD IRAC"],20),
+
+        convertExcelDate(row["NPA Date"]),
+
+        safeString(row["Arrear Condition"],50),
+        safeString(row["Arrear Description"],200),
+
+        safeString(row["Loan Type"],100),
+        safeString(row["Product Group"],100)
+
+      );
+
+    });
+
+
+// ================= BULK INSERT =================
+
+    // ================= BULK INSERT =================
+
+await pool.request().bulk(table);
+
+
+// ============================================================
+// STEP 1 — Today Upload Count
+// ============================================================
+
+const todayCount = rows.length;
+
+
+// ============================================================
+// STEP 2 — Insert Upload Log
+// ============================================================
+
+await pool.request()
+  .input("cnt", sql.Int, todayCount)
+  .query(`
+    INSERT INTO SMA_Upload_Log
+    (upload_date, record_count, uploaded_at)
+    VALUES
+    (CAST(GETDATE() AS DATE), @cnt, GETDATE())
+  `);
+
+
+// ============================================================
+// STEP 3 — Get Yesterday Latest Upload
+// ============================================================
+
+const yesterdayRes = await pool.request().query(`
+  SELECT TOP 1 record_count
+  FROM SMA_Upload_Log
+  WHERE upload_date = CAST(DATEADD(DAY,-1,GETDATE()) AS DATE)
+  ORDER BY uploaded_at DESC
+`);
+
+const yesterdayCount =
+  yesterdayRes.recordset.length
+  ? yesterdayRes.recordset[0].record_count
+  : 0;
+
+
+// ============================================================
+// STEP 4 — Calculate Difference
+// ============================================================
+
+const archived =
+  todayCount < yesterdayCount
+    ? yesterdayCount - todayCount
+    : 0;
+
+const newRecords =
+  todayCount > yesterdayCount
+    ? todayCount - yesterdayCount
+    : 0;
+
+
+// ============================================================
+// FINAL RESPONSE
+// ============================================================
+
+res.json({
+  message: `${rows.length} records uploaded successfully`,
+  archived,
+  uploaded: newRecords,
+  history_total: todayCount
+});
+
+  }
+
+  catch (error) {
+
+    console.error("SMA Upload Error:", error);
+
+    res.status(500).json({
+      message: "Upload failed"
+    });
+
+  }
+
+});
+
+// ============================================================
+// SMA FILE UPLOAD STATUS
+// ============================================================
+
+app.get("/api/sma/upload-status", async (req, res) => {
+	
+	const userId = req.headers["x-user-id"];
+
+if (!userId) {
+  return res.status(401).json({ message: "Unauthorized" });
+}
+
+const pool = await poolPromise;
+
+const userInfo = await pool.request()
+  .input("userId", sql.VarChar, userId)
+  .query(`
+    SELECT Role
+    FROM UsersInfo
+    WHERE UserId = @userId
+  `);
+
+if (!userInfo.recordset.length) {
+  return res.status(403).json({ message: "User not found" });
+}
+
+const { Role } = userInfo.recordset[0];
+
+if (Role !== "Admin" && Role !== "Super Admin") {
+  return res.status(403).json({
+    message: "Only Admin can view upload status"
+  });
+}
+
+  try {
+
+    const pool = await poolPromise;
+
+    // 🔹 Yesterday Last Upload
+    const yesterdayRes = await pool.request().query(`
+      SELECT TOP 1 record_count
+      FROM SMA_Upload_Log
+      WHERE CAST(uploaded_at AS DATE) = CAST(DATEADD(DAY,-1,GETDATE()) AS DATE)
+      ORDER BY uploaded_at DESC
+    `);
+
+    const yesterday =
+      yesterdayRes.recordset.length
+      ? yesterdayRes.recordset[0].record_count
+      : 0;
+
+
+    // 🔹 Today Last Upload
+    const todayRes = await pool.request().query(`
+      SELECT TOP 1 record_count
+      FROM SMA_Upload_Log
+      WHERE CAST(uploaded_at AS DATE) = CAST(GETDATE() AS DATE)
+      ORDER BY uploaded_at DESC
+    `);
+
+    const today =
+      todayRes.recordset.length
+      ? todayRes.recordset[0].record_count
+      : 0;
+
+
+    // 🔹 Difference Calculation
+    res.json({
+      archived: today < yesterday ? yesterday - today : 0,
+      uploaded: today > yesterday ? today - yesterday : 0,
+      history_total: today
+    });
+
+  }
+
+  catch (err) {
+
+    console.error("SMA STATUS ERROR:", err);
+
+    res.status(500).json({
+      message: "Internal Server Error"
+    });
+
+  }
+
+});
+
+// ============================================================
+// SMA LIST
+// ============================================================
+
+// Cluster mapping
+const CLUSTER_MAP = {
+  KR: "Krishna",
+  GU: "Guntur",
+  WG: "West Godavari",
+  VS: "Visakhapatnam"
+};
+
+
+// ============================================================
+// SMA FILTER DROPDOWNS
+// ============================================================
+app.get("/api/sma/filters", async (req, res) => {
+
+  try {
+
+    const pool = await sql.connect(dbConfig);
+
+    const clusters = await pool.request().query(`
+      SELECT DISTINCT [Cluster Code] as cluster
+      FROM SMA_Report
+      WHERE [Cluster Code] IS NOT NULL
+	  ORDER BY [Cluster Code]
+    `);
+
+    const branches = await pool.request().query(`
+      SELECT DISTINCT [Branch Name] as branch
+      FROM SMA_Report
+      WHERE [Branch Name] IS NOT NULL
+	  ORDER BY [Branch Name]
+    `);
+
+    const products = await pool.request().query(`
+      SELECT DISTINCT [Account Type Description] as product
+      FROM SMA_Report
+      WHERE [Account Type Description] IS NOT NULL
+	  ORDER BY [Account Type Description]
+    `);
+
+    const productGroup = await pool.request().query(`
+      SELECT DISTINCT [Product Group] as productGroup
+      FROM SMA_Report
+      WHERE [Product Group] IS NOT NULL
+	  ORDER BY [Product Group]
+    `);
+
+    const loanType = await pool.request().query(`
+      SELECT DISTINCT [Loan Type] as loanType
+      FROM SMA_Report
+      WHERE [Loan Type] IS NOT NULL
+	  ORDER BY [Loan Type]
+    `);
+
+    const newIrac = [
+  { newIrac: "00" },
+  { newIrac: "01" },
+  { newIrac: "02" },
+  { newIrac: "03" },
+  { newIrac: "04" },
+  { newIrac: "05" },
+  { newIrac: "06" },
+  { newIrac: "07" }
+];
+
+    // Convert cluster codes to full names
+    const clusterData = clusters.recordset.map(c => ({
+      code: c.cluster,
+      name: CLUSTER_MAP[c.cluster] || c.cluster
+    }));
+
+    res.json({
+      clusters: clusterData,
+      branches: branches.recordset,
+      products: products.recordset,
+      productGroup: productGroup.recordset,
+      loanType: loanType.recordset,
+      newIrac: newIrac
+    });
+
+  } catch (err) {
+
+    console.error("SMA filters error:", err);
+    res.status(500).json({ message: "Server error" });
+
+  }
+
+});
+
+
+// ============================================================
+// SMA SEARCH
+// ============================================================
+app.post("/api/sma/search", async (req, res) => {
+	
+	const userId = req.headers["x-user-id"];
+
+if (!userId) {
+  return res.status(401).json({ message: "Unauthorized" });
+}
+
+const pool = await sql.connect(dbConfig);
+
+const userInfo = await pool.request()
+  .input("userId", sql.VarChar, userId)
+  .query(`
+    SELECT Role, ClusterName
+    FROM UsersInfo
+    WHERE UserId = @userId
+  `);
+
+if (!userInfo.recordset.length) {
+  return res.status(403).json({ message: "User not found" });
+}
+
+const { Role } = userInfo.recordset[0];
+
+const isRegionalManager = Role?.startsWith("Regional Manager");
+
+// Extract cluster from role
+let userCluster = null;
+
+if (isRegionalManager) {
+  const match = Role.match(/\((.*?)\)/);
+  if (match) {
+    userCluster = match[1];
+  }
+}
+
+const CLUSTER_CODE_MAP = {
+  "Krishna": "KR",
+  "Guntur": "GU",
+  "West Godavari": "WG",
+  "Visakhapatnam": "VS"
+};
+
+const userClusterCode = CLUSTER_CODE_MAP[userCluster];
+
+  const {
+  mobileNumber,
+  cluster,
+  branch,
+  accountNumber,
+  customerName,
+  dataType,   // ✅ NEW
+  product,
+  productGroup,
+  loanType,
+  newIrac
+} = req.body;
+
+  try {
+    const request = pool.request();
+
+    let query = `
+SELECT
+  s.[Account No.] as accountNumber,
+  s.[Account Name] as customerName,
+  s.[Account Type Description] as product,
+  s.[Branch Name] as branch,
+  s.[Cluster Code] as cluster,
+
+  COALESCE(r.mobileNumber, a.AlternateNumber) as mobileNumber
+
+FROM SMA_Report s
+
+LEFT JOIN Recovery_Raw_Data r
+ON s.[Account No.] = r.[loanAccountNumber]
+
+LEFT JOIN Recovery_Alternate_Number a
+ON s.[Account No.] = a.[LoanAccountNumber]
+
+WHERE 1=1
+`;
+
+
+if (mobileNumber) {
+  query += " AND COALESCE(r.mobileNumber, a.AlternateNumber) LIKE @mobileNumber";
+  request.input("mobileNumber", sql.VarChar, `%${mobileNumber}%`);
+}
+
+ if (isRegionalManager) {
+
+  query += " AND s.[Cluster Code] = @restrictedCluster";
+  request.input("restrictedCluster", sql.VarChar, userClusterCode);
+
+} else if (cluster) {
+
+  query += " AND s.[Cluster Code] = @cluster";
+  request.input("cluster", sql.VarChar, cluster);
+
+}
+
+    if (branch) {
+      query += " AND [Branch Name] = @branch";
+      request.input("branch", sql.VarChar, branch);
+    }
+
+    if (accountNumber) {
+      query += " AND [Account No.] = @accountNumber";
+      request.input("accountNumber", sql.VarChar, accountNumber);
+    }
+
+    if (customerName) {
+      query += " AND [Account Name] LIKE @customerName";
+      request.input("customerName", sql.VarChar, `%${customerName}%`);
+    }
+
+    if (product) {
+      query += " AND [Account Type Description] = @product";
+      request.input("product", sql.VarChar, product);
+    }
+
+    if (productGroup) {
+      query += " AND [Product Group] = @productGroup";
+      request.input("productGroup", sql.VarChar, productGroup);
+    }
+
+    if (loanType) {
+      query += " AND [Loan Type] = @loanType";
+      request.input("loanType", sql.VarChar, loanType);
+    }
+	
+// ============================================================
+// DATA TYPE FILTER
+// ============================================================
+
+if (dataType === "SMA") {
+
+  query += `
+AND s.[NEW IRAC] IN (0,1,2,3,4)
+`;
+
+}
+
+if (dataType === "NPA") {
+
+  query += `
+AND s.[NEW IRAC] IN (4,5,6,7)
+`;
+
+}
+
+    if (newIrac) {
+
+  const iracValue = parseInt(newIrac); // converts "00" → 0
+
+  query += " AND [NEW IRAC] = @newIrac";
+  request.input("newIrac", sql.Int, iracValue);
+
+}
+
+    const result = await request.query(query);
+
+    res.json(result.recordset);
+
+  } catch (err) {
+
+    console.error("SMA search error:", err);
+    res.status(500).json({ message: "Server error" });
+
+  }
+
+});
+
+
+// ============================================================
+// SMA VIEW DETAILS
+// ============================================================
+app.get("/api/sma/details/:accountNumber", async (req, res) => {
+	
+	const userId = req.headers["x-user-id"];
+
+if (!userId) {
+  return res.status(401).json({ message: "Unauthorized" });
+}
+
+const pool = await sql.connect(dbConfig);
+
+const userInfo = await pool.request()
+  .input("userId", sql.VarChar, userId)
+  .query(`
+    SELECT Role, ClusterName
+    FROM UsersInfo
+    WHERE UserId = @userId
+  `);
+  
+  if (!userInfo.recordset.length) {
+  return res.status(403).json({ message: "User not found" });
+}
+
+const { Role } = userInfo.recordset[0];
+
+let userCluster = null;
+
+if (Role?.startsWith("Regional Manager")) {
+  const match = Role.match(/\((.*?)\)/);
+  if (match) {
+    userCluster = match[1];
+  }
+}
+
+const CLUSTER_CODE_MAP = {
+  "Krishna": "KR",
+  "Guntur": "GU",
+  "West Godavari": "WG",
+  "Visakhapatnam": "VS"
+};
+
+const userClusterCode = CLUSTER_CODE_MAP[userCluster];
+
+const isRegionalManager = Role?.startsWith("Regional Manager");
+
+  const { accountNumber } = req.params;
+
+  try {
+
+    const result = await pool.request()
+  .input("accountNumber", sql.VarChar, accountNumber)
+  .input("isRegionalManager", sql.Bit, isRegionalManager ? 1 : 0)
+  .input("restrictedCluster", sql.VarChar, userClusterCode)
+      .query(`
+        SELECT
+          [Account Name] as customerName,
+          [Branch Name] as branch,
+          [Cluster Code] as cluster,
+          [Limit] as limit,
+          [Drawing Power] as drawingPower,
+          [Int Rate] as intRate,
+          [Theo Balance] as theoBalance,
+          [Cleared Balance] as clearedBalance,
+          [Uncleared Balance] as unclearedBalance,
+          [Outstanding Balance] as outstandingBalance,
+          [Overdue] as overdue,
+          [Sanction Date] as sanctionDate,
+          [Expiry Date] as expiryDate,
+          [EMIs Due] as emisDue,
+          [EMIs Paid] as emisPaid,
+          [EMIs OD] as emisOD,
+          [NEW IRAC] as newIrac,
+          [OLD IRAC] as oldIrac,
+          [NPA Date] as npaDate,
+          [Arrear Condition] as arrearCondition,
+          [Arrear Description] as arrearDescription
+        FROM SMA_Report
+        WHERE [Account No.] = @accountNumber
+AND (
+  @isRegionalManager = 0
+  OR [Cluster Code] = @restrictedCluster
+)
+      `);
+
+    res.json(result.recordset[0]);
+
+  } catch (err) {
+
+    console.error("SMA details error:", err);
+    res.status(500).json({ message: "Server error" });
+
+  }
+
+});
+
+// =======================================
+// SMA BRANCHES BY CLUSTER
+// =======================================
+
+app.get("/api/sma/branches/:cluster", async (req, res) => {
+
+  const { cluster } = req.params;
+
+  try {
+
+    const pool = await sql.connect(dbConfig);
+
+    const result = await pool.request()
+      .input("cluster", sql.VarChar, cluster)
+      .query(`
+        SELECT DISTINCT [Branch Name] as branch
+        FROM SMA_Report
+        WHERE [Cluster Code] = @cluster
+        ORDER BY [Branch Name]
+      `);
+
+    res.json(result.recordset);
+
+  } catch (err) {
+
+    console.error("Branch fetch error:", err);
+    res.status(500).json({ message: "Server error" });
+
+  }
+
+});
+
+
+// ============================================================
+// SMA ACTIVITY STATUS SEARCH
+// ============================================================
+
+app.post("/api/sma/activity/search", async (req,res)=>{
+
+const {
+mobileNumber,
+cluster,
+branch,
+accountNumber,
+customerName,
+product,
+productGroup,
+loanType,
+newIrac
+} = req.body;
+
+try{
+
+const pool = await sql.connect(dbConfig);
+const request = pool.request();
+
+const userId = req.headers["x-user-id"];
+
+if (!userId) {
+  return res.status(401).json({ message: "Unauthorized" });
+}
+
+const roleResult = await pool.request()
+  .input("userId", sql.VarChar(50), userId)
+  .query(`
+    SELECT Role
+    FROM UsersInfo
+    WHERE UserId = @userId
+  `);
+
+if (!roleResult.recordset.length) {
+  return res.status(403).json({ message: "User not found" });
+}
+
+const userRole = roleResult.recordset[0].Role;
+
+if (userRole === "Branch Manager") {
+  return res.status(403).json({
+    message: "Access Denied. Please Contact Admin."
+  });
+}
+
+let query = `
+
+SELECT
+s.[Account No.] AS accountNumber,
+s.[Account Name] AS customerName,
+s.[Account Type Description] AS product,
+s.[Branch Name] AS branch,
+
+COALESCE(r.mobileNumber,a.AlternateNumber) AS mobileNumber,
+
+STRING_AGG(l.ActionLabel, ', ') AS activityDetails
+
+FROM SMA_Report s
+
+INNER JOIN SMA_Activity_Sessions sess
+ON sess.SourceType='SMA'
+AND sess.SourceId = s.[Account No.]
+
+INNER JOIN SMA_Activity_Logs l
+ON l.SessionId = sess.SessionId
+AND l.SourceType='SMA'
+AND l.SourceId = s.[Account No.]
+
+LEFT JOIN Recovery_Raw_Data r
+ON s.[Account No.] = r.loanAccountNumber
+
+LEFT JOIN Recovery_Alternate_Number a
+ON s.[Account No.] = a.LoanAccountNumber
+
+WHERE 1=1
+
+`;
+
+if(mobileNumber){
+query += " AND COALESCE(r.mobileNumber,a.AlternateNumber) LIKE @mobileNumber";
+request.input("mobileNumber",sql.VarChar,`%${mobileNumber}%`);
+}
+
+const isRegionalManager = userRole?.startsWith("Regional Manager");
+
+let userCluster = null;
+
+if (isRegionalManager) {
+  const match = userRole.match(/\((.*?)\)/);
+  if (match) userCluster = match[1];
+}
+
+const CLUSTER_CODE_MAP = {
+  "Krishna": "KR",
+  "Guntur": "GU",
+  "West Godavari": "WG",
+  "Visakhapatnam": "VS"
+};
+
+const userClusterCode = CLUSTER_CODE_MAP[userCluster];
+
+if (isRegionalManager) {
+
+  query += " AND s.[Cluster Code] = @restrictedCluster";
+  request.input("restrictedCluster", sql.VarChar, userClusterCode);
+
+} else if (cluster) {
+
+  query += " AND s.[Cluster Code] = @cluster";
+  request.input("cluster", sql.VarChar, cluster);
+
+}
+
+if(branch){
+query += " AND s.[Branch Name] = @branch";
+request.input("branch",sql.VarChar,branch);
+}
+
+if(accountNumber){
+query += " AND s.[Account No.] = @accountNumber";
+request.input("accountNumber",sql.VarChar,accountNumber);
+}
+
+if(customerName){
+query += " AND s.[Account Name] LIKE '%' + @customerName + '%'";
+request.input("customerName",sql.VarChar,customerName);
+}
+
+if(product){
+query += " AND s.[Account Type Description] = @product";
+request.input("product",sql.VarChar,product);
+}
+
+if(productGroup){
+query += " AND s.[Product Group] = @productGroup";
+request.input("productGroup",sql.VarChar,productGroup);
+}
+
+if(loanType){
+query += " AND s.[Loan Type] = @loanType";
+request.input("loanType",sql.VarChar,loanType);
+}
+
+if(newIrac !== ""){
+query += " AND s.[NEW IRAC] = @newIrac";
+request.input("newIrac",sql.Int,parseInt(newIrac));
+}
+
+query += `
+GROUP BY
+s.[Account No.],
+s.[Account Name],
+s.[Account Type Description],
+s.[Branch Name],
+COALESCE(r.mobileNumber,a.AlternateNumber)
+`;
+
+const result = await request.query(query);
+
+res.json(result.recordset);
+
+}
+catch(err){
+
+console.error("SMA activity search error:",err);
+res.status(500).json({message:"Server error"});
+
+}
+
+});
+
+// =====================================================================
+// SMA ACTIVITY DETAILS
+// =====================================================================
+
+app.post("/api/sma-activity-details", async (req, res) => {
+
+  const { accountNumber } = req.body;
+
+  if (!accountNumber) {
+    return res.status(400).json([]);
+  }
+
+  try {
+
+    const userId = req.headers["x-user-id"];
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const pool = await poolPromise;
+
+    // ================= FETCH SESSIONS =================
+
+    const sessionsResult = await pool.request()
+      .input("accountNumber", sql.VarChar, accountNumber)
+      .query(`
+
+        SELECT
+          s.SessionId,
+          CONVERT(varchar, s.StartedAt, 105) AS activityDate,
+          FORMAT(s.StartedAt, 'hh:mm tt') AS activityTime,
+          s.StartedByUserName AS userName,
+          s.SessionType,
+          s.SessionStatus
+
+        FROM SMA_Activity_Sessions s
+
+        WHERE s.SourceType = 'SMA'
+        AND s.SourceId = @accountNumber
+
+        ORDER BY s.StartedAt DESC
+
+      `);
+
+    const sessions = sessionsResult.recordset;
+
+    if (sessions.length === 0) {
+      return res.json([]);
+    }
+
+    // ================= FETCH LOGS =================
+
+    const logsResult = await pool.request()
+      .input("accountNumber", sql.VarChar, accountNumber)
+      .query(`
+
+        SELECT
+          SessionId,
+          ActionLabel,
+          MetadataJson
+
+        FROM SMA_Activity_Logs
+
+        WHERE SourceType = 'SMA'
+        AND SourceId = @accountNumber
+
+        ORDER BY CreatedAt
+
+      `);
+
+    const logs = logsResult.recordset;
+
+    // ================= GROUP LOGS =================
+
+    const response = sessions.map(session => {
+
+      const sessionLogs = logs.filter(
+        l => l.SessionId === session.SessionId
+      );
+
+      const actions = sessionLogs
+        .map((l, index) => `${index + 1}. ${l.ActionLabel}`)
+        .join("\n");
+
+      const notes = sessionLogs
+        .map(l => {
+          if (!l.MetadataJson) return "";
+          try {
+            const obj = JSON.parse(l.MetadataJson);
+            return Object.values(obj).join(", ");
+          } catch {
+            return "";
+          }
+        })
+        .filter(Boolean)
+        .join("\n");
+
+      return {
+        activityDate: session.activityDate,
+        activityTime: session.activityTime,
+        userName: session.userName,
+        activityType: session.SessionType,
+        activityStatus: actions || "",
+        notes: notes || ""
+      };
+
+    });
+
+    res.json(response);
+
+  } catch (err) {
+
+    console.error("SMA ACTIVITY DETAILS ERROR:", err);
+    res.status(500).json([]);
+
+  }
+
+});
+
+
+
+// =============================
+// FIELD VISIT SUMMARY
+// =============================
+
+app.post("/api/field-visit-summary", async (req, res) => {
+
+  try {
+
+    const { user, cluster, branch, fromDate, toDate } = req.body;
+	{
+  return res.status(403).json({
+    message: "Access Denied. Please Contact Admin."
+  });
+}
+
+    const pool = await sql.connect(dbConfig);
+	
+	const userId = req.headers["x-user-id"];
+
+if (!userId) {
+  return res.status(401).json({ message: "Unauthorized" });
+}
+
+// Fetch user role
+const roleResult = await pool.request()
+  .input("userId", sql.VarChar(50), userId)
+  .query(`
+    SELECT Role
+    FROM UsersInfo
+    WHERE UserId = @userId
+  `);
+
+if (!roleResult.recordset.length) {
+  return res.status(403).json({ message: "User not found" });
+}
+
+const userRole = roleResult.recordset[0].Role;
+
+// 🔒 Admin Only Page
+if (
+  userRole === "Branch Manager" ||
+  userRole.startsWith("Regional Manager")
+) {
+  return res.status(403).json({
+    message: "Access Denied. Please Contact Admin."
+  });
+}
+	
+    const request = pool.request();
+
+    let query = `
+SELECT 
+    F.UserName,
+    U.BranchName,
+    COUNT(DISTINCT F.AccountNo) AS AccountCount,
+    SUM(ISNULL(F.DistanceTravelled,0)) AS DistanceTravelled
+
+FROM smart_call.dbo.FieldVisitReport F
+
+INNER JOIN smart_call.dbo.UsersInfo U
+    ON U.UserId = F.UserID
+
+WHERE 1=1
+`;
+
+    // ================= FILTERS =================
+
+    if (user) {
+      query += " AND F.UserID = @UserID";
+      request.input("UserID", sql.VarChar, user);
+    }
+
+    if (cluster && cluster !== "Corporate Office") {
+  query += " AND U.ClusterName = @Cluster";
+  request.input("Cluster", sql.VarChar, cluster);
+}
+
+    if (branch) {
+      query += " AND U.BranchName = @Branch";
+      request.input("Branch", sql.VarChar, branch);
+    }
+
+    if (fromDate) {
+      query += " AND CAST(F.MeetingDate AS DATE) >= @FromDate";
+      request.input("FromDate", sql.Date, fromDate);
+    }
+
+    if (toDate) {
+      query += " AND CAST(F.MeetingDate AS DATE) <= @ToDate";
+      request.input("ToDate", sql.Date, toDate);
+    }
+
+    // ================= GROUPING =================
+
+    query += `
+GROUP BY 
+    F.UserName,
+    U.BranchName
+
+ORDER BY 
+    F.UserName
+`;
+
+    const result = await request.query(query);
+
+    res.json(result.recordset);
+
+  } catch (error) {
+
+    console.error("Field Visit Summary Error:", error);
+    res.status(500).json({ error: "Internal Server Error" });
+
+  }
+
+});
+
+
+// =============================
+// FIELD VISIT SUMMARY EXPORT EXCEL
+// =============================
+
+app.post("/api/field-visit-summary/export-excel", async (req, res) => {
+
+  try {
+
+    const { columns, data } = req.body;
+
+    if (!data || data.length === 0) {
+      return res.status(400).json({ error: "No data to export" });
+    }
+
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet("Field Visit Summary");
+
+    // ================= HEADERS =================
+
+    const headers = ["S. No.", ...columns];
+
+    worksheet.addRow(headers);
+
+    worksheet.getRow(1).font = { bold: true };
+
+    // ================= DATA =================
+
+    data.forEach((row, index) => {
+
+      const rowData = [
+        index + 1,
+        ...columns.map(col => row[col] ?? "")
+      ];
+
+      worksheet.addRow(rowData);
+
+    });
+
+    // ================= AUTO WIDTH =================
+
+    worksheet.columns.forEach(column => {
+
+      let maxLength = 10;
+
+      column.eachCell({ includeEmpty: true }, cell => {
+
+        const length = cell.value ? cell.value.toString().length : 10;
+
+        if (length > maxLength) {
+          maxLength = length;
+        }
+
+      });
+
+      column.width = maxLength + 2;
+
+    });
+
+    // ================= DOWNLOAD =================
+
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+
+    res.setHeader(
+      "Content-Disposition",
+      "attachment; filename=Field_Visit_Summary.xlsx"
+    );
+
+    await workbook.xlsx.write(res);
+
+    res.end();
+
+  } catch (error) {
+
+    console.error("Export Excel Error:", error);
+
+    res.status(500).json({ error: "Excel export failed" });
+
+  }
+
+});
 
 // =============================
 // LOGIN API
@@ -5424,7 +8827,7 @@ app.post("/api/login", async (req, res) => {
       return res.status(401).json({ message: "Invalid User ID or Password" });
     }
 
-    // 2️⃣ Get full user info
+    // 2️⃣ Get user info
     const infoQuery = await pool.request()
       .input("userId", userId)
       .query(`
@@ -5446,25 +8849,65 @@ app.post("/api/login", async (req, res) => {
     const user = infoQuery.recordset[0];
     const today = new Date();
 
-    // 3️⃣ Check validity
+    // 3️⃣ Validity Check
     if (new Date(user.ValidFrom) > today || new Date(user.ValidUntil) < today) {
       return res.status(403).json({ message: "User access expired or not yet active" });
     }
 
-    // 4️⃣ Role check
-    if (!["Admin", "Branch Manager"].includes(user.Role)) {
-      return res.status(403).json({ message: "User role not authorized for dashboard" });
-    }
+    // 4️⃣ Role Processing
+const roles = user.Role.split(",").map(r => r.trim());
 
-    // 5️⃣ SUCCESS
-    return res.json({
-      message: "Login successful",
-      userId: userId,
-      role: user.Role,
-      branchName: user.BranchName,
-      branchCode: user.BranchCode,
-      clusterName: user.ClusterName
-    });
+let finalRole = null;
+
+// Role Priority
+if (roles.includes("Admin")) {
+  finalRole = "Admin";
+}
+else if (roles.includes("Branch Manager")) {
+  finalRole = "Branch Manager";
+}
+else if (
+  roles.includes("Regional Manager (Krishna)") ||
+  roles.includes("Regional Manager (Guntur)") ||
+  roles.includes("Regional Manager (West Godavari)") ||
+  roles.includes("Regional Manager (Visakhapatnam)")
+) {
+  finalRole = roles.find(r =>
+    [
+      "Regional Manager (Krishna)",
+      "Regional Manager (Guntur)",
+      "Regional Manager (West Godavari)",
+      "Regional Manager (Visakhapatnam)"
+    ].includes(r)
+  );
+}
+else if (roles.length === 1 && roles.includes("Calling Agent")) {
+  return res.status(403).json({ message: "Calling Agent cannot access dashboard" });
+}
+
+if (!finalRole) {
+  return res.status(403).json({ message: "User role not authorized for dashboard" });
+}
+
+    // Extract cluster from role if Regional Manager
+let clusterName = user.ClusterName;
+
+if (finalRole.startsWith("Regional Manager")) {
+  const match = finalRole.match(/\((.*?)\)/);
+  if (match) {
+    clusterName = match[1];
+  }
+}
+
+// 5️⃣ SUCCESS
+return res.json({
+  message: "Login successful",
+  userId: userId,
+  role: finalRole,
+  branchName: user.BranchName,
+  branchCode: user.BranchCode,
+  clusterName: clusterName
+});
 
   } catch (err) {
     console.error("LOGIN ERROR:", err);
@@ -5636,7 +9079,37 @@ app.post("/api/forgot-password/verify-answer", async (req, res) => {
   }
 });
 
+// ======================
+// HOME USER DETAILS
+// ======================
+app.get("/api/user/:userId", async (req, res) => {
+  try {
 
+    const pool = await poolPromise;
+
+    const result = await pool.request()
+      .input("UserId", sql.VarChar, req.params.userId)
+      .query(`
+        SELECT 
+          UserId,
+          UserName,
+          ClusterName,
+          BranchCode,
+          BranchName,
+          Role
+        FROM UsersInfo
+        WHERE UserId = @UserId
+      `);
+
+    res.json(result.recordset[0]);
+
+  } catch (error) {
+
+    console.error("User Fetch Error:", error);
+    res.status(500).send("Server Error");
+
+  }
+});
 
 
 // ===============================================================================================================================================================================================
@@ -5648,61 +9121,83 @@ app.post("/api/activity/session/start", async (req, res) => {
     sessionType,
     userId,
     userName,
+    sourceType,
+    sourceId,
   } = req.body;
 
-  if (!loanAccountNumber || !sessionType || !userId || !userName) {
+  if (!sessionType || !userId || !userName || !sourceType) {
     return res.status(400).json({ message: "Missing required fields" });
+  }
+
+  if (sourceType === "NPA" && !loanAccountNumber) {
+    return res.status(400).json({ message: "LoanAccountNumber required for NPA" });
   }
 
   try {
     const pool = await poolPromise;
 
-    // ✅ Get AssignmentId from Account_Assignments
-    const assignRes = await pool.request()
-      .input("LoanAccountNumber", sql.VarChar(50), loanAccountNumber)
-      .input("UserId", sql.VarChar(50), String(userId))
-      .query(`
-        SELECT TOP 1 AssignmentId
-        FROM Account_Assignments
-        WHERE LoanAccountNumber = @LoanAccountNumber
-          AND AssignedToUserId = @UserId
-          AND AssignmentStatus = 'Assigned'
-        ORDER BY AssignedAt DESC
-      `);
+    let assignmentId = null;
 
-    if (assignRes.recordset.length === 0) {
-      return res.status(404).json({
-        message: "Assignment not found for this loan and user",
-      });
+    if (sourceType === "NPA") {
+      const assignRes = await pool.request()
+        .input("LoanAccountNumber", sql.VarChar(50), loanAccountNumber)
+        .input("UserId", sql.VarChar(50), String(userId))
+        .query(`
+          SELECT TOP 1 AssignmentId
+          FROM Account_Assignments
+          WHERE LoanAccountNumber = @LoanAccountNumber
+            AND AssignedToUserId = @UserId
+            AND AssignmentStatus = 'Assigned'
+          ORDER BY AssignedAt DESC
+        `);
+
+      if (assignRes.recordset.length === 0) {
+        return res.status(404).json({
+          message: "Assignment not found for this loan and user",
+        });
+      }
+
+      assignmentId = assignRes.recordset[0].AssignmentId;
     }
 
-    const assignmentId = assignRes.recordset[0].AssignmentId;
-
-    // ✅ Start Session
     const result = await pool.request()
-      .input("AssignmentId", sql.BigInt, assignmentId)
-      .input("LoanAccountNumber", sql.VarChar(50), loanAccountNumber)
+      .input("AssignmentId", sql.BigInt, assignmentId || null)
+      .input(
+  "LoanAccountNumber",
+  sql.VarChar(50),
+  sourceType === "LEAD"
+    ? `LEAD-${sourceId}`
+    : loanAccountNumber
+)
       .input("SessionType", sql.VarChar(20), sessionType)
       .input("StartedByUserId", sql.VarChar(50), String(userId))
       .input("StartedByUserName", sql.VarChar(100), userName)
+      .input("SourceType", sql.VarChar(20), sourceType || null)
+.input("SourceId", sql.VarChar(50), sourceId ? String(sourceId) : null)
       .query(`
-        INSERT INTO Activity_Sessions (
-          AssignmentId,
-          LoanAccountNumber,
-          SessionType,
-          SessionStatus,
-          StartedByUserId,
-          StartedByUserName
-        )
-        OUTPUT INSERTED.SessionId
-        VALUES (
-          @AssignmentId,
-          @LoanAccountNumber,
-          @SessionType,
-          'ACTIVE',
-          @StartedByUserId,
-          @StartedByUserName
-        )
+INSERT INTO Activity_Sessions (
+  AssignmentId,
+  LoanAccountNumber,
+  SessionType,
+  SessionStatus,
+  StartedByUserId,
+  StartedByUserName,
+  SourceType,
+  SourceId,
+  IsActive
+)
+OUTPUT INSERTED.SessionId
+VALUES (
+  @AssignmentId,
+  @LoanAccountNumber,
+  @SessionType,
+  'ACTIVE',
+  @StartedByUserId,
+  @StartedByUserName,
+  @SourceType,
+  @SourceId,
+  1
+)
       `);
 
     return res.status(200).json({
@@ -5716,6 +9211,9 @@ app.post("/api/activity/session/start", async (req, res) => {
   }
 });
 app.post("/api/activity/log", async (req, res) => {
+
+  console.log("📥 ACTIVITY LOG REQUEST:", req.body);
+
   const {
     sessionId,
     actionCode,
@@ -5725,19 +9223,49 @@ app.post("/api/activity/log", async (req, res) => {
     noteText = null,
     userId,
     userName,
+    sourceType,
+    sourceId,
   } = req.body;
 
-  if (!sessionId || !actionCode || !actionLabel || !userId) {
-    return res.status(400).json({ message: "Missing required fields" });
-  }
-
   try {
+
     const pool = await poolPromise;
+
+    let sessionIdToUse = sessionId;
+
+    // ⭐ Recover session if mobile lost it
+    if (!sessionIdToUse) {
+
+      const result = await pool.request()
+        .input("userId", sql.VarChar(50), String(userId))
+        .input("loanAccountNumber", sql.VarChar(50), String(sourceId))
+        .query(`
+          SELECT TOP 1 SessionId
+          FROM Activity_Sessions
+          WHERE StartedByUserId = @userId
+          AND LoanAccountNumber = @loanAccountNumber
+          AND IsActive = 1
+          ORDER BY StartedAt DESC
+        `);
+
+      if (result.recordset.length > 0) {
+        sessionIdToUse = result.recordset[0].SessionId;
+      }
+    }
+
+    // validation
+    if (!Number(sessionIdToUse)) {
+      return res.status(400).json({ message: "Invalid sessionId" });
+    }
+
+    if (!sessionIdToUse || !actionCode || !actionLabel || !userId) {
+      return res.status(400).json({ message: "Missing required fields" });
+    }
 
     // 1️⃣ Get last log for hierarchy
     const parentResult = await pool
       .request()
-      .input("SessionId", sql.BigInt, sessionId)
+      .input("SessionId", sql.BigInt, parseInt(sessionIdToUse))
       .query(`
         SELECT TOP 1 LogId
         FROM Activity_Logs
@@ -5753,11 +9281,13 @@ app.post("/api/activity/log", async (req, res) => {
     // 2️⃣ Insert Activity Log
     const logResult = await pool
       .request()
-      .input("SessionId", sql.BigInt, sessionId)
+      .input("SessionId", sql.BigInt, parseInt(sessionIdToUse))
       .input("ParentLogId", sql.BigInt, parentLogId)
       .input("ActionCode", sql.VarChar(100), actionCode)
       .input("ActionLabel", sql.VarChar(200), actionLabel)
       .input("ReasonCode", sql.VarChar(50), reasonCode)
+      .input("SourceType", sql.VarChar(20), sourceType || null)
+      .input("SourceId", sql.VarChar(50), sourceId ? String(sourceId) : null)
       .input(
         "MetadataJson",
         sql.NVarChar(sql.MAX),
@@ -5774,7 +9304,9 @@ app.post("/api/activity/log", async (req, res) => {
           ReasonCode,
           MetadataJson,
           CreatedByUserId,
-          CreatedByUserName
+          CreatedByUserName,
+          SourceType,
+          SourceId
         )
         OUTPUT INSERTED.LogId
         VALUES (
@@ -5785,7 +9317,9 @@ app.post("/api/activity/log", async (req, res) => {
           @ReasonCode,
           @MetadataJson,
           @CreatedByUserId,
-          @CreatedByUserName
+          @CreatedByUserName,
+          @SourceType,
+          @SourceId
         )
       `);
 
@@ -5818,7 +9352,7 @@ app.post("/api/activity/log", async (req, res) => {
       // ✅ Fetch LoanAccountNumber + AssignmentId from session
       const sessionRes = await pool
         .request()
-        .input("SessionId", sql.BigInt, sessionId)
+        .input("SessionId", sql.BigInt, parseInt(sessionIdToUse))
         .query(`
           SELECT TOP 1 LoanAccountNumber, AssignmentId
           FROM Activity_Sessions
@@ -6010,7 +9544,7 @@ app.post("/api/activity/session/end", async (req, res) => {
     const pool = await poolPromise;
 
     await pool.request()
-      .input("SessionId", sql.BigInt, sessionId)
+      .input("SessionId", sql.BigInt, parseInt(sessionId))
       .query(`
         UPDATE Activity_Sessions
         SET SessionStatus = 'COMPLETED',
@@ -6046,7 +9580,21 @@ app.post("/api/activity-status/search", async (req, res) => {
   } = req.body;
 
   try {
-    const pool = await poolPromise;
+	  
+	const userId = req.headers["x-user-id"];
+if (!userId) return res.status(401).json({ message: "Unauthorized" });
+
+const pool = await poolPromise;
+
+const roleResult = await pool.request()
+  .input("userId", sql.VarChar, userId)
+  .query(`
+    SELECT Role, BranchName, ClusterName
+    FROM UsersInfo
+    WHERE UserId = @userId
+  `);
+
+const userInfo = roleResult.recordset[0];
     const request = pool.request();
 
     let query = `
@@ -6062,6 +9610,26 @@ app.post("/api/activity-status/search", async (req, res) => {
        AND A.AssignmentStatus = 'Assigned'
       WHERE 1 = 1
     `;
+	
+	if (userInfo.Role === "Branch Manager") {
+  query += ` AND R.branchName = @userBranch`;
+  request.input("userBranch", userInfo.BranchName);
+}
+
+const isRegionalManager = userInfo.Role?.startsWith("Regional Manager");
+
+if (isRegionalManager) {
+  query += `
+    AND R.branchName IN (
+      SELECT branch_name
+      FROM Branch_Cluster_Master
+      WHERE cluster_name = @restrictedCluster
+    )
+  `;
+
+  request.input("restrictedCluster", sql.VarChar, userInfo.ClusterName);
+}
+  
 
     if (mobileNumber) {
       query += ` AND R.mobileNumber = @mobileNumber`;
@@ -6153,7 +9721,8 @@ if (dpdQueue) {
 // ACTIVITY DETAILS
 // =====================================================================
 
-app.post("/api/activity-details", async (req, res) => {
+app.post("/api/npa-activity-details", async (req, res) => {
+
   const { loanAccountNumber } = req.body;
 
   if (!loanAccountNumber) {
@@ -6161,23 +9730,86 @@ app.post("/api/activity-details", async (req, res) => {
   }
 
   try {
+
+    const userId = req.headers["x-user-id"];
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
     const pool = await poolPromise;
 
-    // 1️⃣ Fetch sessions
-    const sessionsResult = await pool.request()
-      .input("loanAccountNumber", sql.VarChar, loanAccountNumber)
+    const roleResult = await pool.request()
+      .input("userId", sql.VarChar, userId)
       .query(`
-        SELECT
-          s.SessionId,
-          CONVERT(varchar, s.StartedAt, 105) AS activityDate,
-          FORMAT(s.StartedAt, 'hh:mm tt') AS activityTime,
-          s.StartedByUserName AS userName,
-          s.SessionType,
-          s.SessionStatus
-        FROM Activity_Sessions s
-        WHERE s.LoanAccountNumber = @loanAccountNumber
-        ORDER BY s.StartedAt DESC
+        SELECT Role, BranchName, ClusterName
+        FROM UsersInfo
+        WHERE UserId = @userId
       `);
+
+    const userInfo = roleResult.recordset[0];
+
+// ================= BRANCH MANAGER RESTRICTION =================
+
+if (userInfo.Role === "Branch Manager") {
+
+  const check = await pool.request()
+    .input("loanAccountNumber", sql.VarChar, loanAccountNumber)
+    .input("branch", sql.VarChar, userInfo.BranchName)
+    .query(`
+      SELECT 1
+      FROM Recovery_Raw_Data
+      WHERE loanAccountNumber = @loanAccountNumber
+      AND branchName = @branch
+    `);
+
+  if (check.recordset.length === 0) {
+    return res.status(403).json({ message: "Access denied" });
+  }
+}
+
+// ================= REGIONAL MANAGER RESTRICTION =================
+
+const isRegionalManager = userInfo.Role?.startsWith("Regional Manager");
+
+if (isRegionalManager) {
+
+  const check = await pool.request()
+    .input("loanAccountNumber", sql.VarChar, loanAccountNumber)
+    .input("cluster", sql.VarChar, userInfo.ClusterName)
+    .query(`
+      SELECT 1
+      FROM Recovery_Raw_Data R
+      WHERE R.loanAccountNumber = @loanAccountNumber
+      AND R.branchName IN (
+        SELECT branch_name
+        FROM Branch_Cluster_Master
+        WHERE cluster_name = @cluster
+      )
+    `);
+
+  if (check.recordset.length === 0) {
+    return res.status(403).json({ message: "Access denied" });
+  }
+}
+
+    // ================= FETCH SESSIONS =================
+
+    const request = pool.request()
+      .input("loanAccountNumber", sql.VarChar, loanAccountNumber);
+
+    const sessionsResult = await request.query(`
+      SELECT
+        s.SessionId,
+        CONVERT(varchar, s.StartedAt, 105) AS activityDate,
+        FORMAT(s.StartedAt, 'hh:mm tt') AS activityTime,
+        s.StartedByUserName AS userName,
+        s.SessionType,
+        s.SessionStatus
+      FROM Activity_Sessions s
+      WHERE s.LoanAccountNumber = @loanAccountNumber
+      AND ISNULL(s.SourceType,'NPA') = 'NPA'
+      ORDER BY s.StartedAt DESC
+    `);
 
     const sessions = sessionsResult.recordset;
 
@@ -6185,7 +9817,8 @@ app.post("/api/activity-details", async (req, res) => {
       return res.json([]);
     }
 
-    // 2️⃣ Fetch logs
+    // ================= FETCH LOGS =================
+
     const logsResult = await pool.request().query(`
       SELECT SessionId, ActionLabel
       FROM Activity_Logs
@@ -6194,36 +9827,36 @@ app.post("/api/activity-details", async (req, res) => {
 
     const logs = logsResult.recordset;
 
-    // 3️⃣ Group logs under sessions
-const response = sessions.map(session => {
+    // ================= GROUP LOGS =================
 
-  const sessionLogs = logs
-    .filter(l => l.SessionId === session.SessionId);
+    const response = sessions.map(session => {
 
-  const actions = sessionLogs
-    .map((l, index) => `${index + 1}. ${l.ActionLabel}`)
-    .join("\n");
+      const sessionLogs = logs.filter(
+        l => l.SessionId === session.SessionId
+      );
 
-  return {
-    activityDate: session.activityDate,
-    activityTime: session.activityTime,
-    userName: session.userName,
-    activityType: session.SessionType,
+      const actions = sessionLogs
+        .map((l, index) => `${index + 1}. ${l.ActionLabel}`)
+        .join("\n");
 
-    // Show numbered logs under Activity Status
-    activityStatus: actions || "",
+      return {
+        activityDate: session.activityDate,
+        activityTime: session.activityTime,
+        userName: session.userName,
+        activityType: session.SessionType,
+        activityStatus: actions || "",
+        notes: ""
+      };
 
-    // Keep Notes column empty
-    notes: ""
-  };
-});
+    });
 
     res.json(response);
 
   } catch (err) {
+
     console.error("ACTIVITY DETAILS ERROR:", err);
     res.status(500).json([]);
-	
+
   }
 });
 
@@ -6243,7 +9876,21 @@ app.post("/api/activity-status/export-pdf", async (req, res) => {
   }
 
   try {
-    const pool = await poolPromise;
+    
+	const userId = req.headers["x-user-id"];
+if (!userId) return res.status(401).json({ message: "Unauthorized" });
+
+const pool = await poolPromise;
+
+const roleResult = await pool.request()
+  .input("userId", sql.Int, userId)
+  .query(`
+    SELECT Role, BranchName
+    FROM UsersInfo
+    WHERE UserId = @userId
+  `);
+
+const userInfo = roleResult.recordset[0];
     const request = pool.request();
 
     selectedIds.forEach((id, index) => {
@@ -6278,6 +9925,11 @@ app.post("/api/activity-status/export-pdf", async (req, res) => {
       WHERE R.loanAccountNumber IN (${selectedIds.map((_, i) => `@id${i}`).join(",")})
       ORDER BY CASE ${orderCase} END, S.StartedAt DESC
     `);
+	
+	if (userInfo.Role === "Branch Manager") {
+  query += ` AND R.branchName = @userBranch`;
+  request.input("userBranch", userInfo.BranchName);
+}
 
     if (!result.recordset.length) {
       return res.status(400).json({ message: "No records found for PDF" });
@@ -6521,7 +10173,24 @@ app.post("/api/activity-status/action", async (req, res) => {
   }
 
   try {
-    const pool = await poolPromise;
+	  
+	const userId = req.headers["x-user-id"];
+
+if (!userId) {
+  return res.status(401).json({ message: "Unauthorized" });
+}
+
+const pool = await poolPromise;
+
+const roleResult = await pool.request()
+  .input("userId", sql.VarChar, userId)
+  .query(`
+    SELECT Role, BranchName
+    FROM UsersInfo
+    WHERE UserId = @userId
+  `);
+
+const userInfo = roleResult.recordset[0];    
     const request = pool.request();
 
     // ================= BASE QUERY =================
@@ -6533,7 +10202,11 @@ app.post("/api/activity-status/action", async (req, res) => {
         ON CRS.LoanAccountNumber = A.LoanAccountNumber
       WHERE A.AssignmentStatus = 'Assigned'
     `;
-
+	
+	  if (userInfo.Role === "Branch Manager") {
+    baseQuery += ` AND R.branchName = @userBranch`;
+    request.input("userBranch", userInfo.BranchName);
+  }
     // ================= COMMON FILTERS =================
 
     if (mobileNumber) {

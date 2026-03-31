@@ -63,10 +63,11 @@ const dbConfig = {
   password: "Clab@@230830",
   server: "10.0.0.4",
   database: "smart_call",
-  options: {
-    encrypt: false,
-    trustServerCertificate: true,
-  },
+options: {
+  encrypt: false,
+  trustServerCertificate: true,
+  requestTimeout: 60000
+}
 };
 
 // ======================
@@ -94,10 +95,13 @@ app.get("/health", (req, res) => {
 // ✅ REGISTER
 // =======================================================
 app.post("/register", async (req, res) => {
+	console.log("📥 [REGISTER_API] Request received for user:", req.body?.userId);
   const { userId, password, mpin, securityQ, securityA, deviceId } = req.body;
 
   try {
+	  
     if (!userId || !password || !mpin || !securityQ || !securityA || !deviceId) {
+		console.log("⚠️ [REGISTER_API] Missing fields", { userId });
       return res.status(400).json({ message: "All fields are mandatory" });
     }
 
@@ -105,6 +109,7 @@ app.post("/register", async (req, res) => {
       /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{6,8}$/;
 
     if (!passwordRegex.test(password)) {
+		console.log("⚠️ [REGISTER_API] Password format invalid", { userId });
       return res.status(400).json({
         message:
           "Password must be 6–8 characters with uppercase, lowercase, number and special character",
@@ -112,13 +117,14 @@ app.post("/register", async (req, res) => {
     }
 
     if (!/^\d{4}$/.test(String(mpin))) {
+		console.log("⚠️ [REGISTER_API] MPIN invalid", { userId });
       return res.status(400).json({
         message: "MPIN must be exactly 4 numeric digits",
       });
     }
 
     const pool = await poolPromise;
-
+console.log("🔍 [REGISTER_API] Checking authorized user", { userId });
     // ✅ check authorized user in UsersInfo
     const userCheck = await pool
       .request()
@@ -129,12 +135,12 @@ app.post("/register", async (req, res) => {
         WHERE UserId = @UserId
       `);
 
-    if (userCheck.recordset.length === 0) {
-      return res.status(403).json({
-        message: "User not authorized. Contact admin.",
-      });
-    }
-
+if (userCheck.recordset.length === 0) {
+  console.log("❌ [REGISTER_API] User not authorized", { userId });
+  return res.status(403).json({
+    message: "User not authorized. Contact admin.",
+  });
+}
     // ✅ already registered?
     const authCheck = await pool
       .request()
@@ -150,7 +156,7 @@ app.post("/register", async (req, res) => {
         message: "User already registered. Please login.",
       });
     }
-
+console.log("💾 [REGISTER_API] Creating auth record", { userId });
     await pool
       .request()
       .input("UserId", sql.VarChar(50), String(userId).trim())
@@ -177,21 +183,31 @@ app.post("/register", async (req, res) => {
           @DeviceId
         )
       `);
-
-    return res.status(200).json({ message: "Registration successful" });
+console.log("✅ [REGISTER_API] Registration success", { userId });
+return res.status(200).json({ message: "Registration successful" });
   } catch (err) {
-    console.error("REGISTER ERROR:", err);
+    console.error("❌ [REGISTER_API] Error:", {
+  userId,
+  message: err.message,
+  stack: err.stack,
+});
     return res.status(500).json({ message: "Internal server error" });
   }
 });
 // =======================================================
 // ✅ LOGIN (UserId + MPIN + DEVICE) ✅ FINAL BEST VERSION
 // =======================================================
+// =======================================================
+// ✅ LOGIN (UserId + MPIN + DEVICE)
+// =======================================================
 app.post("/login", async (req, res) => {
+  console.log("📥 [LOGIN_API] Request received");
+
   const { mpin, deviceId } = req.body;
 
   try {
     if (!mpin || !deviceId) {
+      console.log("⚠️ [LOGIN_API] Missing MPIN or deviceId");
       return res.status(400).json({ message: "MPIN and Device ID are required" });
     }
 
@@ -199,14 +215,13 @@ app.post("/login", async (req, res) => {
     const cleanDeviceId = String(deviceId).trim();
 
     if (!/^\d{4}$/.test(cleanMPIN)) {
+      console.log("⚠️ [LOGIN_API] Invalid MPIN format");
       return res.status(400).json({ message: "MPIN must be exactly 4 digits" });
     }
 
     const pool = await poolPromise;
 
-    console.log("📌 LOGIN INPUT:", { cleanMPIN, cleanDeviceId });
-
-    // ✅ Find user by MPIN
+    // 🔍 Find user by MPIN
     const mpinUser = await pool.request()
       .input("AppMPIN", sql.VarChar(10), cleanMPIN)
       .query(`
@@ -216,14 +231,15 @@ app.post("/login", async (req, res) => {
       `);
 
     if (mpinUser.recordset.length === 0) {
+      console.log("❌ [LOGIN_API] Invalid MPIN");
       return res.status(401).json({ message: "Invalid MPIN" });
     }
 
     const dbUser = mpinUser.recordset[0];
 
-    // ✅ If device mismatch → auto rebind to current deviceId
+    // ⚠️ Device mismatch → rebind
     if (String(dbUser.DeviceId).trim() !== cleanDeviceId) {
-      console.log("⚠️ Device mismatch → rebinding device to this MPIN user");
+      console.log("⚠️ [LOGIN_API] Device mismatch - rebinding");
 
       await pool.request()
         .input("UserId", sql.VarChar(50), dbUser.UserId)
@@ -235,7 +251,9 @@ app.post("/login", async (req, res) => {
         `);
     }
 
-    // ✅ Now fetch full profile
+    console.log("👤 [LOGIN_API] Fetching user profile");
+
+    // 👤 Fetch profile
     const result = await pool.request()
       .input("UserId", sql.VarChar(50), dbUser.UserId)
       .query(`
@@ -251,7 +269,9 @@ app.post("/login", async (req, res) => {
         WHERE UA.UserId = @UserId
       `);
 
-    // ✅ Update last login time
+    console.log("🕒 [LOGIN_API] Updating last login time");
+
+    // 🕒 update last login
     await pool.request()
       .input("UserId", sql.VarChar(50), dbUser.UserId)
       .query(`
@@ -259,7 +279,9 @@ app.post("/login", async (req, res) => {
         SET LastLoginAt = GETDATE()
         WHERE UserId = @UserId
       `);
-console.log("📤 LOGIN RESPONSE:", result);
+
+    console.log("📤 [LOGIN_API] Sending login response");
+    console.log("✅ [LOGIN_API] Login success");
 
     return res.status(200).json({
       message: "Login successful",
@@ -267,11 +289,14 @@ console.log("📤 LOGIN RESPONSE:", result);
     });
 
   } catch (err) {
-    console.error("❌ LOGIN ERROR:", err);
+    console.error("❌ [LOGIN_API] Error:", {
+      message: err.message,
+      stack: err.stack
+    });
+
     return res.status(500).json({ message: "Internal server error" });
   }
 });
-
 //============================================================================================
 //                                DPD LIST (DATABASE CONNECTED)
 //============================================================================================
@@ -290,7 +315,6 @@ app.post("/api/dpd-list", async (req, res) => {
     const pool = await poolPromise;
     const request = pool.request();
 
-    // force string userId
     request.input("userId", sql.VarChar(50), String(userId));
 
     dpdList.forEach((dpd, index) => {
@@ -317,6 +341,10 @@ app.post("/api/dpd-list", async (req, res) => {
         ISNULL(CRS.CompleteFlag, 0) AS CompleteFlag,
 
         CRS.UpdatedAt AS CompletedAt,
+
+        -- ⭐ IMPORTANT (DATE CHECK)
+        CRS.ScheduleCallTimestamp,
+        CRS.ScheduleVisitTimestamp,
 
         ISNULL(CRS.ScheduleCallPendingFlag, 0) AS ScheduleCallPendingFlag,
         ISNULL(CRS.ScheduleVisitPendingFlag, 0) AS ScheduleVisitPendingFlag,
@@ -380,41 +408,56 @@ app.post("/api/account-details", async (req, res) => {
   try {
     const pool = await poolPromise;
 
-const result = await pool.request()
-  .input("loanAccountNumber", sql.VarChar(50), loanAccountNumber)
-  .query(`
-    SELECT
-      R.firstname,
-      R.fathersName,
-      R.village,
-      R.gp,
-      R.pincode,
-      R.mobileNumber,
-      R.loanAccountNumber,
-      R.product,
-      R.dpdQueue,
-      R.currentOutstandingBalance,
-      R.principleDue,
-      R.interestDue,
-      R.interestRate,
-      CAST(R.lastInterestAppliedDate AS VARCHAR(20)) AS lastInterestAppliedDate,
-      R.EMIAMOUNT,
-      R.OVERDUEAMT,
+    const result = await pool.request()
+      .input("loanAccountNumber", sql.VarChar(50), loanAccountNumber)
+      .query(`
+        SELECT
+          R.firstname,
+          R.fathersName,
+          R.village,
+          R.gp,
+          R.pincode,
+          R.mobileNumber,
+          R.loanAccountNumber,
+          R.product,
+          R.dpdQueue,
+          R.currentOutstandingBalance,
+          R.principleDue,
+          R.interestDue,
+          R.interestRate,
+          CAST(R.lastInterestAppliedDate AS VARCHAR(20)) AS lastInterestAppliedDate,
+          R.EMIAMOUNT,
+          R.OVERDUEAMT,
 
-      A.AlternateNumber
+          A.AlternateNumber,
 
-    FROM dbo.Recovery_Raw_Data R
-    LEFT JOIN dbo.Recovery_Alternate_Number A
-      ON R.loanAccountNumber = A.LoanAccountNumber
+          CASE 
+            WHEN M.Address IS NOT NULL THEN M.Address
+            ELSE CONCAT(R.village, ', ', R.gp, ', ', R.pincode)
+          END AS FullAddress,
 
-    WHERE R.loanAccountNumber = @loanAccountNumber
-  `);
+          CASE 
+            WHEN M.Address IS NOT NULL THEN 'MANUAL'
+            ELSE 'DB'
+          END AS AddressSource
+
+        FROM dbo.Recovery_Raw_Data R
+
+        LEFT JOIN dbo.Recovery_Alternate_Number A
+          ON R.loanAccountNumber = A.LoanAccountNumber
+
+        LEFT JOIN dbo.Customer_Manual_Address M
+          ON R.loanAccountNumber = M.LoanAccountNumber
+
+        WHERE R.loanAccountNumber = @loanAccountNumber
+      `);
 
     if (result.recordset.length === 0) {
       return res.status(404).json({ message: "Account not found" });
     }
 
     res.json({ account: result.recordset[0] });
+
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Server error" });
@@ -422,50 +465,141 @@ const result = await pool.request()
 });
 
 // =======================================================
-// SAVE ALTERNATE NUMBER
+// SAVE ALTERNATE NUMBER (WITH HISTORY)
 // =======================================================
 app.post("/api/account/save-alternate", async (req, res) => {
-  const { loanAccountNumber, alternateNumber } = req.body;
+  const { loanAccountNumber, alternateNumber, addedBy } = req.body;
 
   if (!loanAccountNumber || !alternateNumber) {
-    return res.status(400).json({ message: "Loan account and alternate number required" });
+    return res.status(400).json({
+      message: "Loan account and alternate number required"
+    });
   }
 
   if (!/^\d{10}$/.test(String(alternateNumber))) {
-    return res.status(400).json({ message: "Alternate number must be 10 digits" });
+    return res.status(400).json({
+      message: "Alternate number must be 10 digits"
+    });
   }
 
   try {
     const pool = await poolPromise;
 
-await pool.request()
-  .input("LoanAccountNumber", sql.VarChar(50), loanAccountNumber)
-  .input("AlternateNumber", sql.VarChar(15), alternateNumber)
-  .query(`
-    IF EXISTS (SELECT 1 FROM dbo.Recovery_Alternate_Number 
-               WHERE LoanAccountNumber = @LoanAccountNumber)
-    BEGIN
-        UPDATE dbo.Recovery_Alternate_Number
-        SET AlternateNumber = @AlternateNumber,
-            UpdatedAt = GETDATE()
-        WHERE LoanAccountNumber = @LoanAccountNumber
-    END
-    ELSE
-    BEGIN
-        INSERT INTO dbo.Recovery_Alternate_Number
-        (LoanAccountNumber, AlternateNumber)
-        VALUES (@LoanAccountNumber, @AlternateNumber)
-    END
-  `);
+    await pool.request()
+      .input("LoanAccountNumber", sql.VarChar(50), loanAccountNumber)
+      .input("AlternateNumber", sql.VarChar(15), alternateNumber)
+      .input("AddedBy", sql.VarChar(100), addedBy || "UNKNOWN")
+      .query(`
 
-    res.json({ success: true, message: "Alternate number saved successfully" });
+        -- INSERT INTO HISTORY
+        INSERT INTO dbo.Recovery_Alternate_Number_History
+        (LoanAccountNumber, AlternateNumber, ActionType, ActionBy, ActionAt)
+        VALUES
+        (@LoanAccountNumber, @AlternateNumber, 'INSERT', @AddedBy, GETDATE());
+
+        -- INSERT INTO MAIN TABLE
+        INSERT INTO dbo.Recovery_Alternate_Number
+        (LoanAccountNumber, AlternateNumber, AddedBy, AddedAt)
+        VALUES
+        (@LoanAccountNumber, @AlternateNumber, @AddedBy, GETDATE());
+
+      `);
+
+    res.json({ success: true });
 
   } catch (err) {
-    console.error("SAVE ALTERNATE ERROR:", err);
+    console.error("SAVE ALT ERROR:", err);
     res.status(500).json({ message: "Server error" });
   }
-}); 
+});
 
+//================================== DELETE ALTERNATE NUMBER ==================================
+app.post("/api/account/delete-alternate", async (req, res) => {
+  const { loanAccountNumber, alternateNumber, deletedBy } = req.body;
+
+  try {
+    const pool = await poolPromise;
+
+    await pool.request()
+      .input("LoanAccountNumber", sql.VarChar(50), loanAccountNumber)
+      .input("AlternateNumber", sql.VarChar(15), alternateNumber)
+      .input("DeletedBy", sql.VarChar(100), deletedBy || "SYSTEM")
+      .query(`
+
+        -- INSERT INTO HISTORY
+        INSERT INTO dbo.Recovery_Alternate_Number_History
+        (LoanAccountNumber, AlternateNumber, ActionType, ActionBy, ActionAt)
+        VALUES
+        (@LoanAccountNumber, @AlternateNumber, 'DELETE', @DeletedBy, GETDATE());
+
+        -- DELETE FROM MAIN
+        DELETE FROM dbo.Recovery_Alternate_Number
+        WHERE LoanAccountNumber = @LoanAccountNumber
+        AND AlternateNumber = @AlternateNumber;
+
+      `);
+
+    res.json({ success: true });
+
+  } catch (err) {
+    console.error("DELETE ALT ERROR:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+//================================== MANUAL ADDRESS ==================================
+app.post("/api/account/save-manual-address", async (req, res) => {
+  try {
+    const { loanAccountNumber, address, userId } = req.body;
+
+    if (!loanAccountNumber || !address) {
+      return res.status(400).json({ message: "Missing fields" });
+    }
+
+    const pool = await poolPromise;
+
+    await pool.request()
+      .input("LoanAccountNumber", sql.VarChar(50), loanAccountNumber)
+      .input("Address", sql.NVarChar(sql.MAX), address)
+      .input("UserId", sql.VarChar(100), userId)
+      .query(`
+
+        -- SAVE OLD ADDRESS INTO HISTORY (IF EXISTS)
+        INSERT INTO dbo.Customer_Manual_Address_History
+        (LoanAccountNumber, Address, ActionType, ActionBy, ActionAt)
+        SELECT
+            LoanAccountNumber,
+            Address,
+            'DELETE',
+            @UserId,
+            GETDATE()
+        FROM dbo.Customer_Manual_Address
+        WHERE LoanAccountNumber = @LoanAccountNumber;
+
+        -- DELETE OLD
+        DELETE FROM dbo.Customer_Manual_Address
+        WHERE LoanAccountNumber = @LoanAccountNumber;
+
+        -- INSERT NEW ADDRESS
+        INSERT INTO dbo.Customer_Manual_Address
+        (LoanAccountNumber, Address, CreatedBy, CreatedAt)
+        VALUES
+        (@LoanAccountNumber, @Address, @UserId, GETDATE());
+
+        -- INSERT NEW INTO HISTORY
+        INSERT INTO dbo.Customer_Manual_Address_History
+        (LoanAccountNumber, Address, ActionType, ActionBy, ActionAt)
+        VALUES
+        (@LoanAccountNumber, @Address, 'INSERT', @UserId, GETDATE());
+
+      `);
+
+    res.json({ success: true });
+
+  } catch (err) {
+    console.log("Save address error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
 // =====================================================================
 // HOME → MEMBERS SUMMARY (ASSIGNMENT BASED)
 // =====================================================================
@@ -1167,11 +1301,6 @@ app.post("/api/field-visit/start", async (req, res) => {
     userName,
     accountNo,
     customerName,
-
-    startLat,
-    startLng,
-    startAddress,
-
     customerLat,
     customerLng,
     customerAddress
@@ -1180,19 +1309,15 @@ app.post("/api/field-visit/start", async (req, res) => {
   // ===============================
   // VALIDATION
   // ===============================
-if (
-  !userId ||
-  !userName ||
-  !accountNo ||
-  !customerName ||
-  startLat === undefined ||
-  startLng === undefined ||
-  !startAddress ||
-  customerLat === undefined ||
-  customerLng === undefined ||
-  !customerAddress
-)
-{
+  if (
+    !userId ||
+    !userName ||
+    !accountNo ||
+    !customerName ||
+    customerLat === undefined ||
+    customerLng === undefined ||
+    !customerAddress
+  ) {
     return res.status(400).json({ message: "Missing required fields" });
   }
 
@@ -1200,8 +1325,7 @@ if (
     const pool = await poolPromise;
 
     // ============================================
-    // STEP 1 — GET BRANCH LAT/LNG FROM USER
-    // UsersInfo → BranchCode → Branch_GPS
+    // STEP 1 — GET BRANCH LAT/LNG
     // ============================================
     const branchResult = await pool.request()
       .input("UserId", sql.VarChar(50), userId)
@@ -1223,7 +1347,46 @@ if (
     const branchLng = branchResult.recordset[0].BranchLongitude;
 
     // ============================================
-    // STEP 2 — INSERT INTO FieldVisitReport
+    // STEP 2 — CHECK LAST VISIT WITHIN 1 HOUR
+    // ============================================
+const lastVisitResult = await pool.request()
+  .input("UserId", sql.VarChar(50), userId)
+  .query(`
+    SELECT TOP 1 
+      MeetingLatitude,
+      MeetingLongitude,
+      DATEDIFF(MINUTE, Timestamp, GETDATE()) AS DiffMinutes
+    FROM FieldVisitReport
+    WHERE UserID = @UserId
+      AND MeetingLatitude IS NOT NULL
+      AND MeetingLongitude IS NOT NULL
+    ORDER BY Timestamp DESC
+  `);
+
+    let startLat = branchLat;
+    let startLng = branchLng;
+    let startAddress = "Branch Location";
+
+    if (lastVisitResult.recordset.length > 0) {
+      const last = lastVisitResult.recordset[0];
+
+const diffMinutes = last.DiffMinutes;
+
+console.log("⏱ DiffMinutes:", diffMinutes);
+
+if (diffMinutes <= 120) {
+  startLat = last.MeetingLatitude;
+  startLng = last.MeetingLongitude;
+  startAddress = "Previous Visit Location";
+} else {
+  startLat = branchLat;
+  startLng = branchLng;
+  startAddress = "Branch Location";
+}
+    }
+
+    // ============================================
+    // STEP 3 — INSERT VISIT
     // ============================================
     const insertResult = await pool.request()
       .input("UserID", sql.VarChar(50), userId)
@@ -1234,6 +1397,7 @@ if (
       .input("BranchLatitude", sql.Decimal(18, 10), branchLat)
       .input("BranchLongitude", sql.Decimal(18, 10), branchLng)
 
+      // 🔥 Dynamic start
       .input("StartLatitude", sql.Decimal(18, 10), startLat)
       .input("StartLongitude", sql.Decimal(18, 10), startLng)
       .input("StartAddress", sql.NVarChar(500), startAddress)
@@ -1303,6 +1467,10 @@ if (
     });
   }
 });
+
+// ===============================
+// STOP FIELD VISIT
+// ===============================
 
 app.post("/api/field-visit/stop", async (req, res) => {
   try {
@@ -1606,6 +1774,7 @@ app.get("/api/getLeadDetails/:sno", async (req, res) => {
     });
   }
 });
+//==================================== ACTIVITY HOME HISTORY =======================================================
 app.post("/api/activity/history", async (req, res) => {
   try {
     const { userId, fromDate, toDate, searchText, type } = req.body;
@@ -1622,102 +1791,222 @@ app.post("/api/activity/history", async (req, res) => {
       .input("ToDate", sql.Date, toDate || null)
       .input("SearchText", sql.VarChar(100), searchText || null)
       .input("Type", sql.VarChar(20), type || null)
+
       .query(`
 
-        ;WITH LatestAction AS (
-          SELECT
+/* ======================================================
+   LATEST SESSION ACTIONS (NPA + LEAD)
+====================================================== */
+
+WITH LatestAction AS (
+    SELECT *
+    FROM (
+        SELECT
             s.SessionId,
-            MAX(l.CreatedAt) AS LatestTime
-          FROM smart_call.dbo.Activity_Sessions s
-          INNER JOIN smart_call.dbo.Activity_Logs l
+            s.SourceType,
+            s.LoanAccountNumber,
+            s.SourceId,
+            s.SessionType,
+            l.CreatedAt AS ActionTime,
+
+            ROW_NUMBER() OVER (
+                PARTITION BY 
+                    CASE 
+                        WHEN s.SourceType='LEAD' 
+                        THEN CAST(s.SourceId AS VARCHAR)
+                        ELSE s.LoanAccountNumber 
+                    END
+                ORDER BY l.CreatedAt DESC
+            ) AS rn
+
+        FROM smart_call.dbo.Activity_Sessions s
+        INNER JOIN smart_call.dbo.Activity_Logs l
             ON s.SessionId = l.SessionId
-          WHERE s.StartedByUserId = @UserId
+        WHERE
+            s.StartedByUserId = @UserId
             AND (
                 (@FromDate IS NULL OR CAST(l.CreatedAt AS DATE) >= @FromDate)
-                AND
-                (@ToDate IS NULL OR CAST(l.CreatedAt AS DATE) <= @ToDate)
+                AND (@ToDate IS NULL OR CAST(l.CreatedAt AS DATE) <= @ToDate)
             )
-            AND (
-                @Type IS NULL
-                OR @Type = 'BOTH'
-                OR UPPER(ISNULL(s.SourceType,'NPA')) = UPPER(@Type)
-            )
-          GROUP BY s.SessionId
+    ) x
+    WHERE rn = 1
+)
+
+/* ======================================================
+   NPA RECORDS
+====================================================== */
+
+SELECT
+    la.LoanAccountNumber,
+    'NPA' AS SourceType,
+    la.SessionType,
+    r.firstname AS CustomerName,
+
+    sr.[NEW IRAC] AS dpdQueue,
+
+    l.ActionLabel,
+
+    CONVERT(VARCHAR(20), la.ActionTime, 113) AS FormattedTime,
+
+    la.ActionTime,
+
+    CASE
+        WHEN ISNULL(cr.CompleteFlag,0)=1
+        OR ISNULL(cr.ScheduleCallCompletedFlag,0)=1
+        OR ISNULL(cr.ScheduleVisitCompletedFlag,0)=1
+        THEN 'COMPLETED'
+
+        WHEN ISNULL(cr.InProcessFlag,0)=1
+        OR ISNULL(cr.ScheduleCallPendingFlag,0)=1
+        OR ISNULL(cr.ScheduleVisitPendingFlag,0)=1
+        THEN 'IN PROCESS'
+
+        ELSE 'PENDING'
+    END AS AccountStatus
+
+FROM LatestAction la
+
+INNER JOIN smart_call.dbo.Activity_Logs l
+  ON l.SessionId = la.SessionId
+ AND l.CreatedAt = la.ActionTime
+
+LEFT JOIN smart_call.dbo.Recovery_Raw_Data r
+  ON r.loanAccountNumber = la.LoanAccountNumber
+
+LEFT JOIN smart_call.dbo.SMA_Report sr
+  ON sr.[Account No.] = la.LoanAccountNumber
+
+LEFT JOIN smart_call.dbo.CallRecovery_Status cr
+  ON cr.LoanAccountNumber = la.LoanAccountNumber
+ AND cr.UserId = @UserId
+
+WHERE
+    la.SourceType = 'NPA'
+    AND (@Type IS NULL OR @Type='ALL' OR @Type='NPA')
+    AND (
+        @SearchText IS NULL
+        OR r.firstname LIKE '%' + @SearchText + '%'
+        OR la.LoanAccountNumber LIKE '%' + @SearchText + '%'
+    )
+
+
+UNION ALL
+
+/* ======================================================
+   LEAD RECORDS
+====================================================== */
+
+SELECT
+    ld.MobileNumber AS LoanAccountNumber,
+
+    'LEAD' AS SourceType,
+
+    la.SessionType,
+
+    ld.FullName AS CustomerName,
+
+    NULL AS dpdQueue,
+
+    l.ActionLabel,
+
+    CONVERT(VARCHAR(20), la.ActionTime, 113) AS FormattedTime,
+
+    la.ActionTime,
+
+    CASE
+        WHEN l.ActionCode IN (
+            'LEAD_LOS_CAPTURED',
+            'LEAD_NO_REQUIREMENT'
         )
+        THEN 'COMPLETED'
 
-        ----------------------
-        -- NPA RECORDS
-        ----------------------
-        SELECT
-          s.LoanAccountNumber,
-          'NPA' AS SourceType,
-          s.SessionType,
-          r.firstname AS CustomerName,
-          r.dpdQueue,
-          l.ActionLabel,
-          FORMAT(l.CreatedAt, 'dd/MM/yyyy hh:mm tt') AS FormattedTime,
+        WHEN l.ActionCode IN (
+            'LEAD_SCHEDULED',
+            'LEAD_CALLBACK',
+            'LEAD_VISIT',
+            'LEAD_FLOW_SUBMITTED',
+            'LEAD_INTEREST_OTHER_PRODUCT',
+            'LEAD_PRODUCT_DEPOSIT',
+            'LEAD_PRODUCT_LOAN',
+            'LEAD_PRODUCT_OTHER',
+            'LEAD_OTHER_PRODUCT_TYPED'
+        )
+        THEN 'INPROCESS'
 
-          CASE
-            WHEN ISNULL(cr.CompleteFlag,0)=1
-              OR ISNULL(cr.ScheduleCallCompletedFlag,0)=1
-              OR ISNULL(cr.ScheduleVisitCompletedFlag,0)=1
-              THEN 'COMPLETED'
-            WHEN ISNULL(cr.InProcessFlag,0)=1
-              OR ISNULL(cr.ScheduleCallPendingFlag,0)=1
-              OR ISNULL(cr.ScheduleVisitPendingFlag,0)=1
-              THEN 'IN PROCESS'
-            ELSE 'PENDING'
-          END AS AccountStatus
+        ELSE 'PENDING'
+    END AS AccountStatus
 
-        FROM LatestAction LA
-        INNER JOIN smart_call.dbo.Activity_Sessions s
-          ON s.SessionId = LA.SessionId
-        INNER JOIN smart_call.dbo.Activity_Logs l
-          ON l.SessionId = s.SessionId
-         AND l.CreatedAt = LA.LatestTime
-        INNER JOIN smart_call.dbo.Recovery_Raw_Data r
-          ON r.loanAccountNumber = s.LoanAccountNumber
-        LEFT JOIN smart_call.dbo.CallRecovery_Status cr
-          ON cr.LoanAccountNumber = s.LoanAccountNumber
-         AND cr.UserId = @UserId
-        WHERE ISNULL(s.SourceType,'NPA') = 'NPA'
-          AND (
-              @SearchText IS NULL OR
-              r.firstname LIKE '%' + @SearchText + '%' OR
-              r.loanAccountNumber LIKE '%' + @SearchText + '%'
-          )
+FROM LatestAction la
 
-        UNION ALL
+INNER JOIN smart_call.dbo.Activity_Logs l
+  ON l.SessionId = la.SessionId
+ AND l.CreatedAt = la.ActionTime
 
-        ----------------------
-        -- LEAD RECORDS
-        ----------------------
-        SELECT
-          s.LoanAccountNumber,
-          'LEAD' AS SourceType,
-          s.SessionType,
-          ld.FullName AS CustomerName,
-          NULL AS dpdQueue,
-          l.ActionLabel,
-          FORMAT(l.CreatedAt, 'dd/MM/yyyy hh:mm tt') AS FormattedTime,
-          'PENDING' AS AccountStatus
+INNER JOIN smart_call.dbo.Leads_Data ld
+  ON ld.SNo = la.SourceId
 
-        FROM LatestAction LA
-        INNER JOIN smart_call.dbo.Activity_Sessions s
-          ON s.SessionId = LA.SessionId
-        INNER JOIN smart_call.dbo.Activity_Logs l
-          ON l.SessionId = s.SessionId
-         AND l.CreatedAt = LA.LatestTime
-        INNER JOIN smart_call.dbo.Leads_Data ld
-          ON ld.SNo = s.SourceId
-        WHERE s.SourceType = 'LEAD'
-          AND (
-              @SearchText IS NULL OR
-              ld.FullName LIKE '%' + @SearchText + '%' OR
-              ld.MobileNumber LIKE '%' + @SearchText + '%'
-          )
+WHERE
+    la.SourceType = 'LEAD'
+    AND (@Type IS NULL OR @Type='ALL' OR @Type='LEAD')
+    AND (
+        @SearchText IS NULL
+        OR ld.FullName LIKE '%' + @SearchText + '%'
+        OR ld.MobileNumber LIKE '%' + @SearchText + '%'
+    )
 
-        ORDER BY FormattedTime DESC
+
+UNION ALL
+
+/* ======================================================
+   CO USE (SMA)
+====================================================== */
+
+SELECT
+    s.LoanAccountNumber,
+
+    'CO_USE' AS SourceType,
+
+    s.SessionType,
+
+    sr.[Account Name] AS CustomerName,
+
+    sr.[NEW IRAC] AS dpdQueue,
+
+    l.ActionLabel,
+
+    CONVERT(VARCHAR(20), l.CreatedAt, 113) AS FormattedTime,
+
+    l.CreatedAt AS ActionTime,
+
+    NULL AS AccountStatus
+
+FROM smart_call.dbo.SMA_Activity_Sessions s
+
+INNER JOIN (
+    SELECT SessionId, MAX(CreatedAt) AS LatestTime
+    FROM smart_call.dbo.SMA_Activity_Logs
+    GROUP BY SessionId
+) latest
+  ON latest.SessionId = s.SessionId
+
+INNER JOIN smart_call.dbo.SMA_Activity_Logs l
+  ON l.SessionId = latest.SessionId
+ AND l.CreatedAt = latest.LatestTime
+
+LEFT JOIN smart_call.dbo.SMA_Report sr
+  ON sr.[Account No.] = s.LoanAccountNumber
+
+WHERE
+    s.StartedByUserId = @UserId
+    AND (@Type IS NULL OR @Type='ALL' OR @Type='CO_USE')
+    AND (
+        @SearchText IS NULL
+        OR sr.[Account Name] LIKE '%' + @SearchText + '%'
+        OR s.LoanAccountNumber LIKE '%' + @SearchText + '%'
+    )
+
+
+ORDER BY ActionTime DESC
       `);
 
     res.json({
@@ -1731,12 +2020,7 @@ app.post("/api/activity/history", async (req, res) => {
     res.status(500).json({ message: "History fetch failed" });
   }
 });
-// =========================================================
-// ACTIVITY HISTORY DETAILS
-// Returns ALL actions for one LoanAccountNumber
-// Includes formatted schedule timestamps
-// =========================================================
-
+//=========================================== HOME ACTIVITY DETAILS ============================================
 app.post("/api/activity/history-details", async (req, res) => {
   try {
     const { loanAccountNumber } = req.body;
@@ -1749,35 +2033,106 @@ app.post("/api/activity/history-details", async (req, res) => {
 
     const result = await pool.request()
       .input("LoanAccountNumber", sql.VarChar(50), String(loanAccountNumber))
+
       .query(`
-        SELECT
-          s.SessionType,
-          l.ActionLabel,
+/* ======================================================
+   NPA ACTIVITY TIMELINE
+====================================================== */
 
-          -- 🔥 Main Action Time (Formatted)
-          FORMAT(l.CreatedAt, 'dd/MM/yyyy hh:mm tt') AS FormattedTime,
+SELECT
+    s.SessionType,
+    l.ActionLabel,
 
-          -- 🔥 Scheduled Call Time (Formatted)
-          FORMAT(cr.ScheduleCallTimestamp, 'dd/MM/yyyy hh:mm tt') 
-            AS FormattedCallSchedule,
+    CONVERT(VARCHAR(20), l.CreatedAt, 113) AS FormattedTime,
 
-          -- 🔥 Scheduled Visit Time (Formatted)
-          FORMAT(cr.ScheduleVisitTimestamp, 'dd/MM/yyyy hh:mm tt') 
-            AS FormattedVisitSchedule
+    FORMAT(cr.ScheduleCallTimestamp,'dd/MM/yyyy hh:mm tt')
+      AS FormattedCallSchedule,
 
-        FROM smart_call.dbo.Activity_Sessions s
-        INNER JOIN smart_call.dbo.Activity_Logs l
-          ON s.SessionId = l.SessionId
+    FORMAT(cr.ScheduleVisitTimestamp,'dd/MM/yyyy hh:mm tt')
+      AS FormattedVisitSchedule,
 
-        LEFT JOIN smart_call.dbo.CallRecovery_Status cr
-          ON cr.LoanAccountNumber = s.LoanAccountNumber
+    'NPA' AS SourceType
 
-        WHERE s.LoanAccountNumber = @LoanAccountNumber
+FROM smart_call.dbo.Activity_Sessions s
 
-        ORDER BY l.CreatedAt DESC
+INNER JOIN smart_call.dbo.Activity_Logs l
+  ON s.SessionId = l.SessionId
+
+LEFT JOIN smart_call.dbo.CallRecovery_Status cr
+  ON cr.LoanAccountNumber = s.LoanAccountNumber
+
+WHERE
+    s.SourceType = 'NPA'
+    AND s.LoanAccountNumber = @LoanAccountNumber
+
+
+UNION ALL
+
+
+/* ======================================================
+   LEAD ACTIVITY TIMELINE
+====================================================== */
+
+SELECT
+    s.SessionType,
+    l.ActionLabel,
+
+    CONVERT(VARCHAR(20), l.CreatedAt, 113) AS FormattedTime,
+
+    NULL AS FormattedCallSchedule,
+
+    NULL AS FormattedVisitSchedule,
+
+    'LEAD' AS SourceType
+
+FROM smart_call.dbo.Activity_Sessions s
+
+INNER JOIN smart_call.dbo.Activity_Logs l
+  ON s.SessionId = l.SessionId
+
+INNER JOIN smart_call.dbo.Leads_Data ld
+  ON ld.SNo = s.SourceId
+
+WHERE
+    s.SourceType = 'LEAD'
+    AND ld.MobileNumber = @LoanAccountNumber
+
+
+UNION ALL
+
+
+/* ======================================================
+   CO USE (SMA) TIMELINE
+====================================================== */
+
+SELECT
+    s.SessionType,
+    l.ActionLabel,
+
+    CONVERT(VARCHAR(20), l.CreatedAt, 113) AS FormattedTime,
+
+    NULL AS FormattedCallSchedule,
+
+    NULL AS FormattedVisitSchedule,
+
+    'CO_USE' AS SourceType
+
+FROM smart_call.dbo.SMA_Activity_Sessions s
+
+INNER JOIN smart_call.dbo.SMA_Activity_Logs l
+  ON s.SessionId = l.SessionId
+
+WHERE
+    s.LoanAccountNumber = @LoanAccountNumber
+
+
+ORDER BY FormattedTime DESC
       `);
 
-    res.json({ records: result.recordset });
+    res.json({
+      success: true,
+      records: result.recordset
+    });
 
   } catch (err) {
     console.error("History details error:", err);
@@ -1842,56 +2197,98 @@ app.get("/api/sma-report", async (req, res) => {
 
     let query = `
       SELECT
-        [SNo.],
-        [Br Code],
-        [Branch Name],
-        [Cluster Code],
-        [Account No.],
-        [Account Name],
-        [Account Type Description],
-        [Limit],
-        [Drawing Power],
-        [Int Rate],
-        [Theo Balance],
-        [Cleared Balance],
-        [Uncleared Balance],
-        [Outstanding Balance],
-        [Overdue],
-        [Sanction Date],
-        [Expiry Date],
-        [EMIs Due],
-        [EMIs Paid],
-        [EMIs OD],
-        [NEW IRAC],
-        [OLD IRAC],
-        [NPA Date],
-        [Arrear Condition],
-        [Arrear Description],
-        [Loan Type],
-        [Product Group]
-      FROM smart_call.dbo.SMA_Report
+        S.[SNo.],
+        S.[Br Code],
+        S.[Branch Name],
+        S.[Cluster Code],
+        S.[Account No.],
+        S.[Account Name],
+        S.[Account Type Description],
+        S.[Limit],
+        S.[Drawing Power],
+        S.[Int Rate],
+        S.[Theo Balance],
+        S.[Cleared Balance],
+        S.[Uncleared Balance],
+        S.[Outstanding Balance],
+        S.[Overdue],
+        S.[Sanction Date],
+        S.[Expiry Date],
+        S.[EMIs Due],
+        S.[EMIs Paid],
+        S.[EMIs OD],
+        S.[NEW IRAC],
+        S.[OLD IRAC],
+        S.[NPA Date],
+        S.[Arrear Condition],
+        S.[Arrear Description],
+        S.[Loan Type],
+        S.[Product Group],
+
+        COALESCE(MAX(R.mobileNumber), MAX(A.AlternateNumber)) AS MobileNumber,
+        MAX(A.AlternateNumber) AS AlternateNumber
+
+      FROM smart_call.dbo.SMA_Report S
+
+      LEFT JOIN smart_call.dbo.Recovery_Raw_Data R
+      ON S.[Account No.] = R.loanAccountNumber
+
+      LEFT JOIN smart_call.dbo.Recovery_Alternate_Number A
+      ON S.[Account No.] = A.LoanAccountNumber
+
       WHERE 1=1
     `;
 
     // Cluster filter
     if (clusterCode) {
-      query += ` AND [Cluster Code] = '${clusterCode}'`;
+      query += ` AND S.[Cluster Code] = '${clusterCode}'`;
     }
 
-    // Branch Code filter (handles leading zeros like 00001)
+    // Branch Code filter
     if (branchCode) {
-      query += ` AND CAST([Br Code] AS INT) = ${parseInt(branchCode)}`;
+      query += ` AND CAST(S.[Br Code] AS INT) = ${parseInt(branchCode)}`;
     }
 
     // Branch Name filter
     if (branchName) {
-      query += ` AND [Branch Name] LIKE '%${branchName}%'`;
+      query += ` AND S.[Branch Name] LIKE '%${branchName}%'`;
     }
 
-    // IRAC filter (handles values like 00,01,02 etc)
+    // IRAC filter
     if (irac) {
-      query += ` AND CAST([NEW IRAC] AS INT) = ${parseInt(irac)}`;
+      query += ` AND CAST(S.[NEW IRAC] AS INT) = ${parseInt(irac)}`;
     }
+
+    query += `
+      GROUP BY
+        S.[SNo.],
+        S.[Br Code],
+        S.[Branch Name],
+        S.[Cluster Code],
+        S.[Account No.],
+        S.[Account Name],
+        S.[Account Type Description],
+        S.[Limit],
+        S.[Drawing Power],
+        S.[Int Rate],
+        S.[Theo Balance],
+        S.[Cleared Balance],
+        S.[Uncleared Balance],
+        S.[Outstanding Balance],
+        S.[Overdue],
+        S.[Sanction Date],
+        S.[Expiry Date],
+        S.[EMIs Due],
+        S.[EMIs Paid],
+        S.[EMIs OD],
+        S.[NEW IRAC],
+        S.[OLD IRAC],
+        S.[NPA Date],
+        S.[Arrear Condition],
+        S.[Arrear Description],
+        S.[Loan Type],
+        S.[Product Group]
+    `;
 
     const result = await pool.request().query(query);
 
@@ -1970,43 +2367,41 @@ res.status(500).send("Server error");
 
 });
 
-app.get("/api/customer-numbers", async (req,res)=>{
+// =======================================================
+// GET CUSTOMER + ALL ALTERNATE NUMBERS
+// =======================================================
+app.get("/api/customer-numbers", async (req, res) => {
+  try {
+    const { accountNumber } = req.query;
 
-try{
+    const pool = await poolPromise;
 
-const {accountNumber} = req.query;
+    const result = await pool.request()
+      .input("accountNumber", accountNumber)
+      .query(`
+        SELECT DISTINCT
+            R.mobileNumber,
+            A.AlternateNumber
+        FROM smart_call.dbo.Recovery_Alternate_Number A
+        LEFT JOIN smart_call.dbo.Recovery_Raw_Data R
+            ON R.loanAccountNumber = A.LoanAccountNumber
+        WHERE A.LoanAccountNumber = @accountNumber
 
-const pool = await poolPromise;
+        UNION
 
-const result = await pool.request()
-.input("accountNumber",accountNumber)
-.query(`
+        SELECT
+            R.mobileNumber,
+            NULL AS AlternateNumber
+        FROM smart_call.dbo.Recovery_Raw_Data R
+        WHERE R.loanAccountNumber = @accountNumber
+      `);
 
-SELECT
-MAX(R.mobileNumber) as mobileNumber,
-MAX(A.AlternateNumber) as AlternateNumber
+    res.json(result.recordset);
 
-FROM smart_call.dbo.Recovery_Raw_Data R
-
-FULL OUTER JOIN smart_call.dbo.Recovery_Alternate_Number A
-ON R.loanAccountNumber = A.LoanAccountNumber
-
-WHERE
-R.loanAccountNumber = @accountNumber
-OR
-A.LoanAccountNumber = @accountNumber
-
-`);
-
-res.json(result.recordset);
-
-}catch(err){
-
-console.log("Customer numbers error:",err);
-res.status(500).send("Server error");
-
-}
-
+  } catch (err) {
+    console.log("Customer numbers error:", err);
+    res.status(500).send("Server error");
+  }
 });
 //=========================SMA START========================================
 app.post("/api/sma/session/start", async (req,res)=>{
@@ -2067,7 +2462,6 @@ res.status(500).send("Server error");
 
 });
 
-//======================================SMA ACTIVITY===========================================
 //======================================SMA ACTIVITY===========================================
 app.post("/api/sma/log", async (req,res)=>{
 
@@ -2193,8 +2587,6 @@ GETDATE(),
 
 }
 
-//===========================================================
-
 res.json({logId});
 
 }catch(err){
@@ -2240,6 +2632,52 @@ res.status(500).send("Server error");
 }
 
 });
+//====================================================== SMA HISTORY ===========================================================
+app.get("/api/sma/history", async (req, res) => {
+  try {
+
+    const { accountNumber } = req.query;
+
+    const pool = await poolPromise;
+
+    const result = await pool.request()
+      .input("accountNumber", accountNumber)
+      .query(`
+SELECT
+    S.SessionId,
+    S.StartedAt,
+    L.LogId,
+    L.ActionLabel,
+    L.ActionCode,
+    L.MetadataJson,
+    L.CreatedAt,
+    N.NoteText
+
+FROM smart_call.dbo.SMA_Activity_Sessions S
+
+LEFT JOIN smart_call.dbo.SMA_Activity_Logs L
+ON S.SessionId = L.SessionId
+
+LEFT JOIN smart_call.dbo.SMA_Activity_Notes N
+ON L.LogId = N.LogId
+
+WHERE S.LoanAccountNumber = @accountNumber
+
+ORDER BY
+S.StartedAt DESC,
+L.CreatedAt ASC
+
+`);
+
+    res.json(result.recordset);
+
+  } catch (err) {
+
+    console.log("SMA history error:", err);
+    res.status(500).send("Server error");
+
+  }
+});
 //=========================== LEAD STATUS =======================================================================
 app.get("/api/leads/status/:userId", async (req,res)=>{
 
@@ -2283,6 +2721,337 @@ res.status(500).send("Server error");
 }
 
 });
+
+//================================== EDIT IN PROCESS =========================================================
+
+app.post("/api/recovery/reset-today", async (req, res) => {
+  try {
+
+    const { loanAccountNumber, type } = req.body;
+
+    const pool = await poolPromise;
+
+    // STEP 1 — get current values
+    const existing = await pool.request()
+      .input("loanAccountNumber", sql.VarChar(50), loanAccountNumber)
+      .query(`
+        SELECT 
+          AssignmentId,
+          UserId,
+          ScheduleCallTimestamp,
+          ScheduleVisitTimestamp
+        FROM CallRecovery_Status
+        WHERE LoanAccountNumber = @loanAccountNumber
+        AND InProcessFlag = 1
+      `);
+
+    if (!existing.recordset.length) {
+      return res.json({ success: false });
+    }
+
+    const row = existing.recordset[0];
+
+    let updateQuery = "";
+    let newCall = null;
+    let newVisit = null;
+
+    if (type === "CALL") {
+      updateQuery = `
+        UPDATE CallRecovery_Status
+        SET
+          ScheduleCallTimestamp = GETDATE(),
+          ScheduleVisitTimestamp = NULL,
+
+          ScheduleCallPendingFlag = 1,
+          ScheduleCallCompletedFlag = 0,
+
+          ScheduleVisitPendingFlag = 0,
+          ScheduleVisitCompletedFlag = 0,
+
+          LastActionCode = 'RESET_TO_CALL',
+          LastActionLabel = 'Reset to Call Today',
+          UpdatedAt = GETDATE()
+
+        WHERE LoanAccountNumber = @loanAccountNumber
+        AND InProcessFlag = 1
+      `;
+
+      newCall = new Date();
+    }
+
+    if (type === "VISIT") {
+      updateQuery = `
+        UPDATE CallRecovery_Status
+        SET
+          ScheduleVisitTimestamp = GETDATE(),
+          ScheduleCallTimestamp = NULL,
+
+          ScheduleVisitPendingFlag = 1,
+          ScheduleVisitCompletedFlag = 0,
+
+          ScheduleCallPendingFlag = 0,
+          ScheduleCallCompletedFlag = 0,
+
+          LastActionCode = 'RESET_TO_VISIT',
+          LastActionLabel = 'Reset to Visit Today',
+          UpdatedAt = GETDATE()
+
+        WHERE LoanAccountNumber = @loanAccountNumber
+        AND InProcessFlag = 1
+      `;
+
+      newVisit = new Date();
+    }
+
+    // STEP 2 — update main table
+    await pool.request()
+      .input("loanAccountNumber", sql.VarChar(50), loanAccountNumber)
+      .query(updateQuery);
+
+    // STEP 3 — insert log
+    await pool.request()
+      .input("loanAccountNumber", sql.VarChar(50), loanAccountNumber)
+      .input("assignmentId", sql.Int, row.AssignmentId)
+      .input("userId", sql.VarChar(50), row.UserId)
+      .input("type", sql.VarChar(10), type)
+      .input("prevCall", sql.DateTime, row.ScheduleCallTimestamp)
+      .input("prevVisit", sql.DateTime, row.ScheduleVisitTimestamp)
+      .input("newCall", sql.DateTime, newCall)
+      .input("newVisit", sql.DateTime, newVisit)
+      .query(`
+        INSERT INTO Reset_For_Today_Log (
+          LoanAccountNumber,
+          AssignmentId,
+          UserId,
+          ResetType,
+          PreviousCallTimestamp,
+          PreviousVisitTimestamp,
+          NewCallTimestamp,
+          NewVisitTimestamp
+        )
+        VALUES (
+          @loanAccountNumber,
+          @assignmentId,
+          @userId,
+          @type,
+          @prevCall,
+          @prevVisit,
+          @newCall,
+          @newVisit
+        )
+      `);
+
+    res.json({ success: true });
+
+  } catch (err) {
+    console.log("Reset today error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+//==================================VISIT NEARBY CUSTOMERS=========================================
+async function getCoordsFromAddress(address) {
+  try {
+    const response = await axios.get(
+      "https://maps.googleapis.com/maps/api/geocode/json",
+      {
+        params: {
+          address: address,
+          key: GOOGLE_API_KEY,
+        },
+      }
+    );
+
+    if (response.data.status === "OK") {
+      const loc = response.data.results[0].geometry.location;
+      return {
+        latitude: loc.lat,
+        longitude: loc.lng,
+      };
+    }
+
+    return null;
+  } catch (err) {
+    console.log("Geocode error:", err.message);
+    return null;
+  }
+}
+
+
+async function getRoadDistance(originLat, originLng, destLat, destLng) {
+  try {
+    const response = await axios.get(
+      "https://maps.googleapis.com/maps/api/distancematrix/json",
+      {
+        params: {
+          origins: `${originLat},${originLng}`,
+          destinations: `${destLat},${destLng}`,
+          key: GOOGLE_API_KEY,
+          mode: "driving",
+        },
+      }
+    );
+
+    const element = response.data.rows[0].elements[0];
+
+    if (element.status === "OK") {
+      return {
+        distanceKm: element.distance.value / 1000,
+        duration: element.duration.text,
+      };
+    }
+
+    return null;
+  } catch (err) {
+    console.log("Distance API error:", err.message);
+    return null;
+  }
+}
+//==================================VISIT NEARBY CUSTOMERS=========================================
+
+
+app.get("/nearby-customers", async (req, res) => {
+  try {
+    const { lat, lng, userId } = req.query;
+    const radius = 2; // KM
+
+    if (!lat || !lng || !userId) {
+      return res.status(400).json({ message: "lat, lng, userId required" });
+    }
+
+    const pool = await poolPromise;
+
+    const result = await pool.request()
+      .input("UserId", sql.VarChar(50), String(userId))
+      .query(`
+        SELECT 
+          R.loanAccountNumber,
+          R.firstname,
+          R.gp,
+          R.pincode
+        FROM Recovery_Raw_Data R
+        INNER JOIN Account_Assignments A
+          ON A.LoanAccountNumber = R.loanAccountNumber
+        WHERE
+          A.AssignedToUserId = @UserId
+          AND A.AssignmentStatus = 'Assigned'
+      `);
+
+    const rows = result.recordset;
+    const nearby = [];
+
+    for (const row of rows) {
+
+      const address =
+        `${row.gp || ""}, ${row.pincode || ""}, Andhra Pradesh, India`;
+
+      // Step 1: Get customer lat/lng
+      const coords = await getCoordsFromAddress(address);
+      if (!coords) continue;
+
+      // Step 2: Get GOOGLE ROAD DISTANCE
+      const road = await getRoadDistance(
+        lat,
+        lng,
+        coords.latitude,
+        coords.longitude
+      );
+
+      if (!road) continue;
+
+      const distance = road.distanceKm;
+
+      // Step 3: filter within radius
+      if (distance <= radius) {
+        nearby.push({
+          loanAccountNumber: row.loanAccountNumber,
+          customerName: row.firstname,
+          address: address,
+          distance: distance,
+          duration: road.duration
+        });
+      }
+    }
+
+    // Step 4: sort nearest first
+    nearby.sort((a, b) => a.distance - b.distance);
+
+    res.json(nearby);
+
+  } catch (err) {
+    console.log("Nearby customers error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+//================================== FUTURE / PAST SCHEDULED LIST ==================================
+app.post("/api/recovery/scheduled-list", async (req, res) => {
+  try {
+    const { type, userId } = req.body;
+
+    const pool = await poolPromise;
+    const request = pool.request();
+
+    request.input("userId", sql.VarChar(50), userId);
+
+    let dateCondition = "";
+
+    if (type === "FUTURE") {
+      dateCondition = `
+        (
+          (CRS.ScheduleCallTimestamp IS NOT NULL 
+           AND CAST(CRS.ScheduleCallTimestamp AS DATE) > CAST(GETDATE() AS DATE))
+          OR
+          (CRS.ScheduleVisitTimestamp IS NOT NULL 
+           AND CAST(CRS.ScheduleVisitTimestamp AS DATE) > CAST(GETDATE() AS DATE))
+        )
+      `;
+    }
+
+    if (type === "PAST") {
+      dateCondition = `
+        (
+          (CRS.ScheduleCallTimestamp IS NOT NULL 
+           AND CAST(CRS.ScheduleCallTimestamp AS DATE) < CAST(GETDATE() AS DATE))
+          OR
+          (CRS.ScheduleVisitTimestamp IS NOT NULL 
+           AND CAST(CRS.ScheduleVisitTimestamp AS DATE) < CAST(GETDATE() AS DATE))
+        )
+      `;
+    }
+
+    const query = `
+      SELECT
+        R.firstname,
+        R.loanAccountNumber AS LoanAccountNumber,
+        R.mobileNumber,
+        R.OVERDUEAMT AS overdueAmount,
+        0 AS AttemptCount,
+        'IN PROCESS' AS AccountStatus,
+        CRS.ScheduleCallTimestamp,
+        CRS.ScheduleVisitTimestamp
+      FROM CallRecovery_Status CRS
+      INNER JOIN Recovery_Raw_Data R
+        ON R.loanAccountNumber = CRS.LoanAccountNumber
+      WHERE CRS.UserId = @userId
+      AND CRS.InProcessFlag = 1
+      AND ${dateCondition}
+      ORDER BY CRS.UpdatedAt DESC
+    `;
+
+    const result = await request.query(query);
+
+    res.json({
+      success: true,
+      records: result.recordset
+    });
+
+  } catch (err) {
+    console.log("Scheduled list error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
 //==================================================================================================================================================================================
 //                                                                         --------------------------------------------------------------------
 //==================================================================================================================================================================================
@@ -2295,9 +3064,12 @@ app.get("/api/branches", async (req, res) => {
     const result = await pool.request().query(`
       SELECT branch_code, branch_name
       FROM dbo.Branch_Cluster_Master
+      WHERE branch_name <> 'Corporate Office'
       ORDER BY branch_name
     `);
+
     res.status(200).json(result.recordset);
+
   } catch (err) {
     console.error("❌ BRANCH API ERROR:", err);
     res.status(500).json({ message: "Failed to fetch branches" });
@@ -2336,8 +3108,10 @@ app.get("/api/branches/:clusterName", async (req, res) => {
       const result = await pool.request().query(`
         SELECT branch_code, branch_name
         FROM dbo.Branch_Cluster_Master
+        WHERE branch_name <> 'Corporate Office'
         ORDER BY branch_name
       `);
+
       return res.status(200).json(result.recordset);
     }
 
@@ -2347,10 +3121,12 @@ app.get("/api/branches/:clusterName", async (req, res) => {
         SELECT branch_code, branch_name
         FROM dbo.Branch_Cluster_Master
         WHERE cluster_name = @cluster_name
+        AND branch_name <> 'Corporate Office'
         ORDER BY branch_name
       `);
 
     res.status(200).json(result.recordset);
+
   } catch (err) {
     console.error("❌ BRANCH API ERROR:", err);
     res.status(500).json({ message: "Failed to fetch branches" });
@@ -2527,31 +3303,31 @@ await pool.request()
   `);
 
 // ------------------------------------------------------------------
-// STEP 6 — Get YESTERDAY latest upload
+// STEP 6 — Get LAST upload BEFORE today (NOT today)
 // ------------------------------------------------------------------
-const yesterdayLatestRes = await pool.request().query(`
+const prevRes = await pool.request().query(`
   SELECT TOP 1 record_count
   FROM Recovery_Upload_Log
-  WHERE upload_date = CAST(DATEADD(DAY, -1, GETDATE()) AS DATE)
+  WHERE upload_date < CAST(GETDATE() AS DATE)
   ORDER BY uploaded_at DESC
 `);
 
-const yesterdayLatestCount = 
-  yesterdayLatestRes.recordset.length
-  ? yesterdayLatestRes.recordset[0].record_count
-  : 0;
+const previousCount =
+  prevRes.recordset.length
+    ? prevRes.recordset[0].record_count
+    : 0;
 
 // ------------------------------------------------------------------
-// STEP 7 — Calculate difference (Yesterday latest vs Today latest)
+// STEP 7 — Calculate difference
 // ------------------------------------------------------------------
 const archived =
-  todayCount < yesterdayLatestCount
-    ? yesterdayLatestCount - todayCount
+  todayCount < previousCount
+    ? previousCount - todayCount
     : 0;
 
 const newRecords =
-  todayCount > yesterdayLatestCount
-    ? todayCount - yesterdayLatestCount
+  todayCount > previousCount
+    ? todayCount - previousCount
     : 0;
 
     // ------------------------------------------------------------------
@@ -2573,74 +3349,90 @@ const newRecords =
 
 
 //============================================================================================
-//                          FILE UPLOAD STATUS (DAILY COMPARISON)
+//                          FILE UPLOAD STATUS (FINAL CORRECT LOGIC)
 //============================================================================================
 app.get("/api/recovery-upload-status", async (req, res) => {
   try {
+
     const pool = await poolPromise;
-	
-	const userId = req.headers["x-user-id"];
 
-if (!userId) {
-  return res.status(401).json({ message: "Unauthorized" });
-}
+    const userId = req.headers["x-user-id"];
 
-// Fetch user role from DB
-const roleResult = await pool.request()
-  .input("userId", sql.VarChar(50), userId)
-  .query(`
-    SELECT Role 
-    FROM UsersInfo
-    WHERE UserId = @userId
-  `);
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
 
-if (!roleResult.recordset.length) {
-  return res.status(403).json({ message: "User not found" });
-}
+    // 🔹 Fetch user role
+    const roleResult = await pool.request()
+      .input("userId", sql.VarChar(50), userId)
+      .query(`
+        SELECT Role 
+        FROM UsersInfo
+        WHERE UserId = @userId
+      `);
 
-const userRole = roleResult.recordset[0].Role;
+    if (!roleResult.recordset.length) {
+      return res.status(403).json({ message: "User not found" });
+    }
 
-if (
-  userRole === "Branch Manager" ||
-  userRole.startsWith("Regional Manager")
-) {
-  return res.status(403).json({
-    message: "Access Denied. Please Contact Admin."
-  });
-}
+    const userRole = roleResult.recordset[0].Role;
 
-// 🔹 Yesterday Last Upload
-const yesterdayRes = await pool.request().query(`
-SELECT TOP 1 record_count
-FROM Recovery_Upload_Log
-WHERE CAST(uploaded_at AS DATE) = CAST(DATEADD(DAY,-1,GETDATE()) AS DATE)
-ORDER BY uploaded_at DESC
-`);
+    if (
+      userRole === "Branch Manager" ||
+      userRole.startsWith("Regional Manager")
+    ) {
+      return res.status(403).json({
+        message: "Access Denied. Please Contact Admin."
+      });
+    }
 
-const yesterday = yesterdayRes.recordset.length
-  ? yesterdayRes.recordset[0].record_count
-  : 0;
+    // ============================================================
+    // 🔹 STEP 1 — Get latest upload
+    // ============================================================
+    const latestRes = await pool.request().query(`
+      SELECT TOP 1 record_count, uploaded_at
+      FROM Recovery_Upload_Log
+      ORDER BY uploaded_at DESC
+    `);
 
+    const latestDate = latestRes.recordset.length
+      ? latestRes.recordset[0].uploaded_at
+      : null;
 
-// 🔹 Today Last Upload
-const todayRes = await pool.request().query(`
-SELECT TOP 1 record_count
-FROM Recovery_Upload_Log
-WHERE CAST(uploaded_at AS DATE) = CAST(GETDATE() AS DATE)
-ORDER BY uploaded_at DESC
-`);
+    const today = latestRes.recordset.length
+      ? latestRes.recordset[0].record_count
+      : 0;
 
-const today = todayRes.recordset.length
-  ? todayRes.recordset[0].record_count
-  : 0;
+    // ============================================================
+    // 🔹 STEP 2 — Get previous upload from DIFFERENT DATE
+    // ============================================================
+    const prevRes = await pool.request()
+      .input("latestDate", sql.DateTime, latestDate)
+      .query(`
+        SELECT TOP 1 record_count
+        FROM Recovery_Upload_Log
+        WHERE CAST(uploaded_at AS DATE) < CAST(@latestDate AS DATE)
+        ORDER BY uploaded_at DESC
+      `);
 
+    const previous = prevRes.recordset.length
+      ? prevRes.recordset[0].record_count
+      : 0;
 
-// 🔹 Difference Calculation
-res.json({
-  archived: today < yesterday ? yesterday - today : 0,
-  uploaded: today > yesterday ? today - yesterday : 0,
-  history_total: today
-});
+    // ============================================================
+    // 🔹 STEP 3 — Calculate difference
+    // ============================================================
+    const archived = today < previous ? previous - today : 0;
+    const uploaded = today > previous ? today - previous : 0;
+
+    // ============================================================
+    // 🔹 RESPONSE
+    // ============================================================
+    res.json({
+      archived,
+      uploaded,
+      history_total: today
+    });
 
   } catch (err) {
     console.error("❌ STATUS ERROR:", err);
@@ -3469,6 +4261,8 @@ if (isRegionalManager) {
       OR Role LIKE '%Calling Agent%'
       OR Role LIKE '%Regional Manager%'
   )
+  AND BranchName <> 'Corporate Office'
+  AND ISNULL(Status, 'Active') = 'Active'
 `;
 
     const request = pool.request();
@@ -3597,20 +4391,22 @@ app.post("/api/assign", async (req, res) => {
 });
 
 
+
 // ======================
 // ADD USER
 // ======================
 app.post("/api/users", async (req, res) => {
   const {
-    userId,
-    userName,
-    branchName,
-    roles,
-    dateOfBirth,
-    mobileNumber,
-    validFrom,
-    validUntil
-  } = req.body;
+  userId,
+  userName,
+  branchName,
+  roles,
+  dateOfBirth,
+  mobileNumber,
+  validFrom,
+  validUntil,
+  status   // ✅ ADD THIS
+} = req.body;
 
   const pool = await poolPromise;
 
@@ -3637,7 +4433,7 @@ app.post("/api/users", async (req, res) => {
   const { branch_code, cluster_name } = branch.recordset[0];
 
   await pool.request()
-    .input("UserId", userId)
+    .input("UserId", sql.VarChar, userId)
     .input("UserName", userName)
     .input("BranchName", branchName)
     .input("BranchCode", sql.Int, branch_code)
@@ -3646,17 +4442,18 @@ app.post("/api/users", async (req, res) => {
     .input("DateOfBirth", sql.Date, dateOfBirth === "" ? null : dateOfBirth)
     .input("ValidFrom", sql.Date, validFrom === "" ? null : validFrom)
     .input("ValidUntil", sql.Date, validUntil === "" ? null : validUntil)
+	.input("Status", sql.VarChar, status || "Active")
 
     .query(`
       INSERT INTO UsersInfo (
-        UserId, UserName,
-        BranchName, BranchCode, ClusterName,
-        MobileNumber, DateOfBirth, ValidFrom, ValidUntil, CreatedAt
-      ) VALUES (
-        @UserId, @UserName,
-        @BranchName, @BranchCode, @ClusterName,
-        @MobileNumber, @DateOfBirth, @ValidFrom, @ValidUntil, GETDATE()
-      )
+  UserId, UserName,
+  BranchName, BranchCode, ClusterName,
+  MobileNumber, DateOfBirth, ValidFrom, ValidUntil, Status, CreatedAt
+) VALUES (
+  @UserId, @UserName,
+  @BranchName, @BranchCode, @ClusterName,
+  @MobileNumber, @DateOfBirth, @ValidFrom, @ValidUntil, @Status, GETDATE()
+)
     `);
 	
 	// Insert roles into mapping table
@@ -3702,14 +4499,15 @@ app.put("/api/users/:userId", async (req, res) => {
   const { userId } = req.params;
 
   const {
-    userName,
-    branchName,
-    roles,
-    mobileNumber,
-    dateOfBirth,
-    validFrom,
-    validUntil
-  } = req.body;
+  userName,
+  branchName,
+  roles,
+  mobileNumber,
+  dateOfBirth,
+  validFrom,
+  validUntil,
+  status   // ✅ ADD
+} = req.body;
 
   try {
     const pool = await poolPromise;
@@ -3755,18 +4553,20 @@ app.put("/api/users/:userId", async (req, res) => {
       .input("DateOfBirth", sql.Date, dateOfBirth === "" ? null : dateOfBirth)
       .input("ValidFrom", sql.Date, validFrom === "" ? null : validFrom)
       .input("ValidUntil", sql.Date, validUntil === "" ? null : validUntil)
+	  .input("Status", sql.VarChar, status)
       .query(`
         UPDATE UsersInfo SET
-          UserName = @UserName,
-          BranchName = @BranchName,
-          BranchCode = @BranchCode,
-          ClusterName = @ClusterName,
-          MobileNumber = @MobileNumber,
-          DateOfBirth = @DateOfBirth,
-          ValidFrom = @ValidFrom,
-          ValidUntil = @ValidUntil,
-          UpdatedAt = GETDATE()
-        WHERE UserId = @UserId
+  UserName = @UserName,
+  BranchName = @BranchName,
+  BranchCode = @BranchCode,
+  ClusterName = @ClusterName,
+  MobileNumber = @MobileNumber,
+  DateOfBirth = @DateOfBirth,
+  ValidFrom = @ValidFrom,
+  ValidUntil = @ValidUntil,
+  Status = @Status,
+  UpdatedAt = GETDATE()
+WHERE UserId = @UserId
       `);
 	  
 	  // Delete old roles
@@ -3841,17 +4641,20 @@ app.delete("/api/users/:userId", async (req, res) => {
   }
 });
 
+
 // ======================
 // GET USERS (LIST) - POST
 // ======================
 app.post("/api/users/list", async (req, res) => {
-  const {
-    page = 1,
-    pageSize = 15,
-    name = "",
-    branch = "",
-	cluster = "" 
-  } = req.body;
+ const {
+  page = 1,
+  pageSize = 15,
+  userId = "",
+  name = "",
+  branch = "",
+  cluster = "",
+  status = ""   // ✅ ADD THIS
+} = req.body;
   
   const role = req.headers["x-user-role"];
 const loggedBranch = req.headers["x-user-branch"];
@@ -3898,12 +4701,14 @@ ISNULL((
         DateOfBirth  AS dateOfBirth,
         ValidFrom    AS validFrom,
         ValidUntil   AS validUntil,
-        'Active'     AS status
+        ISNULL(Status, 'Active') AS status
       FROM UsersInfo
       WHERE
-        (@name = '' OR UserName LIKE '%' + @name + '%')
-        AND (@branch = '' OR BranchName = @branch)
-		AND (@cluster = '' OR ClusterName = @cluster)
+(@userId = '' OR UserId LIKE '%' + @userId + '%')
+AND (@name = '' OR UserName LIKE '%' + @name + '%')
+AND (@branch = '' OR BranchName = @branch)
+AND (@cluster = '' OR ClusterName = @cluster)
+AND (@status = '' OR ISNULL(Status,'Active') = @status)
       ORDER BY UserName ASC
       OFFSET @offset ROWS
       FETCH NEXT @pageSize ROWS ONLY
@@ -3913,20 +4718,34 @@ ISNULL((
       SELECT COUNT(*) AS total
       FROM UsersInfo
       WHERE
-        (@name = '' OR UserName LIKE '%' + @name + '%')
-        AND (@branch = '' OR BranchName = @branch)
-		AND (@cluster = '' OR ClusterName = @cluster)   
+  (@userId = '' OR UserId LIKE '%' + @userId + '%')
+  AND (@name = '' OR UserName LIKE '%' + @name + '%')
+  AND (@branch = '' OR BranchName = @branch)
+  AND (@cluster = '' OR ClusterName = @cluster)
+AND (@status = '' OR ISNULL(Status,'Active') = @status)  
     `;
 
-    const request = pool.request()
+    // ✅ DATA QUERY REQUEST
+const dataRequest = pool.request()
+  .input("userId", sql.VarChar, userId)
   .input("name", sql.VarChar, name)
   .input("branch", sql.VarChar, finalBranch || "")
   .input("cluster", sql.VarChar, finalCluster || "")
-      .input("offset", sql.Int, offset)
-      .input("pageSize", sql.Int, pageSize);
+  .input("status", sql.VarChar, status)
+  .input("offset", sql.Int, offset)
+  .input("pageSize", sql.Int, pageSize);
 
-    const records = await request.query(dataQuery);
-    const countRes = await request.query(countQuery);
+// ✅ COUNT QUERY REQUEST
+const countRequest = pool.request()
+  .input("userId", sql.VarChar, userId)
+  .input("name", sql.VarChar, name)
+  .input("branch", sql.VarChar, finalBranch || "")
+  .input("cluster", sql.VarChar, finalCluster || "")
+  .input("status", sql.VarChar, status);
+
+// ✅ EXECUTE
+const records = await dataRequest.query(dataQuery);
+const countRes = await countRequest.query(countQuery);
 
     const total = countRes.recordset[0].total;
     const pages = Math.ceil(total / pageSize);
@@ -4007,8 +4826,8 @@ if (!userId) return res.status(401).json([]);
         f.DistanceTravelled,
         f.CustomerLatitude,
         f.CustomerLongitude,
-        f.Variance,
-        f.Flow
+        f.Variance
+        
       FROM smart_call.dbo.FieldVisitReport f
       INNER JOIN smart_call.dbo.Account_Assignments aa
         ON f.AccountNo = aa.LoanAccountNumber
@@ -4061,8 +4880,82 @@ if (userInfo?.Role?.startsWith("Regional Manager")) {
 
     query += " ORDER BY f.MeetingDate DESC";
 
-    const result = await request.query(query);
-    res.json(result.recordset || []);
+   const result = await request.query(query);
+const data = result.recordset || [];
+
+// ================= FETCH SESSIONS =================
+
+if (data.length === 0) {
+  return res.json([]);
+}
+
+const requestSessions = pool.request();
+
+data.forEach((row, index) => {
+  requestSessions.input(`acc${index}`, row.AccountNo);
+});
+
+const sessionsResult = await requestSessions.query(`
+  SELECT
+    s.SessionId,
+    s.SourceId AS AccountNo
+  FROM Activity_Sessions s
+  WHERE s.SourceId IN (${data.map((_, i) => `@acc${i}`).join(",")})
+    AND s.SessionType = 'VISIT'
+    AND ISNULL(s.SourceType,'NPA') = 'NPA'
+`);
+
+const sessions = sessionsResult.recordset;
+
+// ================= FETCH LOGS =================
+
+const sessionIds = sessions.map(s => s.SessionId);
+
+let logs = [];
+
+if (sessionIds.length > 0) {
+
+  const requestLogs = pool.request();
+
+  sessionIds.forEach((id, index) => {
+    requestLogs.input(`sid${index}`, id);
+  });
+
+  const logsResult = await requestLogs.query(`
+    SELECT 
+      L.SessionId,
+      L.ActionLabel
+    FROM Activity_Logs L
+    WHERE L.SessionId IN (${sessionIds.map((_, i) => `@sid${i}`).join(",")})
+    ORDER BY L.CreatedAt
+  `);
+
+  logs = logsResult.recordset;
+}
+
+// ================= BUILD FLOW =================
+
+const finalData = data.map(row => {
+
+  const session = sessions.find(s => s.AccountNo == row.AccountNo);
+
+  if (!session) {
+    return { ...row, Flow: "" };
+  }
+
+  const sessionLogs = logs.filter(l => l.SessionId === session.SessionId);
+
+  const flow = sessionLogs
+    .map((l, index) => `${index + 1}. ${l.ActionLabel}`)
+    .join("\n");
+
+  return {
+    ...row,
+    Flow: flow
+  };
+});
+
+res.json(finalData);
 
   } catch (err) {
     console.error("FIELD VISIT REPORT ERROR:", err);
@@ -6012,13 +6905,13 @@ CONVERT(VARCHAR, L.TimeStamp, 105) AS DateOfEntry,
 
 CASE
   WHEN EXISTS (
-    SELECT 1
-    FROM smart_call.dbo.Activity_Logs AL
-    WHERE AL.SourceId = CAST(L.SNo AS VARCHAR(50))
-      AND AL.ActionCode = 'LEAD_NOT_INTERESTED'
-      AND AL.ActionLabel = 'Lead Not Interested'
-  )
-  THEN 'NOT INTERESTED'
+  SELECT 1
+  FROM smart_call.dbo.Activity_Logs AL
+  WHERE AL.SourceId = CAST(L.SNo AS VARCHAR(50))
+    AND AL.ActionCode = 'LEAD_NO_REQUIREMENT'
+    AND AL.ActionLabel = 'Lead Does Not Require Loan'
+)
+THEN 'NOT INTERESTED'
 
   WHEN EXISTS (
     SELECT 1
@@ -6070,11 +6963,16 @@ if (isRegionalManager) {
   request.input("rmCluster", sql.VarChar, rmCluster);
 }
 
-    // ================= USER FILTER =================
-    if (userId) {
-      query += ` AND LA.LeadAssignedToUserId = @userId `;
-      request.input("userId", sql.VarChar, userId);
-    }
+     // ================= USER FILTER =================
+if (userId) {
+  query += `
+    AND (
+      LA.LeadAssignedToUserId = @userId
+      OR L.UserID = @userId
+    )
+  `;
+  request.input("userId", sql.VarChar, userId);
+}
 
     // ================= CLUSTER FILTER =================
     if (cluster && cluster !== "Corporate Office") {
@@ -6757,12 +7655,22 @@ LEFT JOIN (
 ) AL_LOS
 ON AL_LOS.SourceId = CAST(L.SNo AS VARCHAR(50))
 
--- Not Interested
+-- Not Interested (Latest Log - Multiple Conditions)
 LEFT JOIN (
-    SELECT DISTINCT SourceId
-    FROM smart_call.dbo.Activity_Logs
-    WHERE ActionCode = 'LEAD_NOT_INTERESTED'
-      AND ActionLabel = 'Lead Not Interested'
+    SELECT SourceId
+    FROM (
+        SELECT 
+            SourceId,
+            ActionCode,
+            ActionLabel,
+            ROW_NUMBER() OVER (PARTITION BY SourceId ORDER BY CreatedAt DESC) AS rn
+        FROM smart_call.dbo.Activity_Logs
+    ) t
+    WHERE rn = 1
+      AND (
+(ActionCode = 'LEAD_NO_REQUIREMENT'
+             AND ActionLabel = 'Lead Does Not Require Loan')
+      )
 ) AL_NOT_INTERESTED
 ON AL_NOT_INTERESTED.SourceId = CAST(L.SNo AS VARCHAR(50))
 
@@ -7008,7 +7916,11 @@ const activityCheck = await pool.request()
     SELECT TOP 1 ActionCode
     FROM smart_call.dbo.Activity_Logs
     WHERE SourceId = @sourceId
-    AND ActionCode IN ('LEAD_LOS_CAPTURED','LEAD_NOT_INTERESTED')
+    AND ActionCode IN (
+  'LEAD_LOS_CAPTURED',
+  'LEAD_NOT_INTERESTED_OTHER_REASON',
+  'LEAD_NO_REQUIREMENT'
+)
   `);
 
 if (activityCheck.recordset.length > 0) {
@@ -7110,7 +8022,8 @@ app.post("/api/leads-data/search", async (req, res) => {
       leadType = "",
       leadStatus = "",
       assignedTo = "",
-      closedBy = ""
+      closedBy = "",
+	  actionType = ""  
     } = req.body;
 
     const pool = await poolPromise;
@@ -7155,15 +8068,38 @@ FORMAT(MAX(AL.CreatedAt),'hh:mm tt') AS activityTime
 
 FROM smart_call.dbo.Activity_Logs AL
 
+INNER JOIN (
+  SELECT SourceId, MAX(LogId) AS LatestLogId
+  FROM smart_call.dbo.Activity_Logs
+  WHERE SourceType = 'LEAD'
+  GROUP BY SourceId
+) Latest
+ON AL.LogId = Latest.LatestLogId
+
 LEFT JOIN smart_call.dbo.Leads_Data LD
 ON LD.SNo = AL.SourceId
 
 LEFT JOIN smart_call.dbo.Lead_Assignments LA
 ON LA.LeadSNo = AL.SourceId
 
-WHERE
-AL.SourceType='LEAD'
+WHERE AL.SourceType='LEAD'
+AND AL.ActionCode NOT IN ('LEAD_REACTIVATED')
 `;
+
+// ✅ Past Schedule
+if (actionType === "past") {
+  query += `
+AND TRY_CAST(JSON_VALUE(AL.MetadataJson, '$.date') AS DATE) < CAST(GETDATE() AS DATE)
+`;
+}
+
+// ✅ Future Schedule
+if (actionType === "future") {
+  query += `
+AND TRY_CAST(JSON_VALUE(AL.MetadataJson, '$.date') AS DATE) >= CAST(GETDATE() AS DATE)
+`;
+}
+
 
     // 🔒 Branch Manager restriction
     if (isBranchManager) {
@@ -7425,10 +8361,10 @@ const isRegionalManager = Role?.startsWith("Regional Manager");
           MAX(AL.CreatedByUserName) AS userName,
 
           CASE
-            WHEN MAX(AL.ActionCode) = 'LEAD_SPOKE'
-            THEN 'Call'
-            ELSE MAX(AL.ActionLabel)
-          END AS activityType,
+  WHEN MAX(AL.ActionCode) IN ('LEAD_SPOKE', 'LEAD_NOT_SPOKE')
+  THEN 'Call'
+  ELSE MAX(AL.ActionLabel)
+END AS activityType,
 
           STRING_AGG(AL.ActionLabel,' -> ') AS activityStatus,
 
@@ -7492,6 +8428,91 @@ if (isRegionalManager) {
     console.error("❌ ACTIVITY DETAILS ERROR:", err);
     res.status(500).json([]);
 
+  }
+
+});
+
+// ============================================================
+// REACTIVATE LEADS (PROPER LOG CHAIN)
+// ============================================================
+app.post("/api/leads/reactivate", async (req, res) => {
+
+  const userId = req.headers["x-user-id"];
+  const { leadIds } = req.body;
+
+  if (!userId || !leadIds || leadIds.length === 0) {
+    return res.status(400).json({ message: "Invalid request" });
+  }
+
+  try {
+
+    const pool = await poolPromise;
+
+    // ✅ Get username
+    const userInfo = await pool.request()
+      .input("userId", sql.VarChar, userId)
+      .query(`SELECT UserName FROM UsersInfo WHERE UserId = @userId`);
+
+    const userName = userInfo.recordset[0]?.UserName || "System";
+
+    for (const leadId of leadIds) {
+
+      await pool.request()
+        .input("leadId", sql.BigInt, leadId)
+        .input("userId", sql.VarChar, userId)
+        .input("userName", sql.VarChar, userName)
+        .query(`
+
+INSERT INTO smart_call.dbo.Activity_Logs
+(
+  SessionId,
+  ParentLogId,
+  ActionCode,
+  ActionLabel,
+  MetadataJson,
+  CreatedAt,
+  CreatedByUserId,
+  CreatedByUserName,
+  IsPrimaryAction,
+  SourceType,
+  SourceId
+)
+
+SELECT
+  AL.SessionId,                 -- ✅ SAME SESSION
+  AL.LogId,                     -- ✅ LINK TO PREVIOUS LOG
+
+  'LEAD_REACTIVATED',
+  'Lead Reactivated',
+
+  JSON_MODIFY(
+    ISNULL(AL.MetadataJson, '{}'),
+    '$.date',
+    FORMAT(GETDATE(),'yyyy-MM-dd HH:mm:ss')
+  ),
+
+  GETDATE(),
+  @userId,
+  @userName,
+  1,
+  'LEAD',
+  @leadId
+
+FROM (
+  SELECT TOP 1 *
+  FROM smart_call.dbo.Activity_Logs
+  WHERE SourceId = @leadId
+  ORDER BY LogId DESC
+) AL
+
+        `);
+    }
+
+    res.json({ message: "Leads reactivated successfully" });
+
+  } catch (err) {
+    console.error("❌ REACTIVATE ERROR:", err);
+    res.status(500).json({ message: "Reactivation failed" });
   }
 
 });
@@ -7760,20 +8781,20 @@ await pool.request()
 
 
 // ============================================================
-// STEP 3 — Get Yesterday Latest Upload
+// STEP 3 — Get LAST upload BEFORE today (NOT today)
 // ============================================================
 
-const yesterdayRes = await pool.request().query(`
+const prevRes = await pool.request().query(`
   SELECT TOP 1 record_count
   FROM SMA_Upload_Log
-  WHERE upload_date = CAST(DATEADD(DAY,-1,GETDATE()) AS DATE)
+  WHERE upload_date < CAST(GETDATE() AS DATE)
   ORDER BY uploaded_at DESC
 `);
 
-const yesterdayCount =
-  yesterdayRes.recordset.length
-  ? yesterdayRes.recordset[0].record_count
-  : 0;
+const previousCount =
+  prevRes.recordset.length
+    ? prevRes.recordset[0].record_count
+    : 0;
 
 
 // ============================================================
@@ -7781,13 +8802,13 @@ const yesterdayCount =
 // ============================================================
 
 const archived =
-  todayCount < yesterdayCount
-    ? yesterdayCount - todayCount
+  todayCount < previousCount
+    ? previousCount - todayCount
     : 0;
 
 const newRecords =
-  todayCount > yesterdayCount
-    ? todayCount - yesterdayCount
+  todayCount > previousCount
+    ? todayCount - previousCount
     : 0;
 
 
@@ -7817,81 +8838,93 @@ res.json({
 });
 
 // ============================================================
-// SMA FILE UPLOAD STATUS
+// SMA FILE UPLOAD STATUS (FINAL CORRECT LOGIC)
 // ============================================================
 
 app.get("/api/sma/upload-status", async (req, res) => {
 	
-	const userId = req.headers["x-user-id"];
+  const userId = req.headers["x-user-id"];
 
-if (!userId) {
-  return res.status(401).json({ message: "Unauthorized" });
-}
+  if (!userId) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
 
-const pool = await poolPromise;
+  const pool = await poolPromise;
 
-const userInfo = await pool.request()
-  .input("userId", sql.VarChar, userId)
-  .query(`
-    SELECT Role
-    FROM UsersInfo
-    WHERE UserId = @userId
-  `);
+  const userInfo = await pool.request()
+    .input("userId", sql.VarChar, userId)
+    .query(`
+      SELECT Role
+      FROM UsersInfo
+      WHERE UserId = @userId
+    `);
 
-if (!userInfo.recordset.length) {
-  return res.status(403).json({ message: "User not found" });
-}
+  if (!userInfo.recordset.length) {
+    return res.status(403).json({ message: "User not found" });
+  }
 
-const { Role } = userInfo.recordset[0];
+  const { Role } = userInfo.recordset[0];
 
-if (Role !== "Admin" && Role !== "Super Admin") {
-  return res.status(403).json({
-    message: "Only Admin can view upload status"
-  });
-}
+  if (Role !== "Admin" && Role !== "Super Admin") {
+    return res.status(403).json({
+      message: "Only Admin can view upload status"
+    });
+  }
 
   try {
 
-    const pool = await poolPromise;
-
-    // 🔹 Yesterday Last Upload
-    const yesterdayRes = await pool.request().query(`
-      SELECT TOP 1 record_count
+    // ============================================================
+    // 🔹 STEP 1 — Get latest upload
+    // ============================================================
+    const latestRes = await pool.request().query(`
+      SELECT TOP 1 record_count, uploaded_at
       FROM SMA_Upload_Log
-      WHERE CAST(uploaded_at AS DATE) = CAST(DATEADD(DAY,-1,GETDATE()) AS DATE)
       ORDER BY uploaded_at DESC
     `);
 
-    const yesterday =
-      yesterdayRes.recordset.length
-      ? yesterdayRes.recordset[0].record_count
+    const latestDate = latestRes.recordset.length
+      ? latestRes.recordset[0].uploaded_at
+      : null;
+
+    const today = latestRes.recordset.length
+      ? latestRes.recordset[0].record_count
       : 0;
 
 
-    // 🔹 Today Last Upload
-    const todayRes = await pool.request().query(`
-      SELECT TOP 1 record_count
-      FROM SMA_Upload_Log
-      WHERE CAST(uploaded_at AS DATE) = CAST(GETDATE() AS DATE)
-      ORDER BY uploaded_at DESC
-    `);
+    // ============================================================
+    // 🔹 STEP 2 — Get previous upload from DIFFERENT DATE
+    // ============================================================
+    const prevRes = await pool.request()
+      .input("latestDate", sql.DateTime, latestDate)
+      .query(`
+        SELECT TOP 1 record_count
+        FROM SMA_Upload_Log
+        WHERE CAST(uploaded_at AS DATE) < CAST(@latestDate AS DATE)
+        ORDER BY uploaded_at DESC
+      `);
 
-    const today =
-      todayRes.recordset.length
-      ? todayRes.recordset[0].record_count
+    const previous = prevRes.recordset.length
+      ? prevRes.recordset[0].record_count
       : 0;
 
 
-    // 🔹 Difference Calculation
+    // ============================================================
+    // 🔹 STEP 3 — Calculate difference
+    // ============================================================
+    const archived = today < previous ? previous - today : 0;
+    const uploaded = today > previous ? today - previous : 0;
+
+
+    // ============================================================
+    // 🔹 RESPONSE
+    // ============================================================
     res.json({
-      archived: today < yesterday ? yesterday - today : 0,
-      uploaded: today > yesterday ? today - yesterday : 0,
+      archived,
+      uploaded,
       history_total: today
     });
 
-  }
-
-  catch (err) {
+  } catch (err) {
 
     console.error("SMA STATUS ERROR:", err);
 
@@ -8285,9 +9318,9 @@ app.get("/api/sma/branches/:cluster", async (req, res) => {
       .input("cluster", sql.VarChar, cluster)
       .query(`
         SELECT DISTINCT [Branch Name] as branch
-        FROM SMA_Report
-        WHERE [Cluster Code] = @cluster
-        ORDER BY [Branch Name]
+FROM SMA_Report
+WHERE (@cluster = '' OR [Cluster Code] = @cluster)
+ORDER BY [Branch Name]
       `);
 
     res.json(result.recordset);
@@ -8607,11 +9640,6 @@ app.post("/api/field-visit-summary", async (req, res) => {
   try {
 
     const { user, cluster, branch, fromDate, toDate } = req.body;
-	{
-  return res.status(403).json({
-    message: "Access Denied. Please Contact Admin."
-  });
-}
 
     const pool = await sql.connect(dbConfig);
 	
@@ -8634,18 +9662,7 @@ if (!roleResult.recordset.length) {
   return res.status(403).json({ message: "User not found" });
 }
 
-const userRole = roleResult.recordset[0].Role;
-
-// 🔒 Admin Only Page
-if (
-  userRole === "Branch Manager" ||
-  userRole.startsWith("Regional Manager")
-) {
-  return res.status(403).json({
-    message: "Access Denied. Please Contact Admin."
-  });
-}
-	
+const userRole = roleResult.recordset[0].Role;	
     const request = pool.request();
 
     let query = `
@@ -8664,6 +9681,34 @@ WHERE 1=1
 `;
 
     // ================= FILTERS =================
+	
+	if (userRole === "Branch Manager") {
+
+  const branchResult = await pool.request()
+    .input("userId", sql.VarChar(50), userId)
+    .query(`
+      SELECT BranchName
+      FROM UsersInfo
+      WHERE UserId = @userId
+    `);
+
+  const userBranch = branchResult.recordset[0].BranchName;
+
+  query += " AND U.BranchName = @userBranch";
+  request.input("userBranch", sql.VarChar, userBranch);
+
+}
+
+if (userRole.startsWith("Regional Manager")) {
+
+  const match = userRole.match(/\((.*?)\)/);
+  const rmCluster = match ? match[1] : "";
+
+  query += " AND U.ClusterName = @rmCluster";
+  request.input("rmCluster", sql.VarChar, rmCluster);
+
+}
+	
 
     if (user) {
       query += " AND F.UserID = @UserID";
@@ -9819,36 +10864,56 @@ if (isRegionalManager) {
 
     // ================= FETCH LOGS =================
 
-    const logsResult = await pool.request().query(`
-      SELECT SessionId, ActionLabel
-      FROM Activity_Logs
-      ORDER BY CreatedAt
-    `);
+    const sessionIds = sessions.map(s => s.SessionId);
 
-    const logs = logsResult.recordset;
+const requestLogs = pool.request();
+
+sessionIds.forEach((id, index) => {
+  requestLogs.input(`sid${index}`, sql.VarChar, id);
+});
+
+const logsResult = await requestLogs.query(`
+  SELECT 
+    L.SessionId,
+    L.LogId,
+    L.ActionLabel,
+    N.NoteText
+  FROM Activity_Logs L
+  LEFT JOIN Activity_Notes N
+    ON L.LogId = N.LogId
+  WHERE L.SessionId IN (${sessionIds.map((_, i) => `@sid${i}`).join(",")})
+  ORDER BY L.CreatedAt
+`);
+
+const logs = logsResult.recordset;
 
     // ================= GROUP LOGS =================
 
     const response = sessions.map(session => {
 
-      const sessionLogs = logs.filter(
-        l => l.SessionId === session.SessionId
-      );
+  const sessionLogs = logs.filter(
+    l => l.SessionId === session.SessionId
+  );
 
-      const actions = sessionLogs
-        .map((l, index) => `${index + 1}. ${l.ActionLabel}`)
-        .join("\n");
+  const actions = sessionLogs
+    .map((l, index) => `${index + 1}. ${l.ActionLabel}`)
+    .join("\n");
 
-      return {
-        activityDate: session.activityDate,
-        activityTime: session.activityTime,
-        userName: session.userName,
-        activityType: session.SessionType,
-        activityStatus: actions || "",
-        notes: ""
-      };
+  let notes = sessionLogs
+  .map(log => log.NoteText || "")
+  .filter(n => n.trim() !== "")
+  .join("\n");
 
-    });
+  return {
+    activityDate: session.activityDate,
+    activityTime: session.activityTime,
+    userName: session.userName,
+    activityType: session.SessionType,
+    activityStatus: actions || "",
+    notes
+  };
+
+});
 
     res.json(response);
 
@@ -10338,30 +11403,166 @@ AND ISNULL(CRS.Submitted,0) = 0
       return res.json(result.recordset);
     }
 
-    // ======================================================
-    // 3️⃣ COMPLETED ACTIVITIES
-    // ======================================================
-    if (actionType === "completed") {
+ // ======================================================
+// 3️⃣ COMPLETED ACTIVITIES (FINAL FIXED)
+// ======================================================
+if (actionType === "completed") {
 
-      const query = `
-        SELECT DISTINCT
-          R.firstname AS memberName,
-          R.loanAccountNumber,
-          R.mobileNumber,
-          R.branchName,
-          A.AssignedToUserName AS assignedTo
-        ${baseQuery}
-        AND (
-              ISNULL(CRS.CompleteFlag,0) = 1
-              OR
-              ISNULL(CRS.Submitted,0) = 1
-            )
-      `;
+  let query = `
+    SELECT DISTINCT
+      COALESCE(R.firstname, RH.firstname, 'Data Not Available') AS memberName,
+      A.LoanAccountNumber AS loanAccountNumber,
+      COALESCE(R.mobileNumber, RH.mobileNumber, 'Data Not Available') AS mobileNumber,
+      COALESCE(R.branchName, RH.branchName, 'Data Not Available') AS branchName,
+      A.AssignedToUserName AS assignedTo
 
-      const result = await request.query(query);
-      return res.json(result.recordset);
-    }
+    FROM Account_Assignments A
 
+    LEFT JOIN Recovery_Raw_Data R
+      ON R.loanAccountNumber = A.LoanAccountNumber
+
+    LEFT JOIN (
+      SELECT *,
+             ROW_NUMBER() OVER (
+               PARTITION BY loanAccountNumber
+               ORDER BY uploadtimestamp DESC
+             ) AS rn
+      FROM Recovery_Raw_Data_history
+    ) RH
+      ON RH.loanAccountNumber = A.LoanAccountNumber
+     AND RH.rn = 1
+
+    INNER JOIN CallRecovery_Status CRS
+      ON CRS.LoanAccountNumber = A.LoanAccountNumber
+
+    WHERE A.AssignmentStatus = 'Assigned'
+  `;
+
+  // ================= ROLE RESTRICTIONS =================
+
+  // 🔒 Branch Manager
+  if (userInfo.Role === "Branch Manager") {
+    query += ` AND COALESCE(R.branchName, RH.branchName) = @userBranch`;
+  }
+
+  // 🔒 Regional Manager
+  if (userInfo.Role?.startsWith("Regional Manager")) {
+    query += `
+      AND COALESCE(R.branchName, RH.branchName) IN (
+        SELECT branch_name
+        FROM Branch_Cluster_Master
+        WHERE cluster_name = @clusterRestriction
+      )
+    `;
+  }
+
+  // ================= FILTERS =================
+
+  if (mobileNumber) {
+    query += ` AND COALESCE(R.mobileNumber, RH.mobileNumber) = @mobileNumber`;
+  }
+
+  if (pincode) {
+    query += ` AND R.pincode = @pincode`;
+  }
+
+  if (branchName) {
+    query += ` AND COALESCE(R.branchName, RH.branchName) = @branchName`;
+  }
+
+  if (product) {
+    query += ` AND R.product = @product`;
+  }
+
+  if (loanAccount) {
+    query += ` AND A.LoanAccountNumber = @loanAccount`;
+  }
+
+  if (memberName) {
+    query += ` AND COALESCE(R.firstname, RH.firstname) LIKE '%' + @memberName + '%'`;
+  }
+
+  if (assignedTo) {
+    query += ` AND A.AssignedToUserId = @assignedTo`;
+  }
+
+  if (cluster && cluster !== "Corporate Office") {
+    query += `
+      AND COALESCE(R.branchName, RH.branchName) IN (
+        SELECT branch_name
+        FROM Branch_Cluster_Master
+        WHERE cluster_name = @cluster
+      )
+    `;
+  }
+
+  // ================= QUEUE FILTER =================
+
+  if (queue === "NPA") {
+    query += ` AND R.dpdQueue >= '04'`;
+  } 
+  else if (queue === "Marketing") {
+    query += ` AND R.QueueType = 'Marketing'`;
+  } 
+  else if (queue === "Welcome Call") {
+    query += ` AND R.QueueType = 'Welcome Call'`;
+  }
+
+  // ================= DPD FILTER =================
+
+  if (dpdQueue === "0-30") {
+    query += ` AND R.dpdQueue = '01'`;
+  } 
+  else if (dpdQueue === "31-60") {
+    query += ` AND R.dpdQueue = '02'`;
+  } 
+  else if (dpdQueue === "61-90") {
+    query += ` AND R.dpdQueue = '03'`;
+  } 
+  else if (dpdQueue === "90+") {
+    query += ` AND R.dpdQueue >= '04'`;
+  }
+
+  // ================= COMPLETED CONDITION =================
+
+  query += `
+    AND (
+      ISNULL(CRS.CompleteFlag,0) = 1
+      OR ISNULL(CRS.Submitted,0) = 1
+    )
+  `;
+
+  // ================= FINAL EXECUTION =================
+
+  const completedRequest = pool.request();
+
+  // 🔁 ADD INPUTS ONLY ONCE
+  if (mobileNumber) completedRequest.input("mobileNumber", mobileNumber);
+  if (pincode) completedRequest.input("pincode", pincode);
+  if (branchName) completedRequest.input("branchName", branchName);
+  if (product) completedRequest.input("product", product);
+  if (loanAccount) completedRequest.input("loanAccount", loanAccount);
+  if (memberName) completedRequest.input("memberName", memberName);
+  if (assignedTo) completedRequest.input("assignedTo", assignedTo);
+
+  if (cluster && cluster !== "Corporate Office") {
+    completedRequest.input("cluster", cluster);
+  }
+
+  if (userInfo.Role === "Branch Manager") {
+    completedRequest.input("userBranch", userInfo.BranchName);
+  }
+
+  if (userInfo.Role?.startsWith("Regional Manager")) {
+    completedRequest.input("clusterRestriction", userInfo.ClusterName);
+  }
+
+  const result = await completedRequest.query(query);
+
+  return res.json(result.recordset);
+}
+ 
+ 
 // ======================================================
 // 4️⃣ RE-ACTIVATE (Update Only - No Delete)
 // ======================================================
@@ -11054,7 +12255,8 @@ app.put("/api/product-master/:code", async (req, res) => {
     } = req.body;
 
     await pool.request()
-      .input("ProductCode", productCode)
+      .input("ProductCode", productCode) // old code
+.input("NewProductCode", req.body.productCode)
       .input("ProductCategory", productCategory)
       .input("ProductType", productType || "")
       .input("ProductName", productName)
@@ -11066,18 +12268,19 @@ app.put("/api/product-master/:code", async (req, res) => {
       .input("ValidTo", validTo || null)
       .query(`
         UPDATE smart_call.dbo.ProductMaster
-        SET
-          ProductCategory = @ProductCategory,
-          ProductType = @ProductType,
-          ProductName = @ProductName,
-          MaxTenure = @MaxTenure,
-          MinTenure = @MinTenure,
-          MaxLimit = @MaxLimit,
-          MinLimit = @MinLimit,
-          ValidFrom = @ValidFrom,
-          ValidTo = @ValidTo,
-          Timestamp = GETDATE()
-        WHERE ProductCode = @ProductCode
+SET
+  ProductCategory = @ProductCategory,
+  ProductType = @ProductType,
+  ProductCode = @NewProductCode,
+  ProductName = @ProductName,
+  MaxTenure = @MaxTenure,
+  MinTenure = @MinTenure,
+  MaxLimit = @MaxLimit,
+  MinLimit = @MinLimit,
+  ValidFrom = @ValidFrom,
+  ValidTo = @ValidTo,
+  Timestamp = GETDATE()
+WHERE ProductCode = @ProductCode
       `);
 
     res.json({ message: "Product updated successfully" });

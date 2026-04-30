@@ -1,3 +1,5 @@
+require("dotenv").config();
+
 process.on("uncaughtException", err => {
   console.error("UNCAUGHT EXCEPTION:", err);
 });
@@ -7,14 +9,85 @@ process.on("unhandledRejection", err => {
 });
 
 const express = require("express");
+
+// ✅ Backend Logger (same style)
+const logInfo = (msg, data) =>
+  console.log(`📡 ${msg}`, data || "");
+
+const logSuccess = (msg, data) =>
+  console.log(`✅ ${msg}`, data || "");
+
+const logError = (msg, data) =>
+  console.error(`❌ ${msg}`, data || "");
+
+const logWarn = (msg, data) =>
+  console.warn(`⚠️ ${msg}`, data || "");
+
 const sql = require("mssql");
 const cors = require("cors");
 
 const app = express();
 const PORT = 5001;
-const axios = require("axios");
+const fs = require("fs");
+const https = require("https");
 
-const GOOGLE_API_KEY = "AIzaSyBU8cG2UuNw7i-6m7azb1cUIiNgX0DJ4KA";
+const httpsOptions = {
+  key: fs.readFileSync(process.env.SSL_KEY),
+  cert: fs.readFileSync(process.env.SSL_CERT),
+  ca: fs.readFileSync(process.env.SSL_CA)
+};
+const axios = require("axios");
+const getAddressFromCoords = async (lat, lng) => {
+  try {
+    const res = await axios.get(
+      "https://maps.googleapis.com/maps/api/geocode/json",
+      {
+        params: {
+          latlng: `${lat},${lng}`,
+          key: process.env.GOOGLE_API_KEY, // same key you already use
+        },
+      }
+    );
+
+
+    if (res.data.results.length > 0) {
+      return res.data.results[0].formatted_address;
+    }
+
+    return `${lat}, ${lng}`;
+  } catch (err) {
+    console.log("Reverse geocode error:", err.message);
+    return `${lat}, ${lng}`;
+  }
+};
+
+const writeDailyLog = require("./logger");
+
+function formatMessage(args) {
+  return args.map(a =>
+    typeof a === "object" ? JSON.stringify(a) : a
+  ).join(" ");
+}
+
+const originalLog = console.log;
+const originalWarn = console.warn;
+const originalError = console.error;
+
+console.log = (...args) => {
+  writeDailyLog("backend", formatMessage(args));
+  originalLog(...args);
+};
+
+console.warn = (...args) => {
+  writeDailyLog("backend", formatMessage(args));
+  originalWarn(...args);
+};
+
+console.error = (...args) => {
+  writeDailyLog("backend", formatMessage(args));
+  originalError(...args);
+};
+
 
 async function getRoadDistanceKm(startLat, startLng, stopLat, stopLng) {
   try {
@@ -24,7 +97,7 @@ async function getRoadDistanceKm(startLat, startLng, stopLat, stopLng) {
         params: {
           origin: `${startLat},${startLng}`,
           destination: `${stopLat},${stopLng}`,
-key: GOOGLE_API_KEY,        
+key: process.env.GOOGLE_API_KEY,      
 },
       }
     );
@@ -95,7 +168,10 @@ app.get("/health", (req, res) => {
 // ✅ REGISTER
 // =======================================================
 app.post("/register", async (req, res) => {
-	console.log("📥 [REGISTER_API] Request received for user:", req.body?.userId);
+console.log("📥 [REGISTER_API] request", {
+  userId: req.body?.userId,
+  deviceId: req.body?.deviceId
+});
   const { userId, password, mpin, securityQ, securityA, deviceId } = req.body;
 
   try {
@@ -106,13 +182,13 @@ app.post("/register", async (req, res) => {
     }
 
     const passwordRegex =
-      /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{6,8}$/;
+      /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{6,20}$/;
 
     if (!passwordRegex.test(password)) {
 		console.log("⚠️ [REGISTER_API] Password format invalid", { userId });
       return res.status(400).json({
         message:
-          "Password must be 6–8 characters with uppercase, lowercase, number and special character",
+          "Password must be 6–20 characters with uppercase, lowercase, number and special character",
       });
     }
 
@@ -134,7 +210,11 @@ console.log("🔍 [REGISTER_API] Checking authorized user", { userId });
         FROM UsersInfo
         WHERE UserId = @UserId
       `);
-
+console.log("📦 [REGISTER_API] authorized user fetched", {
+  userId,
+  count: userCheck.recordset?.length || 0,
+  data: userCheck.recordset
+});
 if (userCheck.recordset.length === 0) {
   console.log("❌ [REGISTER_API] User not authorized", { userId });
   return res.status(403).json({
@@ -150,7 +230,11 @@ if (userCheck.recordset.length === 0) {
         FROM UserAuth
         WHERE UserId = @UserId
       `);
-
+console.log("📦 [REGISTER_API] existing auth check", {
+  userId,
+  count: authCheck.recordset?.length || 0,
+  data: authCheck.recordset
+});
     if (authCheck.recordset.length > 0) {
       return res.status(409).json({
         message: "User already registered. Please login.",
@@ -183,7 +267,17 @@ console.log("💾 [REGISTER_API] Creating auth record", { userId });
           @DeviceId
         )
       `);
-console.log("✅ [REGISTER_API] Registration success", { userId });
+console.log("📦 [REGISTER_API] auth record inserted", {
+  userId,
+  deviceId
+});
+
+console.log("✅ [REGISTER_API] Registration success", {
+  userId
+});
+console.log("📤 [REGISTER_API] response sent", {
+  userId
+});
 return res.status(200).json({ message: "Registration successful" });
   } catch (err) {
     console.error("❌ [REGISTER_API] Error:", {
@@ -194,14 +288,14 @@ return res.status(200).json({ message: "Registration successful" });
     return res.status(500).json({ message: "Internal server error" });
   }
 });
-// =======================================================
-// ✅ LOGIN (UserId + MPIN + DEVICE) ✅ FINAL BEST VERSION
-// =======================================================
+
 // =======================================================
 // ✅ LOGIN (UserId + MPIN + DEVICE)
 // =======================================================
 app.post("/login", async (req, res) => {
-  console.log("📥 [LOGIN_API] Request received");
+console.log("📥 [LOGIN_API] Request received", {
+  deviceId: req.body?.deviceId
+});
 
   const { mpin, deviceId } = req.body;
 
@@ -236,6 +330,10 @@ app.post("/login", async (req, res) => {
     }
 
     const dbUser = mpinUser.recordset[0];
+	console.log("📦 [LOGIN_API] MPIN user fetched", {
+  userId: dbUser.UserId,
+  deviceId: dbUser.DeviceId
+});
 
     // ⚠️ Device mismatch → rebind
     if (String(dbUser.DeviceId).trim() !== cleanDeviceId) {
@@ -255,6 +353,7 @@ app.post("/login", async (req, res) => {
 
     // 👤 Fetch profile
     const result = await pool.request()
+
       .input("UserId", sql.VarChar(50), dbUser.UserId)
       .query(`
         SELECT TOP 1
@@ -268,7 +367,10 @@ app.post("/login", async (req, res) => {
         INNER JOIN UsersInfo UI ON UI.UserId = UA.UserId
         WHERE UA.UserId = @UserId
       `);
-
+console.log("📦 [LOGIN_API] user profile fetched", {
+  userId: dbUser.UserId,
+  user: result.recordset[0]
+});
     console.log("🕒 [LOGIN_API] Updating last login time");
 
     // 🕒 update last login
@@ -279,9 +381,14 @@ app.post("/login", async (req, res) => {
         SET LastLoginAt = GETDATE()
         WHERE UserId = @UserId
       `);
+console.log("✅ [LOGIN_API] Login success", {
+  userId: result.recordset[0]?.UserId,
+  userName: result.recordset[0]?.UserName
+});
 
-    console.log("📤 [LOGIN_API] Sending login response");
-    console.log("✅ [LOGIN_API] Login success");
+console.log("📤 [LOGIN_API] response sent", {
+  user: result.recordset[0]
+});
 
     return res.status(200).json({
       message: "Login successful",
@@ -301,30 +408,53 @@ app.post("/login", async (req, res) => {
 //                                DPD LIST (DATABASE CONNECTED)
 //============================================================================================
 app.post("/api/dpd-list", async (req, res) => {
-  const { dpdQueue, userId } = req.body;
+
+  const { dpdQueue, userId, userName } = req.body;
+
+  console.log("📥 /api/dpd-list request", {
+    userId,
+    userName,
+    dpdQueue
+  });
+
+console.log("⚠️ Validation check", {
+  userId,
+  userName,
+  dpdQueue
+});
 
   if (!dpdQueue || !userId) {
+    console.log("❌ Missing dpdQueue or userId");
     return res.status(400).json({
       message: "dpdQueue and userId are required",
     });
   }
 
-  const dpdList = dpdQueue.split(",").map((d) => d.trim());
+  let dpdList = [];
+
+if (dpdQueue === "ALL") {
+  dpdList = []; // means no filter
+} else {
+  dpdList = dpdQueue.split(",").map((d) => d.trim());
+}
+  console.log("📊 Parsed DPD list", dpdList);
 
   try {
+
     const pool = await poolPromise;
     const request = pool.request();
 
     request.input("userId", sql.VarChar(50), String(userId));
 
     dpdList.forEach((dpd, index) => {
-      request.input(`dpd${index}`, sql.VarChar(2), dpd);
+      request.input(`dpd${index}`, sql.VarChar(10), String(dpd));
     });
 
     const placeholders = dpdList
       .map((_, index) => `@dpd${index}`)
       .join(",");
 
+    console.log("📊 Executing DPD query");
     const query = `
       SELECT TOP 10000
         R.firstname,
@@ -385,20 +515,31 @@ app.post("/api/dpd-list", async (req, res) => {
       WHERE
         A.AssignedToUserId = @userId
         AND A.AssignmentStatus = 'Assigned'
-        AND RIGHT('00' + R.dpdQueue, 2) IN (${placeholders})
+       ${dpdList.length > 0 ? `AND RIGHT('00' + R.dpdQueue, 2) IN (${placeholders})` : ""}
 
       ORDER BY TRY_CAST(R.currentOutstandingBalance AS DECIMAL(18,2)) DESC
     `;
-
-    const result = await request.query(query);
-
+ const result = await request.query(query);
+console.log("📦 DPD fetched data", {
+  userId,
+  userName,
+  records: result.recordset
+});
+console.log("✅ DPD list success", {
+  userId,
+  userName,
+  count: result.recordset.length
+});
+console.log("📤 /api/dpd-list response sent", result.recordset.length);
     return res.json({ records: result.recordset });
 
   } catch (error) {
+console.log("❌ /api/dpd-list error", error);
     console.error("❌ DPD LIST ERROR:", error);
     return res.status(500).json({ message: "Internal server error" });
   }
 });
+
 //============================================================================================
 //                                ACCOUNT DETAILS
 //============================================================================================
@@ -468,22 +609,52 @@ app.post("/api/account-details", async (req, res) => {
 // SAVE ALTERNATE NUMBER (WITH HISTORY)
 // =======================================================
 app.post("/api/account/save-alternate", async (req, res) => {
+
+console.log("📥 [SAVE_ALTERNATE_API] request", {
+  userId: req.body?.userId,
+  userName: req.body?.addedBy,
+  loanAccountNumber: req.body?.loanAccountNumber,
+  alternateNumber: req.body?.alternateNumber,
+  payload: req.body
+});
+
   const { loanAccountNumber, alternateNumber, addedBy } = req.body;
 
+console.log("⚠️ [SAVE_ALTERNATE_API] validation", {
+  loanAccountNumber,
+  alternateNumber,
+  addedBy
+});
+
   if (!loanAccountNumber || !alternateNumber) {
+console.log("❌ Missing required fields");
     return res.status(400).json({
       message: "Loan account and alternate number required"
     });
   }
 
   if (!/^\d{10}$/.test(String(alternateNumber))) {
+console.log("❌ Invalid alternate number format", alternateNumber);
     return res.status(400).json({
       message: "Alternate number must be 10 digits"
     });
   }
 
   try {
+const { userId } = req.body;
+
+console.log("📊 [SAVE_ALTERNATE_API] processing", {
+  userId,
+  userName: addedBy,
+  loanAccountNumber,
+  alternateNumber
+});
     const pool = await poolPromise;
+
+console.log("📊 [SAVE_ALTERNATE_API] executing insert", {
+  loanAccountNumber,
+  alternateNumber
+});
 
     await pool.request()
       .input("LoanAccountNumber", sql.VarChar(50), loanAccountNumber)
@@ -504,21 +675,74 @@ app.post("/api/account/save-alternate", async (req, res) => {
         (@LoanAccountNumber, @AlternateNumber, @AddedBy, GETDATE());
 
       `);
+console.log("📦 [SAVE_ALTERNATE_API] inserted", {
+  userId,
+  userName: addedBy,
+  loanAccountNumber,
+  alternateNumber
+});
+console.log("✅ [SAVE_ALTERNATE_API] success", {
+  loanAccountNumber,
+  alternateNumber
+});
+
+console.log("📤 [SAVE_ALTERNATE_API] response sent", {
+  loanAccountNumber,
+  alternateNumber
+});
 
     res.json({ success: true });
 
   } catch (err) {
-    console.error("SAVE ALT ERROR:", err);
+
+console.log("❌ [SAVE_ALTERNATE_API] error", {
+  message: err.message,
+  stack: err.stack,
+  loanAccountNumber,
+  alternateNumber,
+  addedBy
+});
+
     res.status(500).json({ message: "Server error" });
   }
 });
 
+
 //================================== DELETE ALTERNATE NUMBER ==================================
 app.post("/api/account/delete-alternate", async (req, res) => {
+
+console.log("📥 [DELETE_ALTERNATE_API] request", {
+  userId: req.body?.userId,
+  userName: req.body?.deletedBy,
+  loanAccountNumber: req.body?.loanAccountNumber,
+  alternateNumber: req.body?.alternateNumber,
+  payload: req.body
+});
+
   const { loanAccountNumber, alternateNumber, deletedBy } = req.body;
 
+console.log("⚠️ [DELETE_ALTERNATE_API] validation", {
+  loanAccountNumber,
+  alternateNumber,
+  deletedBy
+});
+
   try {
+
+const { userId } = req.body;
+
+console.log("📊 [DELETE_ALTERNATE_API] processing", {
+  userId,
+  userName: deletedBy,
+  loanAccountNumber,
+  alternateNumber
+});
     const pool = await poolPromise;
+
+console.log("📊 [DELETE_ALTERNATE_API] executing delete", {
+  loanAccountNumber,
+  alternateNumber
+});
 
     await pool.request()
       .input("LoanAccountNumber", sql.VarChar(50), loanAccountNumber)
@@ -538,19 +762,54 @@ app.post("/api/account/delete-alternate", async (req, res) => {
         AND AlternateNumber = @AlternateNumber;
 
       `);
+console.log("📦 [DELETE_ALTERNATE_API] deleted", {
+  userId,
+  userName: deletedBy,
+  loanAccountNumber,
+  alternateNumber
+});
+console.log("✅ [DELETE_ALTERNATE_API] success", {
+  loanAccountNumber,
+  alternateNumber
+});
+
+console.log("📤 [DELETE_ALTERNATE_API] response sent", {
+  loanAccountNumber,
+  alternateNumber
+});
 
     res.json({ success: true });
 
   } catch (err) {
-    console.error("DELETE ALT ERROR:", err);
+
+console.log("❌ [DELETE_ALTERNATE_API] error", {
+  message: err.message,
+  stack: err.stack,
+  loanAccountNumber,
+  alternateNumber,
+  deletedBy
+});
+
     res.status(500).json({ message: "Server error" });
   }
 });
+
 //================================== MANUAL ADDRESS ==================================
 app.post("/api/account/save-manual-address", async (req, res) => {
+console.log("📥 [SAVE_ADDRESS_API] request", {
+  userId: req.body?.userId,
+  userName: req.body?.userName,
+  loanAccountNumber: req.body?.loanAccountNumber,
+  address: req.body?.address
+});
   try {
-    const { loanAccountNumber, address, userId } = req.body;
-
+    const { loanAccountNumber, address, userId, userName } = req.body;
+console.log("📊 [SAVE_ADDRESS_API] saving", {
+  userId,
+  userName,
+  loanAccountNumber,
+  address
+});
     if (!loanAccountNumber || !address) {
       return res.status(400).json({ message: "Missing fields" });
     }
@@ -592,7 +851,12 @@ app.post("/api/account/save-manual-address", async (req, res) => {
         (@LoanAccountNumber, @Address, 'INSERT', @UserId, GETDATE());
 
       `);
-
+console.log("📦 [SAVE_ADDRESS_API] saved", {
+  userId,
+  userName,
+  loanAccountNumber,
+  address
+});
     res.json({ success: true });
 
   } catch (err) {
@@ -603,136 +867,126 @@ app.post("/api/account/save-manual-address", async (req, res) => {
 // =====================================================================
 // HOME → MEMBERS SUMMARY (ASSIGNMENT BASED)
 // =====================================================================
+
 app.post("/api/home/members-summary", async (req, res) => {
-  const { userId } = req.body;
 
-  if (!userId) {
-    return res.status(400).json({ message: "userId is required" });
-  }
-
-  try {
-    const pool = await poolPromise;
-
-    const result = await pool.request()
-      .input("userId", sql.VarChar(50), userId)
-      .query(`
-        SELECT
-          SUM(CASE 
-                WHEN R.dpdQueue IN ('01','02','03','04','05','06','07')
-                THEN 1 ELSE 0
-              END) AS npa,
-
-          SUM(CASE
-                WHEN R.dpdQueue = '00'
-                THEN 1 ELSE 0
-              END) AS marketing,
-
-          SUM(CASE
-                WHEN R.dpdQueue IS NULL
-                THEN 1 ELSE 0
-              END) AS welcome
-
-        FROM Account_Assignments A
-        INNER JOIN Recovery_Raw_Data R
-          ON A.LoanAccountNumber = R.loanAccountNumber
-        WHERE
-          A.AssignedToUserId = @userId
-          AND A.AssignmentStatus = 'Assigned'
-      `);
-
-    const row = result.recordset[0] || {};
-
-    const npa = row.npa || 0;
-    const marketing = row.marketing || 0;
-    const welcome = row.welcome || 0;
-
-    const totalPending = npa + marketing + welcome;
-
-    return res.json({
-      members: {
-        pending: totalPending,
-        inProcess: 0,
-        completed: 0,
-      },
-      npa: {
-        pending: npa,
-        inProcess: 0,
-        completed: 0,
-      },
-      marketing: {
-        pending: marketing,
-        inProcess: 0,
-        completed: 0,
-      },
-      welcome: {
-        pending: welcome,
-        inProcess: 0,
-        completed: 0,
-      }
-    });
-
-  } catch (err) {
-    console.error("❌ MEMBERS SUMMARY ERROR:", err);
-    return res.status(500).json({ message: "Failed to load members summary" });
-  }
+console.log("📥 [HOME_API] members-summary request", {
+  userId: req.body?.userId
 });
-// =====================================================================
-// NPA → DPD SUMMARY (ASSIGNED USER BASED)
-// =====================================================================
-app.post("/api/npa/dpd-summary", async (req, res) => {
-  const { userId } = req.body;
 
-  if (!userId) {
-    return res.status(400).json({ message: "userId is required" });
-  }
+const { userId } = req.body;
 
-  try {
-    const pool = await poolPromise;
+if (!userId) {
+  console.log("⚠️ [HOME_API] userId missing");
+  return res.status(400).json({ message: "userId is required" });
+}
 
-    const result = await pool.request()
-      .input("userId", sql.VarChar(50), userId)
-      .query(`
-        SELECT
-          SUM(CASE WHEN R.dpdQueue = '01' THEN 1 ELSE 0 END) AS d0_30,
-          SUM(CASE WHEN R.dpdQueue = '02' THEN 1 ELSE 0 END) AS d31_60,
-          SUM(CASE WHEN R.dpdQueue = '03' THEN 1 ELSE 0 END) AS d61_90,
-          SUM(CASE WHEN R.dpdQueue IN ('04','05','06','07') THEN 1 ELSE 0 END) AS d90_plus
-        FROM Account_Assignments A
-        INNER JOIN Recovery_Raw_Data R
-          ON A.LoanAccountNumber = R.loanAccountNumber
-        WHERE
-          A.AssignedToUserId = @userId
-          AND A.AssignmentStatus = 'Assigned'
-      `);
+try {
+  const pool = await poolPromise;
 
-    const row = result.recordset[0] || {};
+  console.log("📊 [HOME_API] fetching members summary", { userId });
 
-    return res.json({
-      "0_30": row.d0_30 || 0,
-      "31_60": row.d31_60 || 0,
-      "61_90": row.d61_90 || 0,
-      "90_plus": row.d90_plus || 0,
-    });
+  const result = await pool.request()
+    .input("userId", sql.VarChar(50), userId)
+    .query(`
+      SELECT
+        SUM(CASE 
+              WHEN R.dpdQueue IN ('01','02','03','04','05','06','07')
+              THEN 1 ELSE 0
+            END) AS npa,
 
-  } catch (err) {
-    console.error("❌ DPD SUMMARY ERROR:", err);
-    res.status(500).json({ message: "Failed to load DPD summary" });
-  }
+        SUM(CASE
+              WHEN R.dpdQueue = '00'
+              THEN 1 ELSE 0
+            END) AS marketing,
+
+        SUM(CASE
+              WHEN R.dpdQueue IS NULL
+              THEN 1 ELSE 0
+            END) AS welcome
+
+      FROM Account_Assignments A
+      INNER JOIN Recovery_Raw_Data R
+        ON A.LoanAccountNumber = R.loanAccountNumber
+      WHERE
+        A.AssignedToUserId = @userId
+        AND A.AssignmentStatus = 'Assigned'
+    `);
+
+  const row = result.recordset[0] || {};
+
+  const npa = row.npa || 0;
+  const marketing = row.marketing || 0;
+  const welcome = row.welcome || 0;
+
+  const totalPending = npa + marketing + welcome;
+
+  const response = {
+    members: {
+      pending: totalPending,
+      inProcess: 0,
+      completed: 0,
+    },
+    npa: {
+      pending: npa,
+      inProcess: 0,
+      completed: 0,
+    },
+    marketing: {
+      pending: marketing,
+      inProcess: 0,
+      completed: 0,
+    },
+    welcome: {
+      pending: welcome,
+      inProcess: 0,
+      completed: 0,
+    }
+  };
+
+  console.log("📦 [HOME_API] members-summary fetched", {
+    userId,
+    response
+  });
+
+  console.log("📤 [HOME_API] response sent", { userId });
+
+  return res.json(response);
+
+} catch (err) {
+  console.error("❌ MEMBERS SUMMARY ERROR:", {
+    message: err.message,
+    stack: err.stack,
+    userId
+  });
+
+  return res.status(500).json({ message: "Failed to load members summary" });
+}
 });
+
 // =====================================================================
 // NPA → DPD SUMMARY V2 (Pending / InProcess / Completed from CallRecovery_Status)
 // =====================================================================
 app.post("/api/npa/dpd-summary-v2", async (req, res) => {
-  const { userId } = req.body;
+console.log("📥 [NPA_API] dpd-summary request", {
+  userId: req.body?.userId,
+  userName: req.body?.userName,
+  payload: req.body
+});
+  const { userId, userName } = req.body;
 
-  if (!userId) {
-    return res.status(400).json({ message: "userId is required" });
-  }
-
+if (!userId) {
+  console.log("⚠️ [NPA_API] userId missing");
+  return res.status(400).json({ message: "userId is required" });
+}
   try {
     const pool = await poolPromise;
-
+console.log("📊 [NPA_API] Fetching DPD summary", {
+  userId,
+  userName
+});
     const result = await pool.request()
+	
       .input("UserId", sql.VarChar(50), String(userId))
       .query(`
         ;WITH NPA_Assigned AS (
@@ -761,9 +1015,10 @@ app.post("/api/npa/dpd-summary-v2", async (req, res) => {
                     AND ISNULL(CRS.CompleteFlag,0)=0
               THEN 1 ELSE 0 END) AS inprocess_0_30,
 
-          SUM(CASE WHEN NA.dpdQueue='01'
-                    AND ISNULL(CRS.CompleteFlag,0)=1
-              THEN 1 ELSE 0 END) AS completed_0_30,
+         SUM(CASE WHEN NA.dpdQueue='01'
+          AND ISNULL(CRS.CompleteFlag,0)=1
+          AND CAST(CRS.UpdatedAt AS DATE) = CAST(GETDATE() AS DATE)
+    THEN 1 ELSE 0 END) AS completed_0_30,
 
           -- ===========================
           -- 31_60 (02)
@@ -778,9 +1033,10 @@ app.post("/api/npa/dpd-summary-v2", async (req, res) => {
                     AND ISNULL(CRS.CompleteFlag,0)=0
               THEN 1 ELSE 0 END) AS inprocess_31_60,
 
-          SUM(CASE WHEN NA.dpdQueue='02'
-                    AND ISNULL(CRS.CompleteFlag,0)=1
-              THEN 1 ELSE 0 END) AS completed_31_60,
+         SUM(CASE WHEN NA.dpdQueue='02'
+          AND ISNULL(CRS.CompleteFlag,0)=1
+          AND CAST(CRS.UpdatedAt AS DATE) = CAST(GETDATE() AS DATE)
+    THEN 1 ELSE 0 END) AS completed_31_60,
 
           -- ===========================
           -- 61_90 (03)
@@ -795,9 +1051,10 @@ app.post("/api/npa/dpd-summary-v2", async (req, res) => {
                     AND ISNULL(CRS.CompleteFlag,0)=0
               THEN 1 ELSE 0 END) AS inprocess_61_90,
 
-          SUM(CASE WHEN NA.dpdQueue='03'
-                    AND ISNULL(CRS.CompleteFlag,0)=1
-              THEN 1 ELSE 0 END) AS completed_61_90,
+        SUM(CASE WHEN NA.dpdQueue='03'
+          AND ISNULL(CRS.CompleteFlag,0)=1
+          AND CAST(CRS.UpdatedAt AS DATE) = CAST(GETDATE() AS DATE)
+    THEN 1 ELSE 0 END) AS completed_61_90,
 
           -- ===========================
           -- 90_plus (04-07)
@@ -813,8 +1070,9 @@ app.post("/api/npa/dpd-summary-v2", async (req, res) => {
               THEN 1 ELSE 0 END) AS inprocess_90_plus,
 
           SUM(CASE WHEN NA.dpdQueue IN ('04','05','06','07')
-                    AND ISNULL(CRS.CompleteFlag,0)=1
-              THEN 1 ELSE 0 END) AS completed_90_plus
+          AND ISNULL(CRS.CompleteFlag,0)=1
+          AND CAST(CRS.UpdatedAt AS DATE) = CAST(GETDATE() AS DATE)
+    THEN 1 ELSE 0 END) AS completed_90_plus
 
         FROM NPA_Assigned NA
         LEFT JOIN CallRecovery_Status CRS
@@ -823,32 +1081,66 @@ app.post("/api/npa/dpd-summary-v2", async (req, res) => {
       `);
 
     const row = result.recordset[0] || {};
+const response = {
+  "0_30": {
+    pending: row.pending_0_30 || 0,
+    inProcess: row.inprocess_0_30 || 0,
+    completed: row.completed_0_30 || 0,
+  },
+  "31_60": {
+    pending: row.pending_31_60 || 0,
+    inProcess: row.inprocess_31_60 || 0,
+    completed: row.completed_31_60 || 0,
+  },
+  "61_90": {
+    pending: row.pending_61_90 || 0,
+    inProcess: row.inprocess_61_90 || 0,
+    completed: row.completed_61_90 || 0,
+  },
+  "90_plus": {
+    pending: row.pending_90_plus || 0,
+    inProcess: row.inprocess_90_plus || 0,
+    completed: row.completed_90_plus || 0,
+  }
+};
 
-    return res.json({
-      "0_30": {
-        pending: row.pending_0_30 || 0,
-        inProcess: row.inprocess_0_30 || 0,
-        completed: row.completed_0_30 || 0,
-      },
-      "31_60": {
-        pending: row.pending_31_60 || 0,
-        inProcess: row.inprocess_31_60 || 0,
-        completed: row.completed_31_60 || 0,
-      },
-      "61_90": {
-        pending: row.pending_61_90 || 0,
-        inProcess: row.inprocess_61_90 || 0,
-        completed: row.completed_61_90 || 0,
-      },
-      "90_plus": {
-        pending: row.pending_90_plus || 0,
-        inProcess: row.inprocess_90_plus || 0,
-        completed: row.completed_90_plus || 0,
-      },
-    });
+console.log("📦 [NPA_API] fetched data", {
+  userId,
+  userName,
+  response
+});
+
+const total =
+  response["0_30"].pending +
+  response["31_60"].pending +
+  response["61_90"].pending +
+  response["90_plus"].pending;
+
+console.log("📊 [NPA_API] counts", {
+  userId,
+  userName,
+  "0_30": response["0_30"],
+  "31_60": response["31_60"],
+  "61_90": response["61_90"],
+  "90_plus": response["90_plus"],
+  total
+});
+
+console.log("✅ [NPA_API] DPD summary ready");
+
+console.log("📤 [NPA_API] sending response", {
+  userId,
+  userName
+});
+
+return res.json(response);
 
   } catch (err) {
-    console.error("❌ NPA DPD SUMMARY V2 ERROR:", err);
+    console.error("❌ [NPA_API] error:", {
+  message: err.message,
+  stack: err.stack,
+  userId
+});
     return res.status(500).json({ message: "Failed to load dpd summary v2" });
   }
 });
@@ -858,6 +1150,7 @@ app.post("/api/npa/dpd-summary-v2", async (req, res) => {
 // Marketing → Leads_Data Table
 // =====================================================================
 app.post("/api/home/members-summary-v3", async (req, res) => {
+	console.log("📥 [HOME_API] members-summary request", { userId: req.body?.userId });
   const { userId } = req.body;
 
   if (!userId) {
@@ -870,6 +1163,7 @@ app.post("/api/home/members-summary-v3", async (req, res) => {
     // =====================================================
     // 1️⃣ RECOVERY SUMMARY (NPA + WELCOME)
     // =====================================================
+		console.log("📊 [HOME_API] Fetching recovery summary", { userId });
     const recoveryResult = await pool.request()
       .input("UserId", sql.VarChar(50), String(userId))
       .query(`
@@ -899,9 +1193,10 @@ app.post("/api/home/members-summary-v3", async (req, res) => {
               THEN 1 ELSE 0 END) AS npa_inprocess,
 
           SUM(CASE 
-                WHEN A.dpdQueue IN ('01','02','03','04','05','06','07')
-                 AND ISNULL(CRS.CompleteFlag,0)=1
-              THEN 1 ELSE 0 END) AS npa_completed,
+      WHEN A.dpdQueue IN ('01','02','03','04','05','06','07')
+       AND ISNULL(CRS.CompleteFlag,0)=1
+       AND CAST(CRS.UpdatedAt AS DATE) = CAST(GETDATE() AS DATE)
+    THEN 1 ELSE 0 END) AS npa_completed,
 
           -- WELCOME (NULL/EMPTY)
           SUM(CASE 
@@ -916,10 +1211,11 @@ app.post("/api/home/members-summary-v3", async (req, res) => {
                  AND ISNULL(CRS.CompleteFlag,0)=0
               THEN 1 ELSE 0 END) AS welcome_inprocess,
 
-          SUM(CASE 
-                WHEN (A.dpdQueue IS NULL OR A.dpdQueue = '')
-                 AND ISNULL(CRS.CompleteFlag,0)=1
-              THEN 1 ELSE 0 END) AS welcome_completed
+         SUM(CASE 
+      WHEN (A.dpdQueue IS NULL OR A.dpdQueue = '')
+       AND ISNULL(CRS.CompleteFlag,0)=1
+       AND CAST(CRS.UpdatedAt AS DATE) = CAST(GETDATE() AS DATE)
+    THEN 1 ELSE 0 END) AS welcome_completed
 
         FROM Assigned A
         LEFT JOIN CallRecovery_Status CRS
@@ -928,10 +1224,12 @@ app.post("/api/home/members-summary-v3", async (req, res) => {
       `);
 
     const r = recoveryResult.recordset[0] || {};
+	console.log("✅ [HOME_API] Recovery summary ready");
 
     // =====================================================
     // 2️⃣ MARKETING SUMMARY (From Leads_Data)
     // =====================================================
+	console.log("📊 [HOME_API] Fetching marketing summary", { userId });
 const marketingResult = await pool.request()
   .input("UserId", sql.VarChar(50), String(userId))
   .query(`
@@ -1000,109 +1298,84 @@ const marketingResult = await pool.request()
 `);
 
 const m = marketingResult.recordset[0] || {};
+console.log("✅ [HOME_API] Marketing summary ready");
 
     // =====================================================
     // FINAL RESPONSE
     // =====================================================
-    return res.json({
-members: {
-  pending:
-    (r.npa_pending || 0) +
-    (r.welcome_pending || 0) +
-    (m.marketing_pending || 0),
+			console.log("📤 [HOME_API] Sending members summary response");
+			const response = {
+  members: {
+    pending:
+      (r.npa_pending || 0) +
+      (r.welcome_pending || 0) +
+      (m.marketing_pending || 0),
 
-  inProcess:
-    (r.npa_inprocess || 0) +
-    (r.welcome_inprocess || 0) +
-    (m.marketing_inprocess || 0),
+    inProcess:
+      (r.npa_inprocess || 0) +
+      (r.welcome_inprocess || 0) +
+      (m.marketing_inprocess || 0),
 
-  completed:
-    (r.npa_completed || 0) +
-    (r.welcome_completed || 0) +
-    (m.marketing_completed || 0),
-},
+    completed:
+      (r.npa_completed || 0) +
+      (r.welcome_completed || 0) +
+      (m.marketing_completed || 0),
+  },
 
-      npa: {
-        pending: r.npa_pending || 0,
-        inProcess: r.npa_inprocess || 0,
-        completed: r.npa_completed || 0,
-      },
+  npa: {
+    pending: r.npa_pending || 0,
+    inProcess: r.npa_inprocess || 0,
+    completed: r.npa_completed || 0,
+  },
 
-marketing: {
-  pending: m.marketing_pending || 0,
-  inProcess: m.marketing_inprocess || 0,
-  completed: m.marketing_completed || 0,
-},
+  marketing: {
+    pending: m.marketing_pending || 0,
+    inProcess: m.marketing_inprocess || 0,
+    completed: m.marketing_completed || 0,
+  },
 
-      welcome: {
-        pending: r.welcome_pending || 0,
-        inProcess: r.welcome_inprocess || 0,
-        completed: r.welcome_completed || 0,
-      }
-    });
+  welcome: {
+    pending: r.welcome_pending || 0,
+    inProcess: r.welcome_inprocess || 0,
+    completed: r.welcome_completed || 0,
+  }
+};
+console.log("📦 [HOME_API] Members summary fetched", {
+  userId,
+  response
+});
+console.log("📤 [HOME_API] Sending members summary response", {
+  userId
+});
 
-  } catch (err) {
-    console.error("❌ members-summary error:", err);
+return res.json(response);
+    } catch (err) {
+    console.error("❌ [HOME_API] members-summary error:", {
+  message: err.message,
+  stack: err.stack,
+  userId
+});
     return res.status(500).json({ message: "Server error" });
   }
 });
-// =====================================================================
-// UPDATE ACCOUNT STATUS → IN PROCESS (WHEN USER SCHEDULES CALL / VISIT)
-// =====================================================================
-app.post("/api/account/progress/inprocess", async (req, res) => {
-  const { loanAccountNumber, userId, activityType } = req.body;
 
-  if (!loanAccountNumber || !userId || !activityType) {
-    return res.status(400).json({
-      message: "loanAccountNumber, userId, activityType are required",
-    });
-  }
-
-  try {
-    const pool = await poolPromise;
-
-    // ✅ update assignment status to InProcess
-    await pool.request()
-      .input("loanAccountNumber", sql.VarChar(50), loanAccountNumber)
-      .input("userId", sql.VarChar(50), userId)
-      .query(`
-        UPDATE Account_Assignments
-        SET WorkStatus = 'InProcess',
-            WorkUpdatedAt = GETDATE()
-        WHERE LoanAccountNumber = @loanAccountNumber
-          AND AssignedToUserId = @userId
-          AND AssignmentStatus = 'Assigned'
-      `);
-
-    return res.json({
-      success: true,
-      message: "Moved to In-Process successfully",
-    });
-
-  } catch (err) {
-    console.error("❌ INPROCESS UPDATE ERROR:", err);
-    return res.status(500).json({ message: "Failed to update status" });
-  }
-});
-
-// =====================================================================
-// HOME → SCHEDULE FOR THE DAY (Call + Pending)
-// =====================================================================
 // =====================================================================
 // HOME → SCHEDULE FOR THE DAY SUMMARY (CALL + VISIT)
 // ✅ Pending = scheduled date <= today (carry forward)
 // ✅ Completed = ONLY completed today (UpdatedAt = today)
 // =====================================================================
 app.post("/api/home/schedule-summary", async (req, res) => {
+	console.log("📥 [HOME_API] schedule-summary request", { userId: req.body?.userId });
   const { userId } = req.body;
 
-  if (!userId) {
-    return res.status(400).json({ message: "userId is required" });
-  }
+if (!userId) {
+  console.log("⚠️ [HOME_API] userId missing");
+  return res.status(400).json({ message: "userId required" });
+}
 
   try {
     const pool = await poolPromise;
-
+console.log("📊 [HOME_API] Fetching schedule summary", { userId });
     const result = await pool
       .request()
       .input("UserId", sql.VarChar(50), String(userId))
@@ -1139,7 +1412,9 @@ app.post("/api/home/schedule-summary", async (req, res) => {
       `);
 
     const row = result.recordset[0] || {};
+console.log("✅ [HOME_API] Schedule summary ready");
 
+console.log("📤 [HOME_API] Sending schedule summary response");
     return res.json({
       call: {
         pending: row.call_pending || 0,
@@ -1152,7 +1427,11 @@ app.post("/api/home/schedule-summary", async (req, res) => {
     });
 
   } catch (err) {
-    console.error("❌ Schedule summary error:", err);
+   console.error("❌ [HOME_API] schedule-summary error:", {
+  message: err.message,
+  stack: err.stack,
+  userId
+});
     return res.status(500).json({ message: "Failed to load schedule summary" });
   }
 });
@@ -1162,11 +1441,18 @@ app.post("/api/home/schedule-summary", async (req, res) => {
 // HOME → SCHEDULE FOR THE DAY → TODAY + PAST (CALL / VISIT)
 // =====================================================================
 app.post("/api/home/schedule-today-list", async (req, res) => {
+console.log("📥 [TODAY_SCHEDULE_API] request", {
+  userId: req.body?.userId,
+  userName: req.body?.userName,
+  type: req.body?.type,
+  payload: req.body
+});
   const { userId, type } = req.body; // type = "CALL" or "VISIT"
 
-  if (!userId || !type) {
-    return res.status(400).json({ message: "userId and type are required" });
-  }
+if (!userId || !type) {
+  console.log("⚠️ [TODAY_SCHEDULE_API] missing params", { userId, type });
+  return res.status(400).json({ message: "userId and type are required" });
+}
 
   try {
     const pool = await poolPromise;
@@ -1271,19 +1557,37 @@ app.post("/api/home/schedule-today-list", async (req, res) => {
           CONVERT(date, CRS.ScheduleVisitTimestamp) DESC,
           CRS.ScheduleVisitTimestamp DESC
         `;
+console.log("📊 [TODAY_SCHEDULE_API] Fetching schedules", { userId, type });
 
-    const result = await pool
-      .request()
-      .input("UserId", sql.VarChar(50), String(userId))
-      .query(query);
+const result = await pool
+  .request()
+  .input("UserId", sql.VarChar(50), String(userId))
+  .query(query);
 
-    return res.json({
-      type,
-      records: result.recordset || [],
-    });
+console.log("📦 [TODAY_SCHEDULE_API] fetched data", {
+  userId,
+  type,
+  records: result.recordset
+});
 
+console.log("✅ [TODAY_SCHEDULE_API] schedules fetched", {
+  userId,
+  userName: req.body?.userName,
+  type,
+  count: result.recordset?.length || 0
+});
+console.log("📤 [TODAY_SCHEDULE_API] sending response");
+return res.json({
+  type,
+  records: result.recordset || [],
+});
   } catch (err) {
-    console.error("❌ schedule-today-list error:", err);
+   console.error("❌ [TODAY_SCHEDULE_API] error:", {
+  message: err.message,
+  stack: err.stack,
+  userId,
+  type
+});
     return res.status(500).json({ message: "Failed to load schedule list" });
   }
 });
@@ -1296,7 +1600,8 @@ app.post("/api/home/schedule-today-list", async (req, res) => {
 // START FIELD VISIT
 // ===============================
 app.post("/api/field-visit/start", async (req, res) => {
-  const {
+
+  let {
     userId,
     userName,
     accountNo,
@@ -1306,23 +1611,45 @@ app.post("/api/field-visit/start", async (req, res) => {
     customerAddress
   } = req.body;
 
-  // ===============================
-  // VALIDATION
-  // ===============================
-  if (
-    !userId ||
-    !userName ||
-    !accountNo ||
-    !customerName ||
-    customerLat === undefined ||
-    customerLng === undefined ||
-    !customerAddress
-  ) {
-    return res.status(400).json({ message: "Missing required fields" });
-  }
-
   try {
     const pool = await poolPromise;
+
+    // ============================================
+    // STEP 0 — FALLBACK TO MANUAL ADDRESS
+    // ============================================
+    if (!customerAddress || customerAddress.trim() === "") {
+
+      const manualAddressResult = await pool.request()
+        .input("AccountNo", sql.VarChar(50), accountNo)
+        .query(`
+          SELECT TOP 1 Address
+          FROM Customer_Manual_Address
+          WHERE LoanAccountNumber = @AccountNo
+          ORDER BY CreatedAt DESC
+        `);
+
+      if (manualAddressResult.recordset.length > 0) {
+        customerAddress = manualAddressResult.recordset[0].Address;
+        console.log("✅ Using manual address:", customerAddress);
+      }
+    }
+
+    // ============================================
+    // FINAL VALIDATION
+    // ============================================
+    if (
+      !userId ||
+      !userName ||
+      !accountNo ||
+      !customerName ||
+      !customerAddress
+    ) {
+      return res.status(400).json({ message: "Missing required fields" });
+    }
+
+    // allow null coordinates
+    customerLat = customerLat ?? null;
+    customerLng = customerLng ?? null;
 
     // ============================================
     // STEP 1 — GET BRANCH LAT/LNG
@@ -1347,42 +1674,44 @@ app.post("/api/field-visit/start", async (req, res) => {
     const branchLng = branchResult.recordset[0].BranchLongitude;
 
     // ============================================
-    // STEP 2 — CHECK LAST VISIT WITHIN 1 HOUR
+    // STEP 2 — CHECK LAST VISIT WITHIN 2 HOURS
     // ============================================
-const lastVisitResult = await pool.request()
-  .input("UserId", sql.VarChar(50), userId)
-  .query(`
-    SELECT TOP 1 
-      MeetingLatitude,
-      MeetingLongitude,
-      DATEDIFF(MINUTE, Timestamp, GETDATE()) AS DiffMinutes
-    FROM FieldVisitReport
-    WHERE UserID = @UserId
-      AND MeetingLatitude IS NOT NULL
-      AND MeetingLongitude IS NOT NULL
-    ORDER BY Timestamp DESC
-  `);
+    const lastVisitResult = await pool.request()
+      .input("UserId", sql.VarChar(50), userId)
+      .query(`
+        SELECT TOP 1 
+          MeetingLatitude,
+          MeetingLongitude,
+          DATEDIFF(MINUTE, Timestamp, GETDATE()) AS DiffMinutes
+        FROM FieldVisitReport
+        WHERE UserID = @UserId
+          AND MeetingLatitude IS NOT NULL
+          AND MeetingLongitude IS NOT NULL
+        ORDER BY Timestamp DESC
+      `);
 
-    let startLat = branchLat;
-    let startLng = branchLng;
-    let startAddress = "Branch Location";
+let startLat = branchLat;
+let startLng = branchLng;
+let startAddress = await getAddressFromCoords(branchLat, branchLng);
 
-    if (lastVisitResult.recordset.length > 0) {
-      const last = lastVisitResult.recordset[0];
+if (lastVisitResult.recordset.length > 0) {
+  const last = lastVisitResult.recordset[0];
+  const diffMinutes = last.DiffMinutes;
 
-const diffMinutes = last.DiffMinutes;
+  console.log("⏱ DiffMinutes:", diffMinutes);
 
-console.log("⏱ DiffMinutes:", diffMinutes);
+  if (diffMinutes <= 120) {
+    startLat = last.MeetingLatitude;
+    startLng = last.MeetingLongitude;
 
-if (diffMinutes <= 120) {
-  startLat = last.MeetingLatitude;
-  startLng = last.MeetingLongitude;
-  startAddress = "Previous Visit Location";
-} else {
-  startLat = branchLat;
-  startLng = branchLng;
-  startAddress = "Branch Location";
-}
+    startAddress = await getAddressFromCoords(
+      last.MeetingLatitude,
+      last.MeetingLongitude
+    );
+  }
+
+  // ❌ NO ELSE BLOCK NEEDED
+
     }
 
     // ============================================
@@ -1397,11 +1726,12 @@ if (diffMinutes <= 120) {
       .input("BranchLatitude", sql.Decimal(18, 10), branchLat)
       .input("BranchLongitude", sql.Decimal(18, 10), branchLng)
 
-      // 🔥 Dynamic start
+      // dynamic start location
       .input("StartLatitude", sql.Decimal(18, 10), startLat)
       .input("StartLongitude", sql.Decimal(18, 10), startLng)
       .input("StartAddress", sql.NVarChar(500), startAddress)
 
+      // customer location (optional)
       .input("CustomerLatitude", sql.Decimal(18, 10), customerLat)
       .input("CustomerLongitude", sql.Decimal(18, 10), customerLng)
       .input("CustomerAddress", sql.NVarChar(500), customerAddress)
@@ -1467,7 +1797,6 @@ if (diffMinutes <= 120) {
     });
   }
 });
-
 // ===============================
 // STOP FIELD VISIT
 // ===============================
@@ -1530,6 +1859,11 @@ app.post("/api/field-visit/stop", async (req, res) => {
 // SAVE LEAD API (CORRECTED)
 // =====================================
 app.post("/api/saveLead", async (req, res) => {
+console.log("📥 [SAVE_LEAD_API] request received", {
+  userId: req.body?.UserID,
+  userName: req.body?.UserName,
+  payload: req.body
+});
   try {
 
     let {
@@ -1572,21 +1906,31 @@ app.post("/api/saveLead", async (req, res) => {
     // =====================================
     // VALIDATION
     // =====================================
-    if (!FullName || !MobileNumber || !ProductCategory || !SelectProduct || !SelectLeadType) {
+if (!FullName || !MobileNumber || !ProductCategory || !SelectProduct || !SelectLeadType) {
+  console.log("⚠️ [SAVE_LEAD_API] mandatory fields missing", {
+    userId: UserID
+  });
       return res.status(400).json({
         success: false,
         message: "Mandatory fields missing"
       });
     }
 
-    if (!["Deposits", "Loan"].includes(ProductCategory)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid Product Category"
-      });
-    }
+if (!["Deposits", "Loan"].includes(ProductCategory)) {
+  console.log("⚠️ [SAVE_LEAD_API] invalid product category", {
+    userId: UserID,
+    ProductCategory
+  });
+  return res.status(400).json({
+    success: false,
+    message: "Invalid Product Category"
+  });
+}
 
     const pool = await poolPromise;
+console.log("📊 [SAVE_LEAD_API] Fetching cluster", {
+  BranchCode
+});
 
     // =====================================
     // FETCH CLUSTER FROM BRANCH MASTER
@@ -1599,7 +1943,8 @@ app.post("/api/saveLead", async (req, res) => {
         WHERE branch_code = @BranchCode
       `);
 
-    if (!clusterResult.recordset.length) {
+   if (!clusterResult.recordset.length) {
+  console.log("⚠️ [SAVE_LEAD_API] cluster not found", { BranchCode });
       return res.status(400).json({
         success: false,
         message: "Cluster not found for this BranchCode"
@@ -1607,7 +1952,19 @@ app.post("/api/saveLead", async (req, res) => {
     }
 
     const ClusterName = clusterResult.recordset[0].cluster_name;
-
+	console.log("📦 [SAVE_LEAD_API] cluster fetched", {
+  userId: UserID,
+  ClusterName
+});
+console.log("📊 [SAVE_LEAD_API] inserting lead", {
+  userId: UserID,
+  userName: UserName,
+  FullName,
+  MobileNumber,
+  ProductCategory,
+  SelectProduct,
+  SelectLeadType
+});
     // =====================================
     // INSERT INTO Leads_Data
     // =====================================
@@ -1668,6 +2025,11 @@ app.post("/api/saveLead", async (req, res) => {
     // =====================================
     // SUCCESS RESPONSE
     // =====================================
+console.log("📤 [SAVE_LEAD_API] response success", {
+  userId: UserID,
+  userName: UserName,
+  success: true
+});
     return res.json({
       success: true,
       message: "Lead saved successfully"
@@ -1675,7 +2037,11 @@ app.post("/api/saveLead", async (req, res) => {
 
   } catch (err) {
 
-    console.log("SAVE LEAD ERROR:", err);
+  console.error("❌ [SAVE_LEAD_API] error:", {
+  message: err.message,
+  stack: err.stack,
+  userId: req.body?.UserID
+});
 
     return res.status(500).json({
       success: false,
@@ -1684,12 +2050,18 @@ app.post("/api/saveLead", async (req, res) => {
 
   }
 });
+
 // ================= GET LEADS FOR LOGGED USER =================
 app.get("/api/getMyLeads/:userId", async (req, res) => {
+
+  const { userId } = req.params;
+  console.log("📥 [LEADS_API] getMyLeads request", { userId });
+
   try {
-    const { userId } = req.params;
 
     const pool = await poolPromise;
+
+    console.log("📊 [LEADS_API] Fetching leads", { userId });
 
     const result = await pool.request()
       .input("UserID", sql.VarChar, userId)
@@ -1702,11 +2074,8 @@ app.get("/api/getMyLeads/:userId", async (req, res) => {
           L.SelectLeadType,
           L.LeadCategory,
           L.TimeStamp,
-
           ISNULL(A.AttemptCount,0) AS AttemptCount
-
         FROM Leads_Data L
-
         LEFT JOIN
         (
           SELECT 
@@ -1722,11 +2091,15 @@ app.get("/api/getMyLeads/:userId", async (req, res) => {
           GROUP BY SourceId
         ) A
         ON A.SourceId = L.SNo
-
         WHERE L.UserID = @UserID
-
         ORDER BY L.TimeStamp DESC
       `);
+
+    console.log("✅ [LEADS_API] leads fetched", {
+      count: result.recordset.length
+    });
+     console.log("📦 [LEADS_API] leads data", result.recordset);
+    console.log("📤 [LEADS_API] sending response");
 
     res.json({
       success: true,
@@ -1734,32 +2107,55 @@ app.get("/api/getMyLeads/:userId", async (req, res) => {
     });
 
   } catch (err) {
-    console.log("GET LEADS ERROR", err);
+    console.error("❌ [LEADS_API] getMyLeads error:", {
+      message: err.message,
+      stack: err.stack,
+      userId
+    });
+
     res.json({ success: false });
   }
 });
 
 // ================= GET FULL LEAD DETAILS BY SNo =================
 app.get("/api/getLeadDetails/:sno", async (req, res) => {
+console.log("📥 [LEAD_DETAILS_API] request", {
+  sno: req.params?.sno,
+  userId: req.query?.userId,
+  userName: req.query?.userName
+});
+
   try {
     const { sno } = req.params;
 
     const pool = await poolPromise;
 
+    console.log("📊 [LEAD_DETAILS_API] fetching lead", { sno });
+
     const result = await pool.request()
+
       .input("SNo", sql.Int, sno)
       .query(`
         SELECT *
         FROM Leads_Data
         WHERE SNo = @SNo
       `);
-
+console.log("📦 [LEAD_DETAILS_API] fetched data", {
+  sno,
+  userId: req.query?.userId,
+  userName: req.query?.userName,
+  records: result.recordset
+});
     if (result.recordset.length === 0) {
+      console.log("⚠️ [LEAD_DETAILS_API] lead not found", { sno });
       return res.status(404).json({
         success: false,
         message: "Lead not found"
       });
     }
+
+    console.log("✅ [LEAD_DETAILS_API] lead fetched", { sno });
+    console.log("📤 [LEAD_DETAILS_API] sending response");
 
     res.json({
       success: true,
@@ -1767,7 +2163,12 @@ app.get("/api/getLeadDetails/:sno", async (req, res) => {
     });
 
   } catch (err) {
-    console.log("GET LEAD DETAILS ERROR", err);
+    console.error("❌ [LEAD_DETAILS_API] error:", {
+      message: err.message,
+      stack: err.stack,
+      sno: req.params?.sno
+    });
+
     res.status(500).json({
       success: false,
       message: "Server error"
@@ -1776,15 +2177,29 @@ app.get("/api/getLeadDetails/:sno", async (req, res) => {
 });
 //==================================== ACTIVITY HOME HISTORY =======================================================
 app.post("/api/activity/history", async (req, res) => {
+console.log("📥 [ACTIVITY_API] history request", {
+  userId: req.body?.userId,
+  userName: req.body?.userName,
+  from: req.body?.fromDate,
+  to: req.body?.toDate,
+  type: req.body?.type,
+  search: req.body?.searchText ? "YES" : "NO",
+  payload: req.body
+});
   try {
     const { userId, fromDate, toDate, searchText, type } = req.body;
 
-    if (!userId) {
-      return res.status(400).json({ message: "userId required" });
-    }
-
+if (!userId) {
+  console.log("⚠️ [ACTIVITY_API] userId missing");
+  return res.status(400).json({ message: "userId required" });
+}
     const pool = await poolPromise;
-
+console.log("📊 [ACTIVITY_API] Fetching activity history", {
+  userId,
+  type,
+  hasDateFilter: !!fromDate || !!toDate,
+  hasSearch: !!searchText
+});
     const result = await pool.request()
       .input("UserId", sql.VarChar(50), String(userId))
       .input("FromDate", sql.Date, fromDate || null)
@@ -1998,6 +2413,10 @@ LEFT JOIN smart_call.dbo.SMA_Report sr
 
 WHERE
     s.StartedByUserId = @UserId
+    AND (
+        (@FromDate IS NULL OR CAST(l.CreatedAt AS DATE) >= @FromDate)
+        AND (@ToDate IS NULL OR CAST(l.CreatedAt AS DATE) <= @ToDate)
+    )
     AND (@Type IS NULL OR @Type='ALL' OR @Type='CO_USE')
     AND (
         @SearchText IS NULL
@@ -2008,33 +2427,65 @@ WHERE
 
 ORDER BY ActionTime DESC
       `);
+	console.log("📦 [ACTIVITY_API] fetched data", {
+  userId,
+  userName: req.body?.userName,
+  count: result.recordset?.length || 0,
+  data: result.recordset
+}); 
+console.log("✅ [ACTIVITY_API] history fetched", {
+  userId,
+  userName: req.body?.userName,
+  count: result.recordset.length
+});
 
-    res.json({
-      success: true,
-      count: result.recordset.length,
-      records: result.recordset
-    });
+console.log("📤 [ACTIVITY_API] sending response", {
+  userId,
+  userName: req.body?.userName
+});
+
+res.json({
+  success: true,
+  count: result.recordset.length,
+  records: result.recordset
+});
 
   } catch (err) {
-    console.error("History API Error:", err);
+    console.error("❌ [ACTIVITY_API] history error:", {
+  message: err.message,
+  stack: err.stack,
+  userId
+});
     res.status(500).json({ message: "History fetch failed" });
   }
 });
 //=========================================== HOME ACTIVITY DETAILS ============================================
 app.post("/api/activity/history-details", async (req, res) => {
+console.log("📥 [ACTIVITY_DETAILS_API] request", {
+  userId: req.body?.userId,
+  userName: req.body?.userName,
+  account: req.body?.loanAccountNumber,
+  payload: req.body
+});
   try {
     const { loanAccountNumber } = req.body;
 
-    if (!loanAccountNumber) {
-      return res.status(400).json({ message: "LoanAccountNumber required" });
-    }
+  if (!loanAccountNumber) {
+  console.log("⚠️ [ACTIVITY_DETAILS_API] account missing");
+  
+  return res.status(400).json({ message: "LoanAccountNumber required" });
+}
 
     const pool = await poolPromise;
 
-    const result = await pool.request()
-      .input("LoanAccountNumber", sql.VarChar(50), String(loanAccountNumber))
+console.log("📊 [ACTIVITY_DETAILS_API] Fetching timeline", {
+  account: loanAccountNumber
+});
 
-      .query(`
+const result = await pool.request()
+  .input("LoanAccountNumber", sql.VarChar(50), String(loanAccountNumber))
+  .query(`
+
 /* ======================================================
    NPA ACTIVITY TIMELINE
 ====================================================== */
@@ -2043,7 +2494,8 @@ SELECT
     s.SessionType,
     l.ActionLabel,
 
-    CONVERT(VARCHAR(20), l.CreatedAt, 113) AS FormattedTime,
+  CONVERT(VARCHAR(20), l.CreatedAt, 113) AS FormattedTime,
+l.CreatedAt AS ActionTime,
 
     FORMAT(cr.ScheduleCallTimestamp,'dd/MM/yyyy hh:mm tt')
       AS FormattedCallSchedule,
@@ -2077,7 +2529,8 @@ SELECT
     s.SessionType,
     l.ActionLabel,
 
-    CONVERT(VARCHAR(20), l.CreatedAt, 113) AS FormattedTime,
+   CONVERT(VARCHAR(20), l.CreatedAt, 113) AS FormattedTime,
+l.CreatedAt AS ActionTime,
 
     NULL AS FormattedCallSchedule,
 
@@ -2109,7 +2562,8 @@ SELECT
     s.SessionType,
     l.ActionLabel,
 
-    CONVERT(VARCHAR(20), l.CreatedAt, 113) AS FormattedTime,
+   CONVERT(VARCHAR(20), l.CreatedAt, 113) AS FormattedTime,
+l.CreatedAt AS ActionTime,
 
     NULL AS FormattedCallSchedule,
 
@@ -2126,62 +2580,74 @@ WHERE
     s.LoanAccountNumber = @LoanAccountNumber
 
 
-ORDER BY FormattedTime DESC
+ORDER BY ActionTime DESC
       `);
-
-    res.json({
-      success: true,
-      records: result.recordset
-    });
-
-  } catch (err) {
-    console.error("History details error:", err);
-    res.status(500).json({ message: "Details fetch failed" });
-  }
+console.log("📦 [ACTIVITY_DETAILS_API] fetched data", {
+  userId: req.body?.userId,
+  userName: req.body?.userName,
+  account: loanAccountNumber,
+  count: result.recordset?.length || 0,
+  data: result.recordset
 });
-//=============================RESET VISIT=====================================
-app.post("/api/visit/reset", async (req, res) => {
-  try {
-    const { loanAccountNumber, userId } = req.body;
+console.log("✅ [ACTIVITY_DETAILS_API] timeline fetched", {
+  userId: req.body?.userId,
+  userName: req.body?.userName,
+  count: result.recordset.length
+});
 
-    const pool = await poolPromise;
-
-    await pool.request()
-      .input("LoanAccountNumber", sql.VarChar(50), loanAccountNumber)
-      .input("UserId", sql.VarChar(50), userId)
-      .query(`
-        UPDATE CallRecovery_Status
-        SET
-          PendingFlag = 1,
-          InProcessFlag = 0,
-          CompleteFlag = 0,
-
-          ScheduleVisitTimestamp = GETDATE(),   -- ⭐ IMPORTANT
-
-          ScheduleVisitPendingFlag = 1,
-          ScheduleVisitCompletedFlag = 0,
-
-          UpdatedAt = GETDATE()
-
-        WHERE LoanAccountNumber = @LoanAccountNumber
-        AND UserId = @UserId
-      `);
-
-    res.json({ success: true });
-
+console.log("📤 [ACTIVITY_DETAILS_API] sending response", {
+  userId: req.body?.userId
+});
+return res.json({
+  success: true,
+  records: result.recordset
+});
   } catch (err) {
-    console.error("Reset visit error:", err);
-    res.status(500).json({ message: "Reset visit failed" });
+    console.error("❌ [ACTIVITY_DETAILS_API] error:", {
+  message: err.message,
+  stack: err.stack,
+  account: req.body?.loanAccountNumber
+});
+    res.status(500).json({ message: "Details fetch failed" });
   }
 });
 
 //============================================================================================
 //                               APP SMA Report
-//============================================================================================
+//=============================================================================================
 app.get("/api/sma-report", async (req, res) => {
+
+console.log("📥 [SMA_REPORT_API] request", {
+  userId: req.query.userId || "N/A",
+  userName: req.query.userName || "N/A",
+  cluster: req.query.cluster,
+  branchCode: req.query.branchCode,
+  branchName: req.query.branchName,
+  irac: req.query.irac
+});
+
   try {
 
     const { cluster, branchCode, branchName, irac } = req.query;
+const { userId, userName } = req.query;
+
+console.log("⚠️ [SMA_REPORT_API] validation", {
+  userId,
+  userName,
+  cluster: cluster || "ALL",
+  branchCode: branchCode || "ALL",
+  branchName: branchName || "ALL",
+  irac: irac || "ALL"
+});
+
+console.log("📊 [SMA_REPORT_API] processing", {
+  userId,
+  userName,
+  cluster,
+  branchCode,
+  branchName,
+  irac
+});
 
     const pool = await poolPromise;
 
@@ -2194,6 +2660,7 @@ app.get("/api/sma-report", async (req, res) => {
     };
 
     const clusterCode = clusterMap[cluster] || null;
+	console.log("⚠️ Cluster mapped", clusterCode);
 
     let query = `
       SELECT
@@ -2289,14 +2756,38 @@ app.get("/api/sma-report", async (req, res) => {
         S.[Loan Type],
         S.[Product Group]
     `;
-
+console.log("📊 [SMA_REPORT_API] executing query", {
+  userId,
+  userName,
+  cluster,
+  branchCode,
+  branchName,
+  irac
+});
     const result = await pool.request().query(query);
+console.log("📦 [SMA_REPORT_API] fetched data", {
+  userId,
+  userName,
+  count: result.recordset?.length || 0,
+  data: result.recordset
+});
+console.log("✅ [SMA_REPORT_API] success", {
+  count: result.recordset?.length || 0
+});
 
-    res.json(result.recordset);
+console.log("📤 [SMA_REPORT_API] response sent", {
+  count: result.recordset?.length || 0
+});
+
+res.json(result.recordset);
 
   } catch (err) {
 
-    console.error("SMA API Error:", err);
+console.log("❌ [SMA_REPORT_API] error", {
+  message: err.message,
+  stack: err.stack
+});
+
     res.status(500).send("Server Error");
 
   }
@@ -2305,12 +2796,35 @@ app.get("/api/sma-report", async (req, res) => {
 //                                BRANCH CALL
 //============================================================================================
 app.get("/api/branch-contacts", async (req,res)=>{
+console.log("📥 [BRANCH_CONTACTS_API] request", {
+  userId: req.query.userId || "N/A",
+  userName: req.query.userName || "N/A",
+  branchCode: req.query.branchCode
+});
 
 try{
 
 const {branchCode} = req.query;
 
+console.log("⚠️ [BRANCH_CONTACTS_API] validation", {
+  branchCode: branchCode || "MISSING"
+});
+
+const { userId, userName } = req.query;
+
+console.log("📊 [BRANCH_CONTACTS_API] processing", {
+  userId,
+  userName,
+  branchCode
+});
+
 const pool = await poolPromise;
+
+console.log("📊 [BRANCH_CONTACTS_API] executing query", {
+  userId,
+  userName,
+  branchCode
+});
 
 const result = await pool.request()
 .input("branchCode",branchCode)
@@ -2322,28 +2836,53 @@ SELECT
 FROM smart_call.dbo.employees_master
 WHERE [Br Code] = @branchCode
 `);
+console.log("📦 [BRANCH_CONTACTS_API] fetched data", {
+  userId,
+  userName,
+  branchCode,
+  count: result.recordset?.length || 0,
+  data: result.recordset
+});
+console.log("✅ [BRANCH_CONTACTS_API] success", {
+  count: result.recordset?.length || 0
+});
+
+console.log("📤 [BRANCH_CONTACTS_API] response sent", {
+  count: result.recordset?.length || 0
+});
 
 res.json(result.recordset);
 
 }catch(err){
 
-console.log("Branch contacts error:",err);
+console.log("❌ [BRANCH_CONTACTS_API] error", {
+  message: err.message,
+  stack: err.stack,
+  branchCode: req.query?.branchCode
+});
 
 res.status(500).send("Server error");
 
 }
 
 });
+
 //============================================================================================
 //                                CUSTOMER CALL
 //============================================================================================
 app.get("/api/customer-contact", async (req,res)=>{
-
+console.log("📥 /api/customer-contact request", req.query);
 try{
-
 const {accountNumber} = req.query;
+console.log("⚠️ Validation check", {
+accountNumber: accountNumber || "MISSING"
+});
+
+console.log("📊 Processing customer contact", accountNumber);
 
 const pool = await poolPromise;
+
+console.log("📊 Executing customer contact query");
 
 const result = await pool.request()
 .input("accountNumber",accountNumber)
@@ -2355,26 +2894,49 @@ FROM smart_call.dbo.Recovery_Raw_Data
 WHERE loanAccountNumber = @accountNumber
 `);
 
+console.log("✅ Customer contact success", result.recordset.length);
+
+console.log("📤 /api/customer-contact response sent", result.recordset.length);
+
 res.json(result.recordset);
 
 }catch(err){
 
-console.log("Customer contact error:",err);
+console.log("❌ /api/customer-contact error",err);
 
 res.status(500).send("Server error");
 
 }
 
 });
-
 // =======================================================
 // GET CUSTOMER + ALL ALTERNATE NUMBERS
 // =======================================================
 app.get("/api/customer-numbers", async (req, res) => {
+console.log("📥 [CUSTOMER_NUMBERS_API] request", {
+  userId: req.query.userId || "N/A",
+  userName: req.query.userName || "N/A",
+  accountNumber: req.query.accountNumber
+});
   try {
     const { accountNumber } = req.query;
 
+console.log("⚠️ [CUSTOMER_NUMBERS_API] validation", {
+  accountNumber: accountNumber || "MISSING"
+});
+const { userId, userName } = req.query;
+
+console.log("📊 [CUSTOMER_NUMBERS_API] processing", {
+  userId,
+  userName,
+  accountNumber
+});
     const pool = await poolPromise;
+console.log("📊 [CUSTOMER_NUMBERS_API] executing query", {
+  userId,
+  userName,
+  accountNumber
+});
 
     const result = await pool.request()
       .input("accountNumber", accountNumber)
@@ -2395,17 +2957,44 @@ app.get("/api/customer-numbers", async (req, res) => {
         FROM smart_call.dbo.Recovery_Raw_Data R
         WHERE R.loanAccountNumber = @accountNumber
       `);
+console.log("📦 [CUSTOMER_NUMBERS_API] fetched data", {
+ userId,
+  userName,
+  accountNumber,
+  count: result.recordset?.length || 0,
+  data: result.recordset
+});
+console.log("✅ [CUSTOMER_NUMBERS_API] success", {
+  count: result.recordset?.length || 0
+});
 
+console.log("📤 [CUSTOMER_NUMBERS_API] response sent", {
+  count: result.recordset?.length || 0
+});
     res.json(result.recordset);
 
   } catch (err) {
-    console.log("Customer numbers error:", err);
+
+console.log("❌ [CUSTOMER_NUMBERS_API] error", {
+  message: err.message,
+  stack: err.stack,
+  accountNumber: req.query?.accountNumber
+});
+
     res.status(500).send("Server error");
   }
 });
+
 //=========================SMA START========================================
 app.post("/api/sma/session/start", async (req,res)=>{
-
+console.log("📥 [SMA_SESSION_START_API] request", {
+  userId: req.body?.userId,
+  userName: req.body?.userName,
+  loanAccountNumber: req.body?.loanAccountNumber,
+  sourceType: req.body?.sourceType,
+  sourceId: req.body?.sourceId,
+  payload: req.body
+});
 try{
 
 const {
@@ -2416,7 +3005,27 @@ sourceType,
 sourceId
 } = req.body;
 
+console.log("⚠️ [SMA_SESSION_START_API] validation", {
+  loanAccountNumber,
+  userId,
+  userName,
+  sourceType,
+  sourceId
+});
+
+console.log("📊 [SMA_SESSION_START_API] processing", {
+  loanAccountNumber,
+  userId,
+  userName
+});
+
 const pool = await poolPromise;
+
+console.log("📊 [SMA_SESSION_START_API] executing insert", {
+  loanAccountNumber,
+  userId,
+  userName
+});
 
 const result = await pool.request()
 .input("loanAccountNumber",loanAccountNumber)
@@ -2436,7 +3045,6 @@ StartedByUserName,
 SourceType,
 SourceId
 )
-
 OUTPUT INSERTED.SessionId
 
 VALUES
@@ -2448,22 +3056,49 @@ VALUES
 @sourceType,
 @sourceId
 )
-
 `);
+const sessionId = result.recordset[0].SessionId;
+console.log("📦 [SMA_SESSION_START_API] fetched data", {
+  sessionId,
+  userId,
+  userName,
+  loanAccountNumber
+});
+console.log("✅ [SMA_SESSION_START_API] success", {
+  sessionId,
+  userId,
+  userName
+});
 
-res.json({sessionId: result.recordset[0].SessionId});
+console.log("📤 [SMA_SESSION_START_API] response sent", {
+  sessionId
+});
+
+res.json({sessionId});
 
 }catch(err){
 
-console.log("SMA session start error:",err);
+console.log("❌ [SMA_SESSION_START_API] error", {
+  message: err.message,
+  stack: err.stack,
+  userId: req.body?.userId,
+  loanAccountNumber: req.body?.loanAccountNumber
+});
 res.status(500).send("Server error");
-
 }
-
 });
 
 //======================================SMA ACTIVITY===========================================
 app.post("/api/sma/log", async (req,res)=>{
+
+console.log("📥 [SMA_LOG_API] request", {
+  userId: req.body?.userId,
+  userName: req.body?.userName,
+  sessionId: req.body?.sessionId,
+  actionCode: req.body?.actionCode,
+  actionLabel: req.body?.actionLabel,
+  payload: req.body
+});
 
 try{
 
@@ -2480,10 +3115,30 @@ sourceType,
 sourceId
 } = req.body;
 
+console.log("⚠️ [SMA_LOG_API] validation", {
+  sessionId,
+  actionCode,
+  actionLabel,
+  userId,
+  userName
+});
+
+console.log("📊 [SMA_LOG_API] processing", {
+  sessionId,
+  actionCode,
+  actionLabel,
+  userId
+});
+
 const pool = await poolPromise;
 
 const metadataJson = metadata ? JSON.stringify(metadata) : null;
 
+console.log("📊 [SMA_LOG_API] inserting log", {
+  sessionId,
+  actionCode,
+  userId
+});
 
 //================ INSERT LOG ==================
 
@@ -2535,7 +3190,18 @@ VALUES
 `);
 
 const logId = result.recordset[0].LogId;
-
+console.log("📦 [SMA_LOG_API] fetched data", {
+  logId,
+  sessionId,
+  actionCode,
+  userId,
+  userName
+});
+console.log("✅ [SMA_LOG_API] success", {
+  logId,
+  actionCode,
+  userId
+});
 
 //================ INSERT NOTE IF USER ENTERED TEXT ==================
 
@@ -2555,7 +3221,10 @@ noteText = metadata.note.trim();
 }
 
 if(noteText && noteText.length > 0){
-
+console.log("📊 [SMA_LOG_API] inserting note", {
+  logId,
+  userId
+});
 await pool.request()
 
 .input("logId",logId)
@@ -2585,61 +3254,136 @@ GETDATE(),
 
 `);
 
+console.log("✅ [SMA_LOG_API] note inserted", {
+  logId,
+  userId
+});
+
 }
+
+console.log("📤 [SMA_LOG_API] response sent", {
+  logId
+});
 
 res.json({logId});
 
 }catch(err){
 
-console.log("SMA log error:",err);
+console.log("❌ [SMA_LOG_API] error", {
+  message: err.message,
+  stack: err.stack,
+  userId: req.body?.userId,
+  sessionId: req.body?.sessionId,
+  actionCode: req.body?.actionCode
+});
+
 res.status(500).send("Server error");
 
 }
 
 });
-
 //======================================SMA END==================================
+
 app.post("/api/sma/session/end", async (req,res)=>{
+
+console.log("📥 [SMA_SESSION_END_API] request", {
+  userId: req.body?.userId,
+  userName: req.body?.userName,
+  sessionId: req.body?.sessionId,
+  payload: req.body
+});
 
 try{
 
 const {sessionId} = req.body;
 
+console.log("⚠️ [SMA_SESSION_END_API] validation", {
+  sessionId
+});
+
+const { userId, userName } = req.body;
+
+console.log("📊 [SMA_SESSION_END_API] processing", {
+  userId,
+  userName,
+  sessionId
+});
+
 const pool = await poolPromise;
+
+console.log("📊 [SMA_SESSION_END_API] executing update", {
+  userId,
+  userName,
+  sessionId
+});
 
 await pool.request()
 .input("sessionId",sessionId)
-
 .query(`
-
 UPDATE smart_call.dbo.SMA_Activity_Sessions
 SET
 SessionStatus='COMPLETED',
 EndedAt=GETDATE(),
 IsActive=0
-
 WHERE SessionId=@sessionId
-
 `);
+console.log("📦 [SMA_SESSION_END_API] update result", {
+  sessionId,
+  status: "COMPLETED"
+});
+console.log("✅ [SMA_SESSION_END_API] success", {
+  sessionId
+});
+
+console.log("📤 [SMA_SESSION_END_API] response sent", {
+  sessionId
+});
 
 res.json({success:true});
 
 }catch(err){
 
-console.log("SMA end session error:",err);
+console.log("❌ [SMA_SESSION_END_API] error", {
+  message: err.message,
+  stack: err.stack,
+  sessionId: req.body?.sessionId,
+  userId: req.body?.userId
+});
+
 res.status(500).send("Server error");
 
 }
 
 });
+
 //====================================================== SMA HISTORY ===========================================================
 app.get("/api/sma/history", async (req, res) => {
+console.log("📥 [SMA_HISTORY_API] request", {
+  userId: req.query.userId || "N/A",
+  userName: req.query.userName || "N/A",
+  accountNumber: req.query.accountNumber
+});
   try {
 
     const { accountNumber } = req.query;
+console.log("⚠️ [SMA_HISTORY_API] validation", {
+  accountNumber: accountNumber || "MISSING"
+});
+
+const { userId, userName } = req.query;
+
+console.log("📊 [SMA_HISTORY_API] processing", {
+  userId,
+  userName,
+  accountNumber
+});
 
     const pool = await poolPromise;
-
+console.log("📊 [SMA_HISTORY_API] executing query", {
+  userId,
+  userName,
+  accountNumber
+});
     const result = await pool.request()
       .input("accountNumber", accountNumber)
       .query(`
@@ -2668,68 +3412,110 @@ S.StartedAt DESC,
 L.CreatedAt ASC
 
 `);
+console.log("📦 [SMA_HISTORY_API] fetched data", {
+  userId,
+  userName,
+  accountNumber,
+  count: result.recordset?.length || 0,
+  data: result.recordset
+});
+console.log("✅ [SMA_HISTORY_API] success", {
+  count: result.recordset?.length || 0
+});
+
+console.log("📤 [SMA_HISTORY_API] response sent", {
+  count: result.recordset?.length || 0
+});
 
     res.json(result.recordset);
 
   } catch (err) {
 
-    console.log("SMA history error:", err);
+console.log("❌ [SMA_HISTORY_API] error", {
+  message: err.message,
+  stack: err.stack,
+  accountNumber
+});
+
     res.status(500).send("Server error");
 
   }
 });
-//=========================== LEAD STATUS =======================================================================
-app.get("/api/leads/status/:userId", async (req,res)=>{
+// =========================== LEAD STATUS ===========================
+app.get("/api/leads/status/:userId", async (req, res) => {
+  const { userId } = req.params;
 
-try{
+  console.log("📥 [LEADS_API] status request", { userId });
 
-const {userId} = req.params;
+  try {
+    const pool = await poolPromise;
 
-const pool = await poolPromise;
+    console.log("📊 [LEADS_API] Fetching lead status", { userId });
 
-const result = await pool.request()
-.input("UserId",sql.VarChar,userId)
+    const result = await pool.request()
+      .input("UserId", sql.VarChar(50), userId)
+      .query(`
+        SELECT
+          L.SNo,
+          ISNULL(LASTLOG.ActionCode,'PENDING') AS ActionCode
+        FROM Leads_Data L
+        OUTER APPLY (
+          SELECT TOP 1 ActionCode
+          FROM Activity_Logs
+          WHERE SourceType = 'LEAD'
+            AND SourceId = L.SNo
+            AND CreatedByUserId = @UserId
+          ORDER BY LogId DESC
+        ) LASTLOG
+        WHERE L.UserID = @UserId
+      `);
 
-.query(`
+    console.log("✅ [LEADS_API] status fetched", {
+      count: result.recordset.length
+    });
 
-SELECT
-L.SNo,
+    console.log("📦 [LEADS_API] status data", result.recordset);
+    console.log("📤 [LEADS_API] sending response");
 
-LASTLOG.ActionCode
+    res.json(result.recordset);
 
-FROM Leads_Data L
+  } catch (err) {
+    console.error("❌ [LEADS_API] status error:", {
+      message: err.message,
+      stack: err.stack,
+      userId
+    });
 
-OUTER APPLY(
-    SELECT TOP 1 ActionCode
-    FROM Activity_Logs
-    WHERE SourceType='LEAD'
-    AND SourceId=L.SNo
-    ORDER BY LogId DESC
-) LASTLOG
-
-WHERE L.UserID=@UserId
-
-`);
-
-res.json(result.recordset);
-
-}catch(err){
-
-console.log(err);
-res.status(500).send("Server error");
-
-}
-
+    res.status(500).send("Server error");
+  }
 });
 
 //================================== EDIT IN PROCESS =========================================================
 
 app.post("/api/recovery/reset-today", async (req, res) => {
+
+console.log("📥 /api/recovery/reset-today request", {
+loanAccountNumber: req.body.loanAccountNumber,
+type: req.body.type,
+userName: req.body.userName
+});
   try {
 
     const { loanAccountNumber, type } = req.body;
 
+console.log("⚠️ Validation check", {
+loanAccountNumber,
+type
+});
+
+console.log("📊 Processing reset today", {
+loanAccountNumber,
+type
+});
+
     const pool = await poolPromise;
+
+console.log("📊 Fetching existing schedule");
 
     // STEP 1 — get current values
     const existing = await pool.request()
@@ -2746,16 +3532,27 @@ app.post("/api/recovery/reset-today", async (req, res) => {
       `);
 
     if (!existing.recordset.length) {
+
+console.log("❌ No active schedule found", loanAccountNumber);
+
       return res.json({ success: false });
     }
 
     const row = existing.recordset[0];
+console.log("📊 Existing schedule", {
+prevCall: row.ScheduleCallTimestamp,
+prevVisit: row.ScheduleVisitTimestamp,
+userId: row.UserId
+});
 
     let updateQuery = "";
     let newCall = null;
     let newVisit = null;
 
     if (type === "CALL") {
+
+console.log("📊 Reset type CALL");
+
       updateQuery = `
         UPDATE CallRecovery_Status
         SET
@@ -2780,6 +3577,9 @@ app.post("/api/recovery/reset-today", async (req, res) => {
     }
 
     if (type === "VISIT") {
+
+console.log("📊 Reset type VISIT");
+
       updateQuery = `
         UPDATE CallRecovery_Status
         SET
@@ -2803,10 +3603,14 @@ app.post("/api/recovery/reset-today", async (req, res) => {
       newVisit = new Date();
     }
 
+console.log("📊 Updating main schedule table");
+
     // STEP 2 — update main table
     await pool.request()
       .input("loanAccountNumber", sql.VarChar(50), loanAccountNumber)
       .query(updateQuery);
+
+console.log("📊 Inserting reset history log");
 
     // STEP 3 — insert log
     await pool.request()
@@ -2841,15 +3645,27 @@ app.post("/api/recovery/reset-today", async (req, res) => {
         )
       `);
 
+console.log("✅ Reset today success", {
+loanAccountNumber,
+type,
+userId: row.UserId
+});
+
+console.log("📤 /api/recovery/reset-today response sent", {
+loanAccountNumber,
+type,
+userId: row.UserId
+});
     res.json({ success: true });
 
   } catch (err) {
-    console.log("Reset today error:", err);
+
+console.log("❌ /api/recovery/reset-today error", err);
+
     res.status(500).json({ message: "Server error" });
   }
 });
-
-//==================================VISIT NEARBY CUSTOMERS=========================================
+//============================VISIT NEARBY CUSTOMERS=========================================
 async function getCoordsFromAddress(address) {
   try {
     const response = await axios.get(
@@ -2857,7 +3673,7 @@ async function getCoordsFromAddress(address) {
       {
         params: {
           address: address,
-          key: GOOGLE_API_KEY,
+         key: process.env.GOOGLE_API_KEY,
         },
       }
     );
@@ -2886,7 +3702,7 @@ async function getRoadDistance(originLat, originLng, destLat, destLng) {
         params: {
           origins: `${originLat},${originLng}`,
           destinations: `${destLat},${destLng}`,
-          key: GOOGLE_API_KEY,
+          key: process.env.GOOGLE_API_KEY,
           mode: "driving",
         },
       }
@@ -2911,33 +3727,63 @@ async function getRoadDistance(originLat, originLng, destLat, destLng) {
 
 
 app.get("/nearby-customers", async (req, res) => {
+
+console.log("📥 /nearby-customers request", {
+lat: req.query.lat,
+lng: req.query.lng,
+userId: req.query.userId,
+userName: req.query.userName
+});
   try {
-    const { lat, lng, userId } = req.query;
+    const { lat, lng, userId, userName } = req.query;
     const radius = 2; // KM
 
+console.log("⚠️ Validation check", { lat, lng, userId });
+
     if (!lat || !lng || !userId) {
+console.log("❌ Missing lat/lng/userId");
       return res.status(400).json({ message: "lat, lng, userId required" });
     }
 
+console.log("📊 Processing nearby customers", {
+lat,
+lng,
+userId,
+userName
+});
     const pool = await poolPromise;
+
+console.log("📊 Fetching assigned customers");
 
     const result = await pool.request()
       .input("UserId", sql.VarChar(50), String(userId))
       .query(`
-        SELECT 
-          R.loanAccountNumber,
-          R.firstname,
-          R.gp,
-          R.pincode
+       SELECT 
+  R.loanAccountNumber,
+  R.firstname,
+  R.gp,
+  R.pincode,
+
+  CASE 
+    WHEN CRS.CompleteFlag = 1 THEN 'COMPLETED'
+    WHEN CRS.InProcessFlag = 1 THEN 'IN PROCESS'
+    ELSE 'PENDING'
+  END AS AccountStatus
         FROM Recovery_Raw_Data R
         INNER JOIN Account_Assignments A
           ON A.LoanAccountNumber = R.loanAccountNumber
-        WHERE
-          A.AssignedToUserId = @UserId
-          AND A.AssignmentStatus = 'Assigned'
+		  LEFT JOIN CallRecovery_Status CRS
+  ON CRS.LoanAccountNumber = R.loanAccountNumber
+    WHERE
+  A.AssignedToUserId = @UserId
+  AND A.AssignmentStatus = 'Assigned'
+AND ISNULL(CRS.CompleteFlag, 0) = 0
       `);
 
     const rows = result.recordset;
+console.log("📦 Assigned customers data", rows);
+console.log("📊 Assigned customers count", rows.length);
+
     const nearby = [];
 
     for (const row of rows) {
@@ -2945,9 +3791,14 @@ app.get("/nearby-customers", async (req, res) => {
       const address =
         `${row.gp || ""}, ${row.pincode || ""}, Andhra Pradesh, India`;
 
+console.log("📍 Checking address", address);
+
       // Step 1: Get customer lat/lng
       const coords = await getCoordsFromAddress(address);
-      if (!coords) continue;
+      if (!coords) {
+console.log("⚠️ No coords found", address);
+continue;
+}
 
       // Step 2: Get GOOGLE ROAD DISTANCE
       const road = await getRoadDistance(
@@ -2957,38 +3808,60 @@ app.get("/nearby-customers", async (req, res) => {
         coords.longitude
       );
 
-      if (!road) continue;
+      if (!road) {
+console.log("⚠️ No road distance", address);
+continue;
+}
 
       const distance = road.distanceKm;
 
       // Step 3: filter within radius
       if (distance <= radius) {
-        nearby.push({
-          loanAccountNumber: row.loanAccountNumber,
-          customerName: row.firstname,
-          address: address,
-          distance: distance,
-          duration: road.duration
-        });
+
+console.log("✅ Nearby customer", row.loanAccountNumber, distance);
+
+       nearby.push({
+  loanAccountNumber: row.loanAccountNumber,
+  customerName: row.firstname,
+  address: address,
+  distance: distance,
+  duration: road.duration,
+  AccountStatus: row.AccountStatus   // ⭐ ADD THIS
+});
       }
     }
+
+console.log("📊 Nearby customers before sort", nearby.length);
 
     // Step 4: sort nearest first
     nearby.sort((a, b) => a.distance - b.distance);
 
+console.log("📊 Nearby customers sorted");
+
+console.log("📤 /nearby-customers response sent", nearby.length);
+console.log("📦 Nearby customers response data", nearby);
     res.json(nearby);
 
   } catch (err) {
-    console.log("Nearby customers error:", err);
+
+console.log("❌ /nearby-customers error", err);
+
     res.status(500).json({ message: "Server error" });
   }
 });
-
 //================================== FUTURE / PAST SCHEDULED LIST ==================================
 app.post("/api/recovery/scheduled-list", async (req, res) => {
-  try {
-    const { type, userId } = req.body;
 
+console.log("📥 /api/recovery/scheduled-list request", req.body);
+
+  try {
+    const { type, userId, userName } = req.body;
+
+console.log("⚠️ Validation check", {
+  userId,
+  userName,
+  type
+});
     const pool = await poolPromise;
     const request = pool.request();
 
@@ -2997,6 +3870,9 @@ app.post("/api/recovery/scheduled-list", async (req, res) => {
     let dateCondition = "";
 
     if (type === "FUTURE") {
+
+console.log("📊 Fetching FUTURE scheduled accounts");
+
       dateCondition = `
         (
           (CRS.ScheduleCallTimestamp IS NOT NULL 
@@ -3009,6 +3885,9 @@ app.post("/api/recovery/scheduled-list", async (req, res) => {
     }
 
     if (type === "PAST") {
+
+console.log("📊 Fetching PAST scheduled accounts");
+
       dateCondition = `
         (
           (CRS.ScheduleCallTimestamp IS NOT NULL 
@@ -3019,6 +3898,8 @@ app.post("/api/recovery/scheduled-list", async (req, res) => {
         )
       `;
     }
+
+console.log("📊 Executing scheduled list query");
 
     const query = `
       SELECT
@@ -3040,6 +3921,17 @@ app.post("/api/recovery/scheduled-list", async (req, res) => {
     `;
 
     const result = await request.query(query);
+console.log("📦 Scheduled list fetched data", {
+  userId,
+  userName,
+  records: result.recordset
+});
+console.log("✅ Scheduled list success", {
+  userId,
+  userName,
+  count: result.recordset.length
+});
+console.log("📤 /api/recovery/scheduled-list response sent", result.recordset.length);
 
     res.json({
       success: true,
@@ -3047,10 +3939,13 @@ app.post("/api/recovery/scheduled-list", async (req, res) => {
     });
 
   } catch (err) {
-    console.log("Scheduled list error:", err);
+
+console.log("❌ /api/recovery/scheduled-list error", err);
+
     res.status(500).json({ message: "Server error" });
   }
 });
+
 
 //==================================================================================================================================================================================
 //                                                                         --------------------------------------------------------------------
@@ -3137,9 +4032,12 @@ app.get("/api/branches/:clusterName", async (req, res) => {
 //                                CSV FILE DATA UPLOAD + DAILY COMPARISON
 //============================================================================================
 app.post("/api/recovery-upload", async (req, res) => {
+  const startTime = Date.now();
+  logInfo("Recovery Upload API called");
   const { records } = req.body;
 
-  if (!records || !Array.isArray(records)) {
+   if (!records || !Array.isArray(records)) {
+  logWarn("Invalid records format received", req.body);
     return res.status(400).json({ message: "Invalid JSON format" });
   }
 
@@ -3147,11 +4045,14 @@ app.post("/api/recovery-upload", async (req, res) => {
     const pool = await poolPromise;
 	
 	const userId = req.headers["x-user-id"];
+  logInfo("User ID received", userId);
 
-if (!userId) {
+  if (!userId) {
+  logWarn("Unauthorized request - missing userId");
   return res.status(401).json({ message: "Unauthorized" });
 }
 
+logInfo("Fetching user role from DB");
 // Fetch user role from DB
 const roleResult = await pool.request()
   .input("userId", sql.VarChar(50), userId)
@@ -3162,25 +4063,30 @@ const roleResult = await pool.request()
   `);
 
 if (!roleResult.recordset.length) {
+  logWarn("User not found in DB", userId);
   return res.status(403).json({ message: "User not found" });
 }
 
 const userRole = roleResult.recordset[0].Role;
+logInfo("User role fetched", userRole);
 
 if (
   userRole === "Branch Manager" ||
   userRole.startsWith("Regional Manager")
 ) {
+  logWarn("Access denied for user role", userRole);
   return res.status(403).json({
     message: "Access Denied. Please Contact Admin."
   });
 }
 
     const todayCount = records.length;
+    logInfo("Records received for upload", todayCount);
 
     // ------------------------------------------------------------------
     // STEP 1 — Get yesterday upload count (from log table)
     // ------------------------------------------------------------------
+    logInfo("Fetching yesterday upload count");
     const yesterdayRes = await pool.request().query(`
       SELECT TOP 1 record_count
       FROM Recovery_Upload_Log
@@ -3189,18 +4095,24 @@ if (
     `);
 
     const yesterdayCount = yesterdayRes.recordset.length
-      ? yesterdayRes.recordset[0].record_count
-      : 0;
+  ? yesterdayRes.recordset[0].record_count
+  : 0;
+
+logInfo("Yesterday count", yesterdayCount);
 
     // ------------------------------------------------------------------
     // STEP 2 — Backup current active data (HISTORY = BACKUP ONLY)
     // ------------------------------------------------------------------
     const oldCountRes = await pool.request()
-      .query(`SELECT COUNT(*) AS cnt FROM Recovery_Raw_Data`);
+  .query(`SELECT COUNT(*) AS cnt FROM Recovery_Raw_Data`);
 
-    if (oldCountRes.recordset[0].cnt > 0) {
-      await pool.request().query(`
-        INSERT INTO Recovery_Raw_Data_history (
+logInfo("Checking existing data before backup");
+
+if (oldCountRes.recordset[0].cnt > 0) {
+  logInfo("Backing up existing data to history table");  // ✅ ADD THIS LINE
+
+  await pool.request().query(`
+    INSERT INTO Recovery_Raw_Data_history (
           firstname, dob, gender, religion, socialcategory, voterId,
           drivingLicense, rationCard, pancard, gp, pincode, village,
           branchCode, branchName, fathersName, product, mobileNumber,
@@ -3261,17 +4173,19 @@ if (
         r.voterId, r.drivingLicense, r.rationCard, r.pancard, r.gp,
         r.pincode, r.village, r.branchCode, r.branchName, r.fathersName,
         r.product, r.mobileNumber, r.loanAccountNumber, r.dpdQueue,
-        r.currentOutstandingBalance, r.principleDue, r.interestDue,
+        parseFloat(r.currentOutstandingBalance) || 0, r.principleDue, r.interestDue,
         r.interestRate, r.lastInterestAppliedDate, r.npaDate,
         r.EMIAMOUNT, r.OVERDUEAMT, r.extra
       );
     });
 
     await pool.request().bulk(table);
+    logSuccess("Bulk insert completed", { inserted: todayCount });
 	
 // ------------------------------------------------------------------
 // STEP 4 — Also store NEW upload into History table
 // ------------------------------------------------------------------
+logInfo("Storing uploaded data into history table");
 await pool.request().query(`
   INSERT INTO Recovery_Raw_Data_history (
     firstname, dob, gender, religion, socialcategory, voterId,
@@ -3293,6 +4207,7 @@ await pool.request().query(`
     // ------------------------------------------------------------------
 // STEP 5 — Insert EVERY upload into log table
 // ------------------------------------------------------------------
+logInfo("Inserting upload log into Recovery_Upload_Log");
 await pool.request()
   .input("cnt", sql.Int, todayCount)
   .query(`
@@ -3305,6 +4220,7 @@ await pool.request()
 // ------------------------------------------------------------------
 // STEP 6 — Get LAST upload BEFORE today (NOT today)
 // ------------------------------------------------------------------
+logInfo("Fetching previous upload count");
 const prevRes = await pool.request().query(`
   SELECT TOP 1 record_count
   FROM Recovery_Upload_Log
@@ -3316,6 +4232,8 @@ const previousCount =
   prevRes.recordset.length
     ? prevRes.recordset[0].record_count
     : 0;
+
+logInfo("Previous count", previousCount);
 
 // ------------------------------------------------------------------
 // STEP 7 — Calculate difference
@@ -3330,9 +4248,18 @@ const newRecords =
     ? todayCount - previousCount
     : 0;
 
+logSuccess("Upload comparison calculated", {
+  today: todayCount,
+  previous: previousCount,
+  newRecords,
+  archived
+});
+
     // ------------------------------------------------------------------
     // FINAL RESPONSE (USED BY FRONTEND MODAL)
     // ------------------------------------------------------------------
+    logInfo("API execution time (ms)", Date.now() - startTime);
+    logSuccess("Upload API completed successfully");
     res.status(200).json({
       success: true,
       message: "Upload completed successfully",
@@ -3342,7 +4269,10 @@ const newRecords =
     });
 
   } catch (err) {
-    console.error("❌ PSV Upload Error:", err);
+  logError("Recovery Upload API failed", {
+  message: err.message,
+  stack: err.stack
+});
     res.status(500).json({ message: "Internal Server Error", error: err.message });
   }
 });
@@ -3352,16 +4282,21 @@ const newRecords =
 //                          FILE UPLOAD STATUS (FINAL CORRECT LOGIC)
 //============================================================================================
 app.get("/api/recovery-upload-status", async (req, res) => {
+const startTime = Date.now();
+  logInfo("Upload Status API called");
   try {
 
     const pool = await poolPromise;
 
     const userId = req.headers["x-user-id"];
+    logInfo("User ID received", userId);
 
-    if (!userId) {
+if (!userId) {
+  logWarn("Unauthorized request - missing userId");
       return res.status(401).json({ message: "Unauthorized" });
     }
 
+    logInfo("Fetching user role for status API");
     // 🔹 Fetch user role
     const roleResult = await pool.request()
       .input("userId", sql.VarChar(50), userId)
@@ -3372,15 +4307,17 @@ app.get("/api/recovery-upload-status", async (req, res) => {
       `);
 
     if (!roleResult.recordset.length) {
-      return res.status(403).json({ message: "User not found" });
-    }
-
+  logWarn("User not found in DB", userId);
+  return res.status(403).json({ message: "User not found" });
+}
     const userRole = roleResult.recordset[0].Role;
+    logInfo("User role fetched", userRole);
 
     if (
-      userRole === "Branch Manager" ||
-      userRole.startsWith("Regional Manager")
-    ) {
+  userRole === "Branch Manager" ||
+  userRole.startsWith("Regional Manager")
+) {
+  logWarn("Access denied for status API", userRole);
       return res.status(403).json({
         message: "Access Denied. Please Contact Admin."
       });
@@ -3389,6 +4326,7 @@ app.get("/api/recovery-upload-status", async (req, res) => {
     // ============================================================
     // 🔹 STEP 1 — Get latest upload
     // ============================================================
+    logInfo("Fetching latest upload data");
     const latestRes = await pool.request().query(`
       SELECT TOP 1 record_count, uploaded_at
       FROM Recovery_Upload_Log
@@ -3406,6 +4344,7 @@ app.get("/api/recovery-upload-status", async (req, res) => {
     // ============================================================
     // 🔹 STEP 2 — Get previous upload from DIFFERENT DATE
     // ============================================================
+    logInfo("Fetching previous upload data");
     const prevRes = await pool.request()
       .input("latestDate", sql.DateTime, latestDate)
       .query(`
@@ -3428,14 +4367,25 @@ app.get("/api/recovery-upload-status", async (req, res) => {
     // ============================================================
     // 🔹 RESPONSE
     // ============================================================
-    res.json({
-      archived,
-      uploaded,
-      history_total: today
-    });
+logInfo("API execution time (ms)", Date.now() - startTime);
+    logSuccess("Status calculated", {
+  today,
+  previous,
+  archived,
+  uploaded
+});
+
+res.json({
+  archived,
+  uploaded,
+  history_total: today
+});
 
   } catch (err) {
-    console.error("❌ STATUS ERROR:", err);
+  logError("Upload Status API failed", {
+  message: err.message,
+  stack: err.stack
+});
     res.status(500).json({ message: "Internal Server Error" });
   }
 });
@@ -3447,6 +4397,8 @@ app.get("/api/recovery-upload-status", async (req, res) => {
 app.post("/api/transaction/search", async (req, res) => {
 	
 	const userId = req.headers["x-user-id"];
+const startTime = Date.now();
+
 
 if (!userId) {
   return res.status(401).json({ message: "Unauthorized" });
@@ -3464,6 +4416,27 @@ if (!userId) {
     dpdQueue,
     memberName
   } = req.body;
+
+console.log("🔍 [SEARCH API HIT]", {
+  userId,
+  body: {
+    mobileNumber,
+    loanAccount,
+    memberName,
+    cluster,
+    branchName
+  }
+});
+
+console.log("📋 Filters Applied:", {
+  mobileNumber,
+  cluster,
+  branchName,
+  product,
+  assignedTo,
+  queue,
+  dpdQueue
+});
 
 const isDirectSearch =
   (loanAccount && loanAccount.trim() !== "") ||
@@ -3485,8 +4458,11 @@ WHERE UserId = @userId
   `);
 
 if (!userInfo.recordset.length) {
+  console.warn("❌ User not found for ID:", userId);
   return res.status(403).json({ message: "User not found" });
 }
+
+console.log("👤 User Info:", userInfo.recordset[0]);
 
 const { Role, BranchName: userBranch } = userInfo.recordset[0];
 
@@ -3624,18 +4600,41 @@ else if (!isDirectSearch) {
   request.input("cluster", sql.VarChar, cluster);
 }
 
+console.log("📡 Executing Search Query...");
+console.log("🧾 Final Query:", query);
+const dbStart = Date.now();
     const result = await request.query(query);
+console.log("⏱ DB Time:", Date.now() - dbStart, "ms");
+console.log("✅ Search Success:", {
+  count: result.recordset.length
+});
 
+console.log("⏱ Search API Time:", Date.now() - startTime, "ms");
     return res.status(200).json(result.recordset);
 
   } catch (error) {
-    console.error("❌ SEARCH API ERROR:", error);
+    console.error("❌ SEARCH API ERROR:", {
+  userId,
+  filters: {
+  mobileNumber,
+  loanAccount,
+  memberName,
+  cluster,
+  branchName
+},
+  message: error.message,
+  stack: error.stack
+});
     return res.status(500).json({ message: "Internal server error" });
   }
 });
 
 app.post("/api/assignUsers", async (req, res) => {
   try {
+console.log("📡 [AssignUsers API HIT]", {
+  branchName: req.body.branchName,
+  cluster: req.body.cluster
+});
     const pool = await poolPromise;
     const { branchName, cluster } = req.body;
 
@@ -3663,11 +4662,16 @@ app.post("/api/assignUsers", async (req, res) => {
       request.input("branchName", branchName);
     }
 
+console.log("📡 AssignUsers Query:", query);
     const result = await request.query(query);
+console.log("✅ AssignUsers Success:", result.recordset.length);
     res.json(result.recordset);
 
   } catch (err) {
-    console.error("assignUsers error:", err);
+    console.error("❌ AssignUsers Error:", {
+  body: req.body,
+  message: err.message
+});
     res.status(500).json({ message: "Server Error" });
   }
 });
@@ -3688,6 +4692,12 @@ app.post("/api/assign", async (req, res) => {
 
 // 🔥 GET LOGGED-IN ADMIN FROM REQUEST HEADER
 const assignedByAdminId = req.headers["x-user-id"];
+
+console.log("📌 [ASSIGN API HIT]", {
+  loanIds,
+  assignedToUserId,
+  assignedByAdminId
+});
 
 if (!assignedByAdminId) {
   return res.status(400).json({ message: "Admin ID missing in header" });
@@ -3732,6 +4742,7 @@ if (!assignedByAdminId) {
       BranchCode: userBranchCode,
       ClusterName: userClusterName
     } = userResult.recordset[0];
+console.log("👤 Assigned To:", assignedToUserName);
 
     /* ======================================================
        2️⃣ FETCH ADMIN DETAILS (FOR AUDIT)
@@ -3751,6 +4762,7 @@ if (!assignedByAdminId) {
     }
 
     const assignedByAdminName = adminResult.recordset[0].UserName;
+console.log("👤 Assigned By:", assignedByAdminName);
 
     /* ======================================================
        3️⃣ FETCH & VALIDATE LOAN ACCOUNTS (SINGLE QUERY)
@@ -3774,12 +4786,13 @@ if (!assignedByAdminId) {
       return res.status(400).json({ message: "Some loan accounts not found" });
     }
 
-    const invalidAccounts = loanResult.recordset
-      .filter(r => r.branchName !== userBranchName)
-      .map(r => r.loanAccountNumber);
+   const invalidAccounts = loanResult.recordset
+  .filter(r => r.branchName !== userBranchName)
+  .map(r => r.loanAccountNumber);
 
     if (invalidAccounts.length > 0) {
       await transaction.rollback();
+console.warn("❌ Invalid Accounts:", invalidAccounts);
       return res.status(400).json({
         message: "User is not related to this branch",
         invalidAccounts
@@ -3855,11 +4868,18 @@ if (!assignedByAdminId) {
     }
 
     await transaction.commit();
+console.log("✅ Assignment Success:", loanIds.length);
     return res.json({ message: "Accounts assigned successfully" });
 
   } catch (err) {
     if (transaction) await transaction.rollback();
-    console.error("❌ ASSIGN API ERROR:", err);
+    console.error("❌ ASSIGN API ERROR:", {
+  loanIds,
+  assignedToUserId,
+  assignedByAdminId,
+  message: err.message,
+  stack: err.stack
+});
     return res.status(500).json({ message: "Assignment failed" });
   }
 });
@@ -3871,12 +4891,17 @@ if (!assignedByAdminId) {
 app.get("/api/transaction/details/:loanAccountNumber", async (req, res) => {
 
   const userId = req.headers["x-user-id"];
+console.log("👁 [VIEW DETAILS API HIT]", {
+  userId,
+  loanAccountNumber: req.params.loanAccountNumber
+});
 
   if (!userId) {
     return res.status(401).json({ message: "Unauthorized" });
   }
 
   const { loanAccountNumber } = req.params;
+console.log("📡 Fetching details for:", loanAccountNumber);
 
   if (!loanAccountNumber) {
     return res.status(400).json({ message: "Loan Account Number required" });
@@ -3959,10 +4984,14 @@ if (isRegionalManager) {
       return res.status(404).json({ message: "Record not found or access denied" });
     }
 
+console.log("✅ View Details Success");
     return res.status(200).json(result.recordset[0]);
 
   } catch (err) {
-    console.error("❌ VIEW DETAILS API ERROR:", err);
+    console.error("❌ VIEW DETAILS ERROR:", {
+  loanAccountNumber,
+  message: err.message
+});
     return res.status(500).json({ message: "Failed to fetch transaction details" });
   }
 });
@@ -3974,6 +5003,11 @@ if (isRegionalManager) {
 
 app.post("/api/transaction/export-pdf", async (req, res) => {
   const { selectedIds, columns, fileName, serialData } = req.body;
+console.log("📄 [PDF API HIT]", {
+  selectedIds,
+  columns,
+  fileName
+});
 
   if (!selectedIds || selectedIds.length === 0) {
     return res.status(400).json({ message: "No records selected" });
@@ -4019,6 +5053,7 @@ app.post("/api/transaction/export-pdf", async (req, res) => {
     `);
 
     const data = result.recordset || [];
+console.log("📊 Records fetched for PDF:", data.length);
 	
 	// 🔴 If somehow no data found, stop PDF generation
 if (data.length === 0) {
@@ -4039,6 +5074,7 @@ if (serialData && Array.isArray(serialData)) {
   });
 }
 
+console.log("📡 Generating PDF...");
     const PDFDocument = require("pdfkit");
 
     const doc = new PDFDocument({
@@ -4182,10 +5218,14 @@ remainingCols.forEach(col => {
   y += dynamicHeight;
 });
 
+console.log("✅ PDF Generated Successfully");
     doc.end();
 
   } catch (err) {
-    console.error("❌ TRANSACTION PDF ERROR:", err);
+    console.error("❌ PDF ERROR:", {
+  selectedIds,
+  message: err.message
+});
     res.status(500).json({ message: "Failed to generate PDF" });
   }
 });
@@ -4317,6 +5357,12 @@ app.post("/api/assign", async (req, res) => {
   try {
     const { loanIds, assignedToUserId, assignedByAdminId } = req.body;
 
+console.log("📌 [ASSIGN V2 API HIT]", {
+  loanIds,
+  assignedToUserId,
+  assignedByAdminId
+});
+
     if (!loanIds?.length) {
       return res.status(400).json({ message: "No loans selected" });
     }
@@ -4382,10 +5428,16 @@ app.post("/api/assign", async (req, res) => {
       VALUES ${values}
     `);
 
+console.log("✅ Assign V2 Success:", loanIds.length);
     return res.json({ message: "Assigned Successfully", assignedCount: loanIds.length });
 
   } catch (err) {
-    console.error("Assign Error:", err);
+    console.error("❌ Assign V2 Error:", {
+  loanIds,
+  assignedToUserId,
+  assignedByAdminId,
+  message: err.message
+});
     return res.status(500).json({ message: "Assignment Failed" });
   }
 });
@@ -4405,6 +5457,7 @@ app.post("/api/users", async (req, res) => {
   mobileNumber,
   validFrom,
   validUntil,
+  designation,
   status   // ✅ ADD THIS
 } = req.body;
 
@@ -4442,17 +5495,18 @@ app.post("/api/users", async (req, res) => {
     .input("DateOfBirth", sql.Date, dateOfBirth === "" ? null : dateOfBirth)
     .input("ValidFrom", sql.Date, validFrom === "" ? null : validFrom)
     .input("ValidUntil", sql.Date, validUntil === "" ? null : validUntil)
+	.input("Designation", sql.VarChar, designation)
 	.input("Status", sql.VarChar, status || "Active")
 
     .query(`
       INSERT INTO UsersInfo (
   UserId, UserName,
   BranchName, BranchCode, ClusterName,
-  MobileNumber, DateOfBirth, ValidFrom, ValidUntil, Status, CreatedAt
+  MobileNumber, DateOfBirth, ValidFrom, ValidUntil, Status, Designation, CreatedAt
 ) VALUES (
   @UserId, @UserName,
   @BranchName, @BranchCode, @ClusterName,
-  @MobileNumber, @DateOfBirth, @ValidFrom, @ValidUntil, @Status, GETDATE()
+  @MobileNumber, @DateOfBirth, @ValidFrom, @ValidUntil, @Status, @Designation, GETDATE()
 )
     `);
 	
@@ -4506,6 +5560,7 @@ app.put("/api/users/:userId", async (req, res) => {
   dateOfBirth,
   validFrom,
   validUntil,
+  designation,
   status   // ✅ ADD
 } = req.body;
 
@@ -4553,6 +5608,7 @@ app.put("/api/users/:userId", async (req, res) => {
       .input("DateOfBirth", sql.Date, dateOfBirth === "" ? null : dateOfBirth)
       .input("ValidFrom", sql.Date, validFrom === "" ? null : validFrom)
       .input("ValidUntil", sql.Date, validUntil === "" ? null : validUntil)
+	  .input("Designation", sql.VarChar, designation)
 	  .input("Status", sql.VarChar, status)
       .query(`
         UPDATE UsersInfo SET
@@ -4565,6 +5621,7 @@ app.put("/api/users/:userId", async (req, res) => {
   ValidFrom = @ValidFrom,
   ValidUntil = @ValidUntil,
   Status = @Status,
+  Designation = @Designation,
   UpdatedAt = GETDATE()
 WHERE UserId = @UserId
       `);
@@ -4701,7 +5758,8 @@ ISNULL((
         DateOfBirth  AS dateOfBirth,
         ValidFrom    AS validFrom,
         ValidUntil   AS validUntil,
-        ISNULL(Status, 'Active') AS status
+        ISNULL(Status, 'Active') AS status,
+Designation AS designation
       FROM UsersInfo
       WHERE
 (@userId = '' OR UserId LIKE '%' + @userId + '%')
@@ -4791,14 +5849,25 @@ app.get("/api/products", async (req, res) => {
 app.post("/api/field-visit-report", async (req, res) => {
   const { user, cluster, branch, fromDate, toDate } = req.body;
 
+  logInfo("FIELD VISIT API HIT", {
+  user, cluster, branch, fromDate, toDate
+});
+
   try {
 
     const pool = await poolPromise;   // ✅ MOVE THIS UP
     const request = pool.request();
 
     const userId = req.headers["x-user-id"];
-if (!userId) return res.status(401).json([]);
 
+logInfo("User ID received", userId);
+
+if (!userId) {
+  logError("Unauthorized request - missing userId");
+  return res.status(401).json([]);
+}
+
+logInfo("Fetching user role from DB");
     const roleResult = await pool.request()
       .input("userId", userId)
       .query(`
@@ -4808,7 +5877,9 @@ if (!userId) return res.status(401).json([]);
       `);
 
     const userInfo = roleResult.recordset[0];
+    logSuccess("User role fetched", userInfo);
 
+    logInfo("Building SQL query");
     let query = `
       SELECT
         f.UserID,
@@ -4838,12 +5909,14 @@ if (!userId) return res.status(401).json([]);
     `;
 
     if (userInfo?.Role === "Branch Manager") {
+      logInfo("Applying Branch Manager filter", userInfo.BranchName);
       query += " AND aa.BranchName = @userBranch";
       request.input("userBranch", userInfo.BranchName);
     }
 	
 	// ================= REGIONAL MANAGER RESTRICTION =================
 if (userInfo?.Role?.startsWith("Regional Manager")) {
+  logInfo("Applying Regional Manager filter", userInfo.Role);
 
   const match = userInfo.Role.match(/\((.*?)\)/);
   const rmCluster = match ? match[1] : "";
@@ -4854,41 +5927,52 @@ if (userInfo?.Role?.startsWith("Regional Manager")) {
 }
 
     if (user) {
+      logInfo("Filter applied: user", user);
       query += " AND f.UserID = @user";
       request.input("user", user);
     }
 
     if (cluster && cluster !== "Corporate Office") {
+      logInfo("Filter applied: cluster", cluster);
       query += " AND aa.ClusterName = @cluster";
       request.input("cluster", cluster);
     }
 
     if (branch) {
+      logInfo("Filter applied: branch", branch);
       query += " AND aa.BranchName = @branch";
       request.input("branch", branch);
     }
 
     if (fromDate) {
+      logInfo("Filter applied: fromDate", fromDate);
       query += " AND CAST(f.MeetingDate AS DATE) >= @fromDate";
       request.input("fromDate", fromDate);
     }
 
     if (toDate) {
+      logInfo("Filter applied: toDate", toDate);
       query += " AND CAST(f.MeetingDate AS DATE) <= @toDate";
       request.input("toDate", toDate);
     }
 
     query += " ORDER BY f.MeetingDate DESC";
 
+logInfo("Executing SQL query");
    const result = await request.query(query);
+   logSuccess("Query executed successfully", {
+  rowCount: result.recordset?.length || 0
+});
 const data = result.recordset || [];
 
 // ================= FETCH SESSIONS =================
 
 if (data.length === 0) {
+  logWarn("No records found");
   return res.json([]);
 }
 
+logInfo("Fetching sessions for accounts", data.length);
 const requestSessions = pool.request();
 
 data.forEach((row, index) => {
@@ -4906,6 +5990,7 @@ const sessionsResult = await requestSessions.query(`
 `);
 
 const sessions = sessionsResult.recordset;
+logSuccess("Sessions fetched", sessions.length);
 
 // ================= FETCH LOGS =================
 
@@ -4914,6 +5999,7 @@ const sessionIds = sessions.map(s => s.SessionId);
 let logs = [];
 
 if (sessionIds.length > 0) {
+  logInfo("Fetching activity logs", sessionIds.length);
 
   const requestLogs = pool.request();
 
@@ -4931,10 +6017,12 @@ if (sessionIds.length > 0) {
   `);
 
   logs = logsResult.recordset;
+  logSuccess("Logs fetched", logs.length);
 }
 
 // ================= BUILD FLOW =================
 
+logInfo("Building final response with flow");
 const finalData = data.map(row => {
 
   const session = sessions.find(s => s.AccountNo == row.AccountNo);
@@ -4955,10 +6043,16 @@ const finalData = data.map(row => {
   };
 });
 
+logSuccess("FIELD VISIT API SUCCESS", {
+  finalCount: finalData.length
+});
 res.json(finalData);
 
   } catch (err) {
-    console.error("FIELD VISIT REPORT ERROR:", err);
+  logError("FIELD VISIT API ERROR", {
+    message: err.message,
+    stack: err.stack
+  });
     res.status(500).json([]);
   }
 });
@@ -4973,6 +6067,10 @@ const PDFDocument = require("pdfkit");
 app.post("/api/field-visit-report/export-pdf", (req, res) => {
   const { columns, data } = req.body;
 
+  logInfo("PDF EXPORT API HIT", {
+  columns: columns?.length,
+  rows: data?.length
+});
   // ================= PDF CONFIG =================
   const doc = new PDFDocument({
     size: "A3",            // 🔥 IMPORTANT: A3 for wide tables
@@ -5109,6 +6207,7 @@ app.post("/api/field-visit-report/export-pdf", (req, res) => {
     startY += maxRowHeight;
   });
 
+  logSuccess("PDF generated successfully");
   doc.end();
 });
 
@@ -5121,6 +6220,11 @@ const ExcelJS = require("exceljs");
 app.post("/api/field-visit-report/export-excel", async (req, res) => {
 
   const { columns, data } = req.body;
+
+  logInfo("EXCEL EXPORT API HIT", {
+  columns: columns?.length,
+  rows: data?.length
+});
 
   try {
 
@@ -5185,13 +6289,18 @@ app.post("/api/field-visit-report/export-excel", async (req, res) => {
       "attachment; filename=Field_Visit_Report.xlsx"
     );
 
+    logInfo("Writing Excel file");
     await workbook.xlsx.write(res);
 
+    logSuccess("Excel generated successfully");
     res.end();
 
   } catch (err) {
 
-    console.error("EXCEL EXPORT ERROR:", err);
+    logError("EXCEL EXPORT ERROR", {
+  message: err.message,
+  stack: err.stack
+});
     res.status(500).send("Excel export failed");
 
   }
@@ -5203,16 +6312,22 @@ app.post("/api/field-visit-report/export-excel", async (req, res) => {
 // Activity Summary
 // =============================
 app.post("/api/activity-summary", async (req, res) => {
+
   const { user, branch, cluster, fromDate, toDate } = req.body;
+    logInfo("ACTIVITY SUMMARY API HIT", {
+  user, branch, cluster, fromDate, toDate
+});
 
   try {
 
     // ================= USER VALIDATION =================
     const rawUserId = req.headers["x-user-id"];
+    logInfo("User ID received", rawUserId);
 
     if (!rawUserId) {
-      return res.status(401).json({ message: "Unauthorized" });
-    }
+  logWarn("Unauthorized access attempt");
+  return res.status(401).json({ message: "Unauthorized" });
+}
 
     // ✅ FIXED: No parseInt
     const userId = rawUserId;
@@ -5227,17 +6342,23 @@ app.post("/api/activity-summary", async (req, res) => {
         FROM UsersInfo
         WHERE UserId = @userId
       `);
+logInfo("Role query result", roleResult.recordset);
+logSuccess("User info fetched", roleResult.recordset[0]);
 
     if (!roleResult.recordset.length) {
-      return res.json([]);
-    }
+  logWarn("User not found in UsersInfo");
+  return res.json([]);
+}
 
     const userInfo = roleResult.recordset[0];
+    logInfo("User info", userInfo);
 
     const request = pool.request();
 
-    request.input("fromDate", sql.Date, fromDate || null);
-    request.input("toDate", sql.Date, toDate || null);
+   logInfo("Filters applied", { user, branch, cluster, fromDate, toDate });
+
+request.input("fromDate", sql.Date, fromDate || null);
+request.input("toDate", sql.Date, toDate || null);
 
     let query = `
       WITH CallVisitCounts AS (
@@ -5271,12 +6392,14 @@ app.post("/api/activity-summary", async (req, res) => {
 
     // ================= BRANCH MANAGER RESTRICTION =================
     if (userInfo.Role === "Branch Manager") {
+      logInfo("Branch Manager restriction applied", userInfo.BranchName);
       query += ` AND aa.BranchName = @userBranch`;
       request.input("userBranch", sql.NVarChar, userInfo.BranchName);
     }
 	
 	// ================= REGIONAL MANAGER RESTRICTION =================
 if (userInfo.Role.startsWith("Regional Manager")) {
+  logInfo("Regional Manager restriction applied", userInfo.Role);
 
   const match = userInfo.Role.match(/\((.*?)\)/);
   const rmCluster = match ? match[1] : "";
@@ -5288,18 +6411,21 @@ if (userInfo.Role.startsWith("Regional Manager")) {
 
     // ================= USER FILTER =================
     if (user) {
+      logInfo("Applying user filter", user);
       query += ` AND aa.AssignedToUserId = @user`;
       request.input("user", sql.VarChar(50), user);
     }
 
     // ================= BRANCH FILTER =================
     if (branch) {
+      logInfo("Applying branch filter", branch);
       query += ` AND aa.BranchName = @branch`;
       request.input("branch", sql.NVarChar, branch);
     }
 
     // ================= CLUSTER FILTER =================
     if (cluster && cluster !== "Corporate Office") {
+      logInfo("Applying cluster filter", cluster);
       query += ` AND aa.ClusterName = @cluster`;
       request.input("cluster", sql.NVarChar, cluster);
     }
@@ -5331,12 +6457,25 @@ if (userInfo.Role.startsWith("Regional Manager")) {
       ORDER BY UserName, BranchName;
     `;
 
-    const result = await request.query(query);
+logInfo("Final query prepared");
+   const startTime = Date.now();
+logInfo("Executing Activity Summary query");
 
-    res.json(result.recordset || []);
+const result = await request.query(query);
+
+logSuccess("Query executed successfully", {
+  rowCount: result.recordset.length,
+  executionTimeMs: Date.now() - startTime
+});
+
+logSuccess("Response sent", {
+  rowCount: result.recordset.length,
+  status: 200
+});
+res.json(result.recordset || []);
 
   } catch (err) {
-    console.error("Activity Summary Error:", err);
+    logError("ACTIVITY SUMMARY ERROR", err);
     res.status(500).json([]);
   }
 });
@@ -5347,18 +6486,31 @@ if (userInfo.Role.startsWith("Regional Manager")) {
 // ACTIVITY SUMMARY → EXPORT PDF
 // =====================================================================
 app.post("/api/activity-summary/export-pdf", async (req, res) => {
+  
   const { selectedData, columns, fileName } = req.body;
 
+  logInfo("ACTIVITY SUMMARY PDF EXPORT HIT", {
+  rows: selectedData?.length,
+  columns,
+  fileName
+});
+
   if (!selectedData || selectedData.length === 0) {
+  logWarn("PDF export failed - no data");
     return res.status(400).json({ message: "No records selected" });
   }
 
   if (!columns || columns.length === 0) {
+  logWarn("PDF export failed - no columns");
     return res.status(400).json({ message: "No columns selected" });
   }
 
   try {
 
+logInfo("Starting PDF generation", {
+  rows: selectedData.length,
+  columns
+});
     const doc = new PDFDocument({
       size: "A4",
       layout: "landscape",
@@ -5366,7 +6518,9 @@ app.post("/api/activity-summary/export-pdf", async (req, res) => {
     });
 
     const safeName = (fileName || "Activity_Summary_Report")
-      .replace(/\s+/g, "_");
+  .replace(/\s+/g, "_");
+
+logInfo("PDF filename", safeName);
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader(
@@ -5451,10 +6605,12 @@ app.post("/api/activity-summary/export-pdf", async (req, res) => {
       }
     });
 
+    logSuccess("PDF generated successfully");
+    logSuccess("PDF response sent");
     doc.end();
 
   } catch (err) {
-    console.error("PDF ERROR:", err);
+    logError("PDF generation error", err);
     res.status(500).json({ message: "Failed to generate PDF" });
   }
 });
@@ -5469,19 +6625,43 @@ app.post("/api/assignment-summary/search", async (req, res) => {
 
   const { userName, cluster, branch, fromDate, toDate } = req.body;
 
-  const role = req.headers["x-user-role"];
-  const loggedBranch = req.headers["x-user-branch"];
-  const loggedCluster = req.headers["x-user-cluster"];
+  logInfo("ASSIGNMENT SUMMARY API HIT", {
+  body: req.body
+});
 
-  if (!userName && !cluster && !branch && !fromDate && !toDate) {
-    return res.json([]);
-  }
+  const role = req.headers["x-user-role"];
+const loggedBranch = req.headers["x-user-branch"];
+const loggedCluster = req.headers["x-user-cluster"];
+
+logInfo("User context received", {
+  role,
+  branch: loggedBranch,
+  cluster: loggedCluster
+});
+
+
+if (!userName && !cluster && !branch && !fromDate && !toDate) {
+  logWarn("Search blocked - no filters provided");
+  return res.json([]);
+}
 
   try {
-
+logInfo("Starting Assignment Summary DB process");
     const pool = await poolPromise;
+    logInfo("DB connection established");
     const request = pool.request();
 
+    logInfo("Applying filters", {
+  userName,
+  cluster,
+  branch,
+  fromDate,
+  toDate
+});
+
+if (userName) {
+  logInfo("Filter applied: userName", userName);
+}
     request.input("UserName", sql.VarChar, userName || "");
 
     let finalCluster = cluster;
@@ -5489,13 +6669,17 @@ app.post("/api/assignment-summary/search", async (req, res) => {
 
     // 🔒 Branch Manager restriction
     if (role === "Branch Manager") {
+      logInfo("Branch Manager restriction applied", {
+  loggedCluster,
+  loggedBranch
+});
       finalCluster = loggedCluster;
       finalBranch = loggedBranch;
     }
 	
 	// 🔒 Regional Manager restriction
 if (role && role.startsWith("Regional Manager")) {
-
+logInfo("Regional Manager restriction applied", role);
   const match = role.match(/\((.*?)\)/);
   const rmCluster = match ? match[1] : "";
 
@@ -5505,6 +6689,7 @@ if (role && role.startsWith("Regional Manager")) {
 
     // Corporate Office → show all clusters
     if (finalCluster === "Corporate Office") {
+      logInfo("Corporate Office selected → removing cluster filter");
       finalCluster = "";
     }
 
@@ -5513,6 +6698,14 @@ if (role && role.startsWith("Regional Manager")) {
     request.input("FromDate", sql.Date, fromDate || null);
     request.input("ToDate", sql.Date, toDate || null);
 
+    logInfo("Final filters applied to SQL", {
+  finalCluster,
+  finalBranch,
+  fromDate,
+  toDate
+});
+
+logInfo("Executing Assignment Summary query");
     const result = await request.query(`
 
       SELECT 
@@ -5555,9 +6748,16 @@ if (role && role.startsWith("Regional Manager")) {
     `);
 
     const rows = result.recordset;
+    logSuccess("Query executed successfully", {
+  count: result.recordset?.length || 0
+});
+
+if (!result.recordset.length) {
+  logWarn("No records found");
+}
 
     // ================= GROUP DATA =================
-
+logInfo("Starting data grouping process");
     const grouped = {};
 
     rows.forEach(row => {
@@ -5590,11 +6790,21 @@ if (role && role.startsWith("Regional Manager")) {
 
     });
 
+    logSuccess("Assignment Summary response prepared", {
+  groups: Object.keys(grouped).length
+});
+
+logSuccess("ASSIGNMENT SUMMARY API SUCCESS", {
+  responseCount: Object.values(grouped).length
+});
     res.json(Object.values(grouped));
 
   } catch (err) {
 
-    console.error("Assignment summary error:", err);
+    logError("ASSIGNMENT SUMMARY ERROR", {
+  message: err.message,
+  stack: err.stack
+});
     res.status(500).send("Server error");
 
   }
@@ -5609,16 +6819,23 @@ app.post("/api/assignment-summary/export-pdf", async (req, res) => {
 
   const { records, columns, fileName } = req.body;
 
+  logInfo("ASSIGNMENT SUMMARY PDF EXPORT API HIT", {
+  records: req.body.records?.length,
+  columns: req.body.columns?.length
+});
+
   if (!records || records.length === 0) {
+    logWarn("PDF export blocked - no records");
     return res.status(400).json({ message: "No records selected" });
   }
 
   if (!columns || columns.length === 0) {
+    logWarn("PDF export blocked - no columns");
     return res.status(400).json({ message: "No columns selected" });
   }
 
   try {
-
+logInfo("Starting PDF generation");
     const PDFDocument = require("pdfkit");
 
     const doc = new PDFDocument({
@@ -5805,10 +7022,17 @@ doc.font("Helvetica").fontSize(9);
       y += dynamicHeight;
     });
 
+    logSuccess("ASSIGNMENT SUMMARY EXPORT COMPLETED", {
+  fileName: safeName,
+  columns: columns.length
+});
     doc.end();
 
   } catch (err) {
-    console.error("PDF ERROR:", err);
+    logError("ASSIGNMENT SUMMARY PDF ERROR", {
+  message: err.message,
+  stack: err.stack
+});
 
     if (!res.headersSent) {
       res.status(500).json({ message: "Failed to generate PDF" });
@@ -5821,9 +7045,15 @@ doc.font("Helvetica").fontSize(9);
 // ======================================================
 app.post("/api/borrowers-contacted/search", async (req, res) => {
 
+  logInfo("BORROWERS CONTACTED API HIT", {
+  body: req.body
+});
+
   const loggedInUserId = req.headers["x-user-id"];
+  logInfo("User ID received", loggedInUserId);
 
   if (!loggedInUserId) {
+    logError("Unauthorized request - missing userId");
     return res.status(401).json({ message: "Unauthorized" });
   }
 
@@ -5832,6 +7062,7 @@ app.post("/api/borrowers-contacted/search", async (req, res) => {
   try {
     const pool = await poolPromise;
 
+    logInfo("Fetching user role from DB");
 // 🔥 Get logged-in user role & branch
 const userInfo = await pool.request()
   .input("userId", sql.VarChar, loggedInUserId)
@@ -5842,13 +7073,16 @@ const userInfo = await pool.request()
   `);
 
 if (!userInfo.recordset.length) {
+  logError("User not found in DB", loggedInUserId);
   return res.status(403).json({ message: "User not found" });
 }
 
 const { Role, BranchName: userBranch } = userInfo.recordset[0];
+logSuccess("User role fetched", { Role, userBranch });
 
 const request = pool.request();
 
+logInfo("Building SQL query");
     let query = `
     WITH SpokeSessions AS (
         SELECT DISTINCT SessionId
@@ -5914,13 +7148,14 @@ const request = pool.request();
 	
 	// 🔒 FORCE BRANCH RESTRICTION
 if (Role === "Branch Manager") {
+  logInfo("Applying Branch Manager restriction", userBranch);
   query += ` AND BranchName = @restrictedBranch`;
   request.input("restrictedBranch", sql.VarChar, userBranch);
 }
 
 // 🔒 FORCE CLUSTER RESTRICTION FOR REGIONAL MANAGER
 if (Role.startsWith("Regional Manager")) {
-
+logInfo("Applying Regional Manager restriction", Role);
   const match = Role.match(/\((.*?)\)/);
   const rmCluster = match ? match[1] : "";
 
@@ -5931,29 +7166,34 @@ if (Role.startsWith("Regional Manager")) {
 
     // ================= USER FILTER =================
     if (userId) {
+      logInfo("Filter applied: userId", userId);
       query += ` AND AssignedToUserId = @userId`;
       request.input("userId", sql.VarChar, userId);
     }
 
     // ================= BRANCH FILTER =================
     if (branch) {
+      logInfo("Filter applied: branch", branch);
       query += ` AND BranchName = @branch`;
       request.input("branch", sql.VarChar, branch);
     }
 
     // ================= CLUSTER FILTER =================
     if (cluster && cluster !== "Corporate Office") {
+      logInfo("Filter applied: cluster", cluster);
       query += ` AND ClusterName = @cluster`;
       request.input("cluster", sql.VarChar, cluster);
     }
 
     // ================= DATE FILTER =================
     if (fromDate) {
+      logInfo("Filter applied: fromDate", fromDate);
       query += ` AND CAST(StartedAt AS DATE) >= @fromDate`;
       request.input("fromDate", sql.Date, fromDate);
     }
 
     if (toDate) {
+      logInfo("Filter applied: toDate", toDate);
       query += ` AND CAST(StartedAt AS DATE) <= @toDate`;
       request.input("toDate", sql.Date, toDate);
     }
@@ -5972,12 +7212,38 @@ if (Role.startsWith("Regional Manager")) {
     ORDER BY StartedAt DESC
     `;
 
-    const result = await request.query(query);
+    logInfo("Executing SQL query");
 
-    res.json(result.recordset);
+logInfo("Final Query Filters", {
+  cluster,
+  branch,
+  userId,
+  fromDate,
+  toDate,
+  role: Role
+});
+
+const result = await request.query(query);
+
+logSuccess("Query executed successfully", {
+  count: result.recordset?.length || 0
+});
+
+if (!result.recordset.length) {
+  logWarn("No records found");
+}
+
+logSuccess("BORROWERS API SUCCESS", {
+  count: result.recordset?.length || 0
+});
+
+res.json(result.recordset);
 
   } catch (err) {
-    console.error("Borrowers Contacted Report Error:", err);
+    logError("BORROWERS API ERROR", {
+  message: err.message,
+  stack: err.stack
+});
     res.status(500).json({ error: err.message });
   }
 });
@@ -5989,11 +7255,18 @@ if (Role.startsWith("Regional Manager")) {
 app.post("/api/borrowers-contacted/export-pdf", async (req, res) => {
   const { selectedIndexes, columns, fileName, fullData } = req.body;
 
+  logInfo("BORROWERS PDF EXPORT API HIT", {
+  selected: req.body.selectedIndexes?.length,
+  columns: req.body.columns?.length
+});
+
   if (!selectedIndexes || selectedIndexes.length === 0) {
+    logWarn("PDF export blocked - no records selected");
     return res.status(400).json({ message: "No records selected" });
   }
 
   if (!columns || columns.length === 0) {
+    logWarn("PDF export blocked - no columns selected");
     return res.status(400).json({ message: "No columns selected" });
   }
 
@@ -6002,9 +7275,11 @@ app.post("/api/borrowers-contacted/export-pdf", async (req, res) => {
     const data = selectedIndexes.map(i => fullData[i]);
 
     if (!data || data.length === 0) {
+      logWarn("PDF export blocked - no data after mapping");
       return res.status(400).json({ message: "No records found" });
     }
 
+    logInfo("Generating PDF document");
     const PDFDocument = require("pdfkit");
 
     const doc = new PDFDocument({
@@ -6139,10 +7414,17 @@ app.post("/api/borrowers-contacted/export-pdf", async (req, res) => {
       y += dynamicHeight;
     });
 
+    logSuccess("PDF generated successfully", {
+  rows: data.length
+});
+
     doc.end();
 
   } catch (err) {
-    console.error("PDF ERROR:", err);
+    logError("PDF EXPORT ERROR", {
+  message: err.message,
+  stack: err.stack
+});
     res.status(500).json({ message: "Failed to generate PDF" });
   }
 });
@@ -6156,20 +7438,29 @@ app.post("/api/borrowers-contacted/export-pdf", async (req, res) => {
 app.post("/api/cash-collection-report/search", async (req, res) => {
   const { user, cluster, branch, fromDate, toDate } = req.body;
 
+  logInfo("CASH COLLECTION API HIT", {
+  body: req.body
+});
+
   const userIdFromHeader = req.headers["x-user-id"];
+  logInfo("User ID received", userIdFromHeader);
 
   if (!userIdFromHeader) {
-    return res.status(401).json([]);
-  }
+  logError("Unauthorized request - missing userId");
+  return res.status(401).json([]);
+}
 
   // ✅ Block empty search
-  if (!user && !cluster && !branch && !fromDate && !toDate) {
-    return res.json([]);
-  }
+ if (!user && !cluster && !branch && !fromDate && !toDate) {
+  logWarn("Search blocked - no filters");
+  return res.json([]);
+}
 
   try {
     const pool = await poolPromise;
+    logInfo("DB connection established");
 
+    logInfo("Fetching user role from DB");
     // 🔍 Get logged-in user details
     const userCheck = await pool.request()
       .input("userId", sql.VarChar(50), userIdFromHeader)
@@ -6180,13 +7471,16 @@ app.post("/api/cash-collection-report/search", async (req, res) => {
       `);
 
     if (userCheck.recordset.length === 0) {
-      return res.status(403).json([]);
-    }
+  logError("User not found in DB", userIdFromHeader);
+  return res.status(403).json([]);
+}
 
     const loggedUser = userCheck.recordset[0];
+    logSuccess("User role fetched", loggedUser);
 
     const request = pool.request();
 
+    logInfo("Building SQL query");
     let query = `
       SELECT
         A.AssignedToUserId      AS employeeId,
@@ -6222,13 +7516,14 @@ app.post("/api/cash-collection-report/search", async (req, res) => {
 
     // 🔒 Branch Manager restriction (INSIDE WHERE)
     if (loggedUser.Role === "Branch Manager") {
+      logInfo("Applying Branch Manager restriction", loggedUser.BranchName);
       query += ` AND A.BranchName = @restrictedBranch`;
       request.input("restrictedBranch", sql.VarChar(100), loggedUser.BranchName);
     }
 	
 	// 🔒 Regional Manager restriction
 if (loggedUser.Role.startsWith("Regional Manager")) {
-
+logInfo("Applying Regional Manager restriction", loggedUser.Role);
   const match = loggedUser.Role.match(/\((.*?)\)/);
   const rmCluster = match ? match[1] : "";
 
@@ -6239,29 +7534,34 @@ if (loggedUser.Role.startsWith("Regional Manager")) {
 
     // ================= USER FILTER =================
     if (user) {
+      logInfo("Filter applied: user", user);
       query += ` AND A.AssignedToUserId = @user`;
       request.input("user", sql.VarChar(50), user);
     }
 
     // ================= CLUSTER FILTER =================
     if (cluster && cluster !== "Corporate Office") {
+      logInfo("Filter applied: cluster", cluster);
       query += ` AND A.ClusterName = @cluster`;
       request.input("cluster", sql.VarChar(100), cluster);
     }
 
     // ================= BRANCH FILTER =================
     if (branch) {
+      logInfo("Filter applied: branch", branch);
       query += ` AND A.BranchName = @branch`;
       request.input("branch", sql.VarChar(100), branch);
     }
 
     // ================= DATE FILTER =================
     if (fromDate) {
+      logInfo("Filter applied: fromDate", fromDate);
       query += ` AND CAST(L.CreatedAt AS DATE) >= @fromDate`;
       request.input("fromDate", sql.Date, fromDate);
     }
 
     if (toDate) {
+      logInfo("Filter applied: toDate", toDate);
       query += ` AND CAST(L.CreatedAt AS DATE) <= @toDate`;
       request.input("toDate", sql.Date, toDate);
     }
@@ -6278,12 +7578,35 @@ if (loggedUser.Role.startsWith("Regional Manager")) {
       ORDER BY L.CreatedAt DESC
     `;
 
+logInfo("Executing SQL query");
+
+logInfo("Final Query Filters", {
+  user,
+  cluster,
+  branch,
+  fromDate,
+  toDate,
+  role: loggedUser.Role
+});
+
     const result = await request.query(query);
+
+    logSuccess("Query executed successfully", {
+  count: result.recordset?.length || 0
+});
+
+if (!result.recordset.length) {
+  logWarn("No records found");
+}
+logSuccess("CASH COLLECTION API SUCCESS");
 
     return res.json(result.recordset);
 
   } catch (err) {
-    console.error("CASH COLLECTION REPORT ERROR:", err);
+    logError("CASH COLLECTION API ERROR", {
+  message: err.message,
+  stack: err.stack
+});
     return res.status(500).json([]);
   }
 });
@@ -6295,11 +7618,19 @@ if (loggedUser.Role.startsWith("Regional Manager")) {
 app.post("/api/cash-collection-report/export-pdf", async (req, res) => {
   const { selectedIndexes, columns, fileName, fullData } = req.body;
 
+  logInfo("CASH COLLECTION PDF EXPORT API HIT", {
+  selected: req.body.selectedIndexes?.length,
+  columns: req.body.columns?.length
+});
+logInfo("Export file name", fileName);
+
   if (!selectedIndexes || selectedIndexes.length === 0) {
+    logWarn("PDF export blocked - no records selected");
     return res.status(400).json({ message: "No records selected" });
   }
 
   if (!columns || columns.length === 0) {
+    logWarn("PDF export blocked - no columns selected");
     return res.status(400).json({ message: "No columns selected" });
   }
 
@@ -6308,9 +7639,11 @@ app.post("/api/cash-collection-report/export-pdf", async (req, res) => {
     const data = selectedIndexes.map(i => fullData[i]).filter(Boolean);
 
     if (data.length === 0) {
+      logWarn("PDF export blocked - no data after mapping");
       return res.status(400).json({ message: "No records found" });
     }
 
+logInfo("Generating PDF document");
     const PDFDocument = require("pdfkit");
 
     const doc = new PDFDocument({
@@ -6453,10 +7786,16 @@ app.post("/api/cash-collection-report/export-pdf", async (req, res) => {
       y += dynamicHeight;
     });
 
+    logSuccess("PDF generated successfully", {
+  rows: data.length
+});
     doc.end();
 
   } catch (err) {
-    console.error("❌ CASH COLLECTION PDF ERROR:", err);
+    logError("PDF EXPORT ERROR", {
+  message: err.message,
+  stack: err.stack
+});
     res.status(500).json({ message: "Failed to generate PDF" });
   }
 });
@@ -6468,32 +7807,55 @@ app.post("/api/cash-collection-report/export-pdf", async (req, res) => {
 app.post("/api/user-trips", async (req, res) => {
   const { cluster, branch, fromDate, toDate } = req.body;
 
+  logInfo("USER TRIPS API HIT", {
+  body: req.body
+});
+
 const role = req.headers["x-user-role"];
 const loggedBranch = req.headers["x-user-branch"];
 const loggedCluster = req.headers["x-user-cluster"];
 
+logInfo("User context received", {
+  role,
+  branch: loggedBranch,
+  cluster: loggedCluster
+});
+
   if (!cluster && !branch && !fromDate && !toDate) {
+    logWarn("Search blocked - no filters provided");
     return res.status(200).json([]);
   }
 
   try {
+logInfo("Starting User Trips DB process");
     const pool = await poolPromise;
+    logInfo("DB connection established");
 	let finalCluster = cluster;
 let finalBranch = branch;
 
 // 🔒 If Branch Manager → force restriction
 if (role === "Branch Manager") {
+  logInfo("Branch Manager restriction applied", {
+  loggedCluster,
+  loggedBranch
+});
   finalCluster = loggedCluster;
   finalBranch = loggedBranch;
 }
 
 // 🔒 Regional Manager restriction
 if (role?.startsWith("Regional Manager")) {
-  finalCluster = loggedCluster;
+  logInfo("Regional Manager restriction applied", role);
+
+  const match = role.match(/\((.*?)\)/);
+  const rmCluster = match ? match[1] : "";
+
+  finalCluster = rmCluster;
 }
 
     const request = pool.request();
 
+logInfo("Building SQL query");
     let query = `
       SELECT
         AA.AssignedToUserName     AS UserName,
@@ -6524,6 +7886,7 @@ if (role?.startsWith("Regional Manager")) {
 
     // ================= CLUSTER FILTER =================
     if (finalCluster && finalCluster !== "Corporate Office") {
+      logInfo("Filter applied: cluster", finalCluster);
   query += " AND AA.ClusterName = @cluster";
   request.input("cluster", sql.VarChar, finalCluster);
 }
@@ -6531,30 +7894,62 @@ if (role?.startsWith("Regional Manager")) {
 
     // ================= BRANCH FILTER =================
     if (finalBranch) {
+      logInfo("Filter applied: branch", finalBranch);
   query += " AND AA.BranchName = @branch";
   request.input("branch", sql.VarChar, finalBranch);
 }
 
     // ================= FROM DATE =================
     if (fromDate) {
+      logInfo("Filter applied: fromDate", fromDate);
       query += " AND CAST(AA.AssignedAt AS DATE) >= @fromDate";
       request.input("fromDate", sql.Date, fromDate);
     }
 
     // ================= TO DATE =================
     if (toDate) {
+      logInfo("Filter applied: toDate", toDate);
       query += " AND CAST(AA.AssignedAt AS DATE) <= @toDate";
       request.input("toDate", sql.Date, toDate);
     }
 
     query += " ORDER BY AA.AssignedAt DESC";
 
+    logInfo("Final filters applied to SQL", {
+  finalCluster,
+  finalBranch,
+  fromDate,
+  toDate
+});
+
+    logInfo("Executing SQL query", {
+  finalCluster,
+  finalBranch,
+  fromDate,
+  toDate,
+  role
+});
     const result = await request.query(query);
+
+    logSuccess("Query executed successfully", {
+  count: result.recordset?.length || 0
+});
+
+if (!result.recordset.length) {
+  logWarn("No records found");
+}
+
+logSuccess("USER TRIPS API SUCCESS", {
+  count: result.recordset?.length || 0
+});
 
     return res.status(200).json(result.recordset || []);
 
   } catch (err) {
-    console.error("❌ USER TRIPS ERROR:", err);
+    logError("USER TRIPS API ERROR", {
+  message: err.message,
+  stack: err.stack
+});
     return res.status(500).json([]);
   }
 });
@@ -6566,20 +7961,29 @@ if (role?.startsWith("Regional Manager")) {
 app.post("/api/user-trips/export-pdf", async (req, res) => {
   const { selectedIndexes, columns, fileName, fullData } = req.body;
 
+  logInfo("USER TRIPS PDF EXPORT API HIT", {
+  selected: selectedIndexes?.length,
+  columns: columns?.length
+});
+
   if (!selectedIndexes || selectedIndexes.length === 0) {
+    logWarn("PDF export blocked - no records selected");
     return res.status(400).json({ message: "No records selected" });
   }
 
   if (!columns || columns.length === 0) {
+    logWarn("PDF export blocked - no columns selected");
     return res.status(400).json({ message: "No columns selected" });
   }
 
   try {
+    logInfo("Starting PDF generation");
 
     // Preserve exact order from frontend
     const data = selectedIndexes.map(i => fullData[i]).filter(Boolean);
 
     if (data.length === 0) {
+      logWarn("PDF export blocked - no data after mapping");
       return res.status(400).json({ message: "No records found for PDF" });
     }
 
@@ -6748,10 +8152,16 @@ app.post("/api/user-trips/export-pdf", async (req, res) => {
       y += dynamicHeight;
     });
 
+    logSuccess("PDF generated successfully", {
+  rows: data.length
+});
     doc.end();
 
   } catch (err) {
-    console.error("❌ USER TRIPS PDF ERROR:", err);
+    logError("USER TRIPS PDF ERROR", {
+  message: err.message,
+  stack: err.stack
+});
     res.status(500).json({ message: "Failed to generate PDF" });
   }
 });
@@ -6765,8 +8175,13 @@ app.post("/api/user-trips/export-excel", async (req, res) => {
 
   const { selectedIndexes, columns, fileName, fullData } = req.body;
 
-  try {
+  logInfo("USER TRIPS EXCEL EXPORT API HIT", {
+  selected: selectedIndexes?.length,
+  columns: columns?.length
+});
 
+  try {
+logInfo("Starting Excel generation");
     const data = selectedIndexes.map(i => fullData[i]).filter(Boolean);
 
     const workbook = new ExcelJS.Workbook();
@@ -6834,11 +8249,17 @@ app.post("/api/user-trips/export-excel", async (req, res) => {
 
     // 🔥 IMPORTANT FIX
     await workbook.xlsx.write(res);
+    logSuccess("Excel generated successfully", {
+  rows: data.length
+});
     res.end();
 
   } catch (err) {
 
-    console.error("❌ EXCEL EXPORT ERROR:", err);
+    logError("EXCEL EXPORT ERROR", {
+  message: err.message,
+  stack: err.stack
+});
     res.status(500).send("Excel export failed");
 
   }
@@ -6852,23 +8273,45 @@ app.post("/api/user-trips/export-excel", async (req, res) => {
 app.post("/api/lead-data-report", async (req, res) => {
 
   const loggedUserId = req.headers["x-user-id"];
+  logInfo("User context received", {
+  loggedUserId
+});
 
   const { userId, cluster, branch, fromDate, toDate } = req.body;
 
+  logInfo("LEAD DATA REPORT API HIT", {
+  body: req.body
+});
+
+  logInfo("Checking filters", {
+  userId,
+  cluster,
+  branch,
+  fromDate,
+  toDate
+});
+
+
+
   if (!loggedUserId) {
+    logWarn("Unauthorized access - missing userId");
     return res.status(401).json({ message: "Unauthorized" });
   }
 
   if (!userId && !cluster && !branch && !fromDate && !toDate) {
+    logWarn("Search blocked - no filters provided");
     return res.json([]);
   }
 
-  try {
+ try {
+  logInfo("Starting Lead Data DB process");
 
-    const pool = await poolPromise;
+  const pool = await poolPromise;
+  logInfo("DB connection established");
     const request = pool.request();
 
     // ================= GET LOGGED USER ROLE =================
+    logInfo("Fetching logged user role", loggedUserId);
     const userInfo = await pool.request()
       .input("userId", sql.VarChar, loggedUserId)
       .query(`
@@ -6878,15 +8321,27 @@ app.post("/api/lead-data-report", async (req, res) => {
       `);
 
     if (!userInfo.recordset.length) {
+      logWarn("User not found in UsersInfo table", loggedUserId);
       return res.status(403).json({ message: "User not found" });
     }
 
     const { Role, BranchName: userBranch } = userInfo.recordset[0];
 
+    logInfo("User role fetched", {
+  Role,
+  userBranch
+});
+
     const isBranchManager = Role === "Branch Manager";
 	const isRegionalManager = Role?.startsWith("Regional Manager");
 
+  logInfo("Role flags", {
+  isBranchManager,
+  isRegionalManager
+});
+
     // ================= MAIN QUERY =================
+    logInfo("Building SQL query");
     let query = `
 
 SELECT
@@ -6942,13 +8397,14 @@ WHERE 1 = 1
 
    // 🔒 Branch Manager restriction
 if (isBranchManager) {
+  logInfo("Branch Manager restriction applied", userBranch);
   query += ` AND L.BranchName = @restrictedBranch `;
   request.input("restrictedBranch", sql.VarChar, userBranch);
 }
 
 // 🔒 Regional Manager restriction
 if (isRegionalManager) {
-
+logInfo("Regional Manager restriction applied", Role);
   query += `
   AND L.BranchName IN (
     SELECT branch_name
@@ -6965,6 +8421,7 @@ if (isRegionalManager) {
 
      // ================= USER FILTER =================
 if (userId) {
+  logInfo("Filter applied: userId", userId);
   query += `
     AND (
       LA.LeadAssignedToUserId = @userId
@@ -6976,6 +8433,7 @@ if (userId) {
 
     // ================= CLUSTER FILTER =================
     if (cluster && cluster !== "Corporate Office") {
+      logInfo("Filter applied: cluster", cluster);
       query += `
       AND L.BranchName IN (
         SELECT branch_name
@@ -6988,30 +8446,56 @@ if (userId) {
 
     // ================= BRANCH FILTER =================
     if (branch) {
+      logInfo("Filter applied: branch", branch);
       query += ` AND L.BranchName = @branch `;
       request.input("branch", sql.VarChar, branch);
     }
 
     // ================= DATE FILTER =================
     if (fromDate) {
+      logInfo("Filter applied: fromDate", fromDate);
       query += ` AND CAST(L.TimeStamp AS DATE) >= @fromDate `;
       request.input("fromDate", sql.Date, fromDate);
     }
 
     if (toDate) {
+      logInfo("Filter applied: toDate", toDate);
       query += ` AND CAST(L.TimeStamp AS DATE) <= @toDate `;
       request.input("toDate", sql.Date, toDate);
     }
 
     query += ` ORDER BY L.TimeStamp DESC`;
 
+logInfo("Executing SQL query", {
+  userId,
+  cluster,
+  branch,
+  fromDate,
+  toDate,
+  Role
+});
     const result = await request.query(query);
 
-    res.json(result.recordset || []);
+    logSuccess("Query executed successfully", {
+  count: result.recordset?.length || 0
+});
+
+if (!result.recordset.length) {
+  logWarn("No records found");
+}
+
+    logSuccess("LEAD DATA REPORT API SUCCESS", {
+  count: result.recordset?.length || 0
+});
+
+res.json(result.recordset || []);
 
   } catch (err) {
 
-    console.error("❌ LEAD DATA REPORT ERROR:", err);
+    logError("LEAD DATA REPORT ERROR", {
+  message: err.message,
+  stack: err.stack
+});
     res.status(500).json([]);
 
   }
@@ -7025,6 +8509,11 @@ if (userId) {
 app.post("/api/lead-data-report/export-pdf", async (req, res) => {
   const { selectedIndexes, columns, fileName, fullData } = req.body;
 
+  logInfo("LEAD DATA PDF EXPORT API HIT", {
+  selected: selectedIndexes?.length,
+  columns: columns?.length
+});
+
   if (!selectedIndexes || selectedIndexes.length === 0) {
     return res.status(400).json({ message: "No records selected" });
   }
@@ -7034,11 +8523,12 @@ app.post("/api/lead-data-report/export-pdf", async (req, res) => {
   }
 
   try {
-
+logInfo("Starting PDF generation");
     // Preserve exact order from frontend
     const data = selectedIndexes.map(i => fullData[i]).filter(Boolean);
 
     if (data.length === 0) {
+      logWarn("PDF export blocked - no data after mapping");
       return res.status(400).json({ message: "No records found" });
     }
 
@@ -7198,10 +8688,16 @@ const COLUMN_LABELS = {
       y += dynamicHeight;
     });
 
+    logSuccess("PDF generated successfully", {
+  rows: data.length
+});
     doc.end();
 
   } catch (err) {
-    console.error("❌ LEAD DATA PDF ERROR:", err);
+    logError("LEAD DATA PDF ERROR", {
+  message: err.message,
+  stack: err.stack
+});
     res.status(500).json({ message: "Failed to generate PDF" });
   }
 });
@@ -7215,6 +8711,11 @@ app.post("/api/lead-data-report/export-excel", async (req, res) => {
 
   const { selectedIndexes, columns, fileName, fullData } = req.body;
 
+  logInfo("LEAD DATA EXCEL EXPORT API HIT", {
+  selected: selectedIndexes?.length,
+  columns: columns?.length
+});
+
   if (!selectedIndexes || selectedIndexes.length === 0) {
     return res.status(400).json({ message: "No records selected" });
   }
@@ -7224,7 +8725,7 @@ app.post("/api/lead-data-report/export-excel", async (req, res) => {
   }
 
   try {
-
+logInfo("Starting Excel generation");
     const data = selectedIndexes.map(i => fullData[i]).filter(Boolean);
 
     const workbook = new ExcelJS.Workbook();
@@ -7288,12 +8789,18 @@ app.post("/api/lead-data-report/export-excel", async (req, res) => {
       `attachment; filename="${safeName}.xlsx"`
     );
 
+    logSuccess("Excel generated successfully", {
+  rows: data.length
+});
     await workbook.xlsx.write(res);
     res.end();
 
   } catch (err) {
 
-    console.error("❌ LEAD DATA EXCEL ERROR:", err);
+    logError("EXCEL EXPORT ERROR", {
+  message: err.message,
+  stack: err.stack
+});
     res.status(500).json({ message: "Excel export failed" });
 
   }
@@ -7320,22 +8827,32 @@ const ALLOWED_LEAD_CATEGORIES = ["Known Lead", "Unknown Lead"];
 const ALLOWED_LEAD_TYPES = ["Hot Lead", "Warm Lead", "Cold Lead"];
 
 app.post("/api/leads/upload", async (req, res) => {
+
+  const startTime = Date.now();
+  logInfo("Leads upload API triggered");
 	
 	const userId = req.headers["x-user-id"];
+logInfo("User ID received", userId);
 
 if (!userId) {
+  logWarn("Unauthorized access - No userId");
   return res.status(401).json({ message: "Unauthorized" });
 }
 
   const leads = req.body;
+  logInfo("Leads received", { count: leads?.length });
 
   if (!Array.isArray(leads) || leads.length === 0) {
-    return res.status(400).json({ message: "No data received" });
-  }
+  logWarn("No data received in request");
+  return res.status(400).json({ message: "No data received" });
+}
 
   const pool = await poolPromise;
+  logSuccess("Database connection established");
   
-  const userInfo = await pool.request()
+  logInfo("User role query executed");
+
+const userInfo = await pool.request()
   .input("userId", sql.VarChar, userId)
   .query(`
     SELECT Role
@@ -7344,15 +8861,18 @@ if (!userId) {
   `);
 
 if (!userInfo.recordset.length) {
+  logWarn("User not found in DB", userId);
   return res.status(403).json({ message: "User not found" });
 }
 
 const { Role } = userInfo.recordset[0];
+logInfo("User role fetched", Role);
 
 const isAdmin =
   Role === "Admin" || Role === "Super Admin";
 
 if (!isAdmin) {
+  logWarn("Unauthorized role trying to upload", Role);
   return res.status(403).json({
     message: "Only Admin can upload leads"
   });
@@ -7363,54 +8883,69 @@ if (!isAdmin) {
   try {
 
     await transaction.begin();
+    logInfo("Transaction started");
 	
     // =============================
     // STEP 2 — INSERT NEW DATA
     // =============================
     for (const lead of leads) {
 
+  logInfo("Processing lead", {
+    mobile: lead.MobileNumber,
+    branch: lead.BranchCode
+  });
+
       const leadCategory = normalizeText(lead.LeadCategory);
       const leadType = normalizeText(lead.SelectLeadType);
-      const userId = normalizeText(lead.UserID || lead.UserId);
+      const leadUserId = normalizeText(lead.UserID || lead.UserId);
       const branchCode = normalizeText(lead.BranchCode);
 	  const mobileNumber = normalizeText(lead.MobileNumber);
 
       if (!ALLOWED_LEAD_CATEGORIES.includes(leadCategory)) {
-        throw new Error(`Invalid LeadCategory`);
-      }
+  logError("Invalid LeadCategory", leadCategory);
+  throw new Error(`Invalid LeadCategory`);
+}
 
       if (!ALLOWED_LEAD_TYPES.includes(leadType)) {
+        logError("Invalid LeadType", leadType);
         throw new Error(`Invalid SelectLeadType`);
       }
 
-      if (!userId) {
-        throw new Error(`UserID missing in upload file`);
-      }
+      if (!leadUserId) {
+  logError("Invalid userId", leadUserId);
+  throw new Error(`UserID missing in upload file`);
+}
 
       if (!branchCode) {
+        logError("Invalid branchCode", branchCode);
         throw new Error(`BranchCode missing in upload file`);
       }
 	  
-	  if (!mobileNumber) {                     
+	  if (!mobileNumber) {    
+      logError("Invalid mobileNumber", mobileNumber);                 
   throw new Error(`MobileNumber missing in upload file`);
 }
 
       // ==================================
       // FETCH CLUSTER FROM BRANCH MASTER
       // ==================================
-      const clusterResult = await new sql.Request(transaction)
-        .input("BranchCode", sql.VarChar, branchCode)
-        .query(`
-          SELECT TOP 1 cluster_name
-          FROM smart_call.dbo.Branch_Cluster_Master
-          WHERE branch_code = @BranchCode
-        `);
+      logInfo("Cluster query executed", branchCode);
+
+const clusterResult = await new sql.Request(transaction)
+  .input("BranchCode", sql.VarChar, branchCode)
+  .query(`
+    SELECT TOP 1 cluster_name
+    FROM smart_call.dbo.Branch_Cluster_Master
+    WHERE branch_code = @BranchCode
+  `);
 
       if (!clusterResult.recordset.length) {
+  logError("Cluster not found", branchCode);
         throw new Error(`Cluster not found for BranchCode: ${branchCode}`);
       }
 
       const clusterName = clusterResult.recordset[0].cluster_name;
+logSuccess("Cluster fetched", clusterName);
 
       // =============================
       // CREATE SQL REQUEST
@@ -7419,7 +8954,7 @@ if (!isAdmin) {
 
       request.input("BranchCode", sql.VarChar, branchCode);
       request.input("BranchName", sql.VarChar, normalizeText(lead.BranchName));
-      request.input("UserID", sql.VarChar, userId);
+      request.input("UserID", sql.VarChar, leadUserId);
       request.input("UserName", sql.VarChar, normalizeText(lead.UserName));
       request.input("LeadCategory", sql.VarChar, leadCategory);
       request.input("FullName", sql.VarChar, normalizeText(lead.FullName || lead.FirstName));
@@ -7435,6 +8970,7 @@ if (!isAdmin) {
       // =============================
 // UPSERT INTO MAIN TABLE
 // =============================
+logInfo("Upsert operation started", mobileNumber);
 await request.query(`
 
 IF EXISTS (
@@ -7507,10 +9043,12 @@ BEGIN
 END
 
 `);
+logSuccess("Upsert completed", mobileNumber);
 
       // =============================
       // INSERT INTO HISTORY TABLE
       // =============================
+      logInfo("Inserting into history table", mobileNumber);
       await request.query(`
         INSERT INTO dbo.Leads_Data_History (
           BranchCode,
@@ -7549,30 +9087,38 @@ END
           @ClusterName
         )
       `);
+      logSuccess("History inserted", mobileNumber);
 
     }
 
     await transaction.commit();
+logSuccess("Transaction committed successfully");
 
-    res.json({
-      message: "Leads uploaded successfully",
-      count: leads.length
-    });
+logSuccess("Leads upload completed", { count: leads.length });
+logSuccess("API execution time (ms)", Date.now() - startTime);
+
+res.json({
+  message: "Leads uploaded successfully",
+  count: leads.length
+});
 
   } catch (err) {
 
-    await transaction.rollback();
+  await transaction.rollback();
+  logWarn("Transaction rolled back");
 
-    console.error("LEADS UPLOAD ERROR:", err.message);
+  logError("Leads upload error", err);
+  logError("API failed in ms", Date.now() - startTime);
 
-    res.status(500).json({
-      message: "Upload failed",
-      error: err.message
-    });
+  res.status(500).json({
+    message: "Upload failed",
+    error: err.message
+  });
 
-  }
+}
 
 });
+
 
 
 // =============================
@@ -7580,6 +9126,7 @@ END
 // =============================
 
 app.post("/api/lead/list/search", async (req, res) => {
+  logInfo("API HIT: POST /api/lead/list/search", req.body);
   try {
     const {
   memberName,
@@ -7594,14 +9141,15 @@ app.post("/api/lead/list/search", async (req, res) => {
 	
 	// 🔐 Get logged-in user
 const loggedUserId = req.headers["x-user-id"];
-
 if (!loggedUserId) {
+  logWarn("Unauthorized access - No userId");
   return res.status(401).json([]);
 }
 
     const pool = await poolPromise;
     const request = pool.request();
 	
+    logInfo("Fetching logged user info", loggedUserId);
 	// 🔐 Get role and branch of logged user
 const userInfo = await pool.request()
   .input("userId", sql.VarChar, loggedUserId)
@@ -7611,9 +9159,11 @@ const userInfo = await pool.request()
     WHERE UserId = @userId
   `);
 
-if (!userInfo.recordset.length) {
+  if (!userInfo.recordset.length) {
+  logWarn("User not found in DB", loggedUserId);
   return res.status(403).json([]);
 }
+logSuccess("Logged user info fetched", userInfo.recordset?.[0] || {});
 
 const { Role, BranchName: userBranch, ClusterName: userCluster } = userInfo.recordset[0];
 const isBranchManager = Role === "Branch Manager";
@@ -7761,19 +9311,23 @@ if (assignedTo) {
   sqlQuery += " AND LA.LeadSNo IS NULL";
 
 }
-
     // ✅ IMPORTANT: If no filter applied → return empty
     if (!filterApplied) {
+      logWarn("Search attempted without filters");
       return res.json([]);
     }
 	
     sqlQuery += " ORDER BY L.TimeStamp DESC";
 
+    logInfo("Executing Lead Search Query", {
+  filters: req.body,
+});
     const result = await request.query(sqlQuery);
+    logSuccess("Lead list fetched", { count: result.recordset.length });
     res.json(result.recordset);
 
   } catch (err) {
-    console.error("Lead List Search Error:", err);
+    logError("Lead List Search Failed", err);
     res.status(500).json([]);
   }
 });
@@ -7782,12 +9336,13 @@ if (assignedTo) {
 // LEAD DETAILS
 // =============================
 app.get("/api/lead/details/:sno", async (req, res) => {
+  logInfo("API HIT: GET /api/lead/details", req.params.sno);
   try {
 
     const { sno } = req.params;
 
     const pool = await poolPromise;
-
+logInfo("Fetching lead details", sno);
     const result = await pool.request()
       .input("sno", sql.Int, sno)
       .query(`
@@ -7803,13 +9358,15 @@ app.get("/api/lead/details/:sno", async (req, res) => {
       `);
 
     if (!result.recordset.length) {
+      logWarn("Lead details not found", sno);
       return res.json({});
     }
 
+    logSuccess("Lead details fetched", result.recordset[0]);
     res.json(result.recordset[0]);
 
   } catch (err) {
-    console.error("Lead Details Error:", err);
+    logError("Lead Details API Failed", err);
     res.status(500).json({});
   }
 });
@@ -7820,6 +9377,7 @@ app.get("/api/lead/details/:sno", async (req, res) => {
 // =====================================
 
 app.post("/api/lead/assign", async (req, res) => {
+  logInfo("API HIT: POST /api/lead/assign", req.body);
 
   try {
 
@@ -7827,16 +9385,20 @@ app.post("/api/lead/assign", async (req, res) => {
     const adminUserId = req.headers["x-user-id"];
 
     if (!adminUserId) {
+logWarn("Unauthorized assign attempt");
       return res.status(401).json({ message: "Unauthorized" });
     }
 
+    
     if (!mobileNumbers || mobileNumbers.length === 0) {
+      logWarn("Assign attempted with no leads selected");
       return res.json({ message: "No leads selected" });
     }
 
     // ✅ CONNECT FIRST
    const pool = await poolPromise;
 
+   logInfo("Fetching admin info", adminUserId);
     // 🔐 Get admin role and branch
     const adminInfoFull = await pool.request()
       .input("userId", sql.VarChar, adminUserId)
@@ -7845,10 +9407,12 @@ app.post("/api/lead/assign", async (req, res) => {
         FROM smart_call.dbo.UsersInfo
         WHERE UserId = @userId
       `);
-
+      
     if (!adminInfoFull.recordset.length) {
+      logWarn("Admin not found", adminUserId);
       return res.status(403).json({ message: "User not found" });
     }
+    logSuccess("Admin info fetched", adminInfoFull.recordset?.[0] || {});
 
     const { Role, BranchName: adminBranch } = adminInfoFull.recordset[0];
     const isBranchManager = Role === "Branch Manager";
@@ -7864,6 +9428,7 @@ app.post("/api/lead/assign", async (req, res) => {
 
     const adminName = adminInfo.recordset[0].UserName;
 
+    logInfo("Fetching assigned user info", assignedUserId);
     // Get Assigned User Info
     const userInfo = await pool.request()
       .input("userId", sql.VarChar, assignedUserId)
@@ -7874,14 +9439,17 @@ app.post("/api/lead/assign", async (req, res) => {
       `);
 
     if (!userInfo.recordset.length) {
+      logWarn("Assigned user not found", assignedUserId);
       return res.json({ message: "Assigned user not found" });
     }
 
     const assignedUser = userInfo.recordset[0];
+    logSuccess("Assigned user fetched", assignedUser || {});
 
     let assignedCount = 0;
 
     for (const mobile of mobileNumbers) {
+      logInfo("Processing lead", mobile);
 
       let leadQuery = `
       SELECT TOP 1
@@ -7905,7 +9473,10 @@ app.post("/api/lead/assign", async (req, res) => {
 
       const leadData = await leadRequest.query(leadQuery);
 
-      if (!leadData.recordset.length) continue;
+      if (!leadData.recordset.length) {
+  logWarn("Lead not found", mobile);
+  continue;
+}
 
       const lead = leadData.recordset[0];
 	  
@@ -7924,13 +9495,9 @@ const activityCheck = await pool.request()
   `);
 
 if (activityCheck.recordset.length > 0) {
+  logWarn("Lead skipped (already completed)", lead.SNo);
   continue; // skip this lead
 }
-
-      if (!lead || !lead.SNo) {
-        console.log("Lead not found for mobile:", mobile);
-        continue;
-      }
 
       await pool.request()
         .input("LeadSNo", sql.Int, lead.SNo)
@@ -7985,15 +9552,20 @@ if (activityCheck.recordset.length > 0) {
         `);
 
       assignedCount++;
+      logSuccess("Lead assigned", {
+  leadSNo: lead.SNo,
+  assignedTo: assignedUser.UserId
+});
 
     }
 
+    logSuccess("Assignment completed", { assignedCount });
     res.json({
       message: `${assignedCount} lead(s) assigned successfully`
     });
 
   } catch (err) {
-    console.error("Lead Assign Error:", err);
+    logError("Lead Assign Failed", err);
     res.status(500).json({ message: "Assignment failed" });
   }
 
@@ -8004,9 +9576,13 @@ if (activityCheck.recordset.length > 0) {
 // ============================================================
 app.post("/api/leads-data/search", async (req, res) => {
 
+  logInfo("API HIT: POST /api/leads-data/search", req.body);
+const startTime = Date.now();
+
   const userId = req.headers["x-user-id"];
 
   if (!userId) {
+    logWarn("Unauthorized access - No userId");
     return res.status(401).json({ message: "Unauthorized" });
   }
 
@@ -8038,8 +9614,11 @@ app.post("/api/leads-data/search", async (req, res) => {
       `);
 
     if (!userInfo.recordset.length) {
-      return res.status(403).json({ message: "User not found" });
-    }
+  logWarn("User not found in DB", userId);   // ✅ ADD THIS LINE
+  return res.status(403).json({ message: "User not found" });
+}
+
+logSuccess("User info fetched", userInfo.recordset?.[0] || {});
 
     const { Role, BranchName: userBranch, ClusterName: userCluster } = userInfo.recordset[0];
 
@@ -8296,7 +9875,28 @@ LD.ClusterName
 ORDER BY MAX(AL.CreatedAt) DESC
 `;
 
+logInfo("Executing leads activity search query", {
+  filters: req.body
+});
+
+logInfo("Final query params", {
+  filters: req.body,
+  role: Role,
+  branch: userBranch,
+  cluster: userCluster
+});
+
+logInfo("Query execution started");
     const result = await request.query(query);
+
+    if (result.recordset.length === 0) {
+  logWarn("No records found for filters", req.body);
+}
+
+    logSuccess("Leads activity data fetched", {
+  count: result.recordset.length,
+  timeTaken: `${Date.now() - startTime}ms`
+});
 
     res.json(result.recordset);
 
@@ -8304,7 +9904,11 @@ ORDER BY MAX(AL.CreatedAt) DESC
 
   catch (err) {
 
-    console.error("❌ LEAD ACTIVITY STATUS ERROR:", err);
+    logError("Leads Activity Search Failed", {
+  error: err.message,
+  stack: err.stack,
+  userId
+});
     res.status(500).json([]);
 
   }
@@ -8317,9 +9921,13 @@ ORDER BY MAX(AL.CreatedAt) DESC
 
 app.post("/api/lead-activity-details", async (req, res) => {
 
+  logInfo("API HIT: POST /api/lead-activity-details", req.body);
+const startTime = Date.now();
+
   const userId = req.headers["x-user-id"];
 
   if (!userId) {
+    logWarn("Unauthorized access - No userId");
     return res.status(401).json([]);
   }
 
@@ -8328,6 +9936,7 @@ app.post("/api/lead-activity-details", async (req, res) => {
     const leadSNo = req.body.leadSNo ? String(req.body.leadSNo) : "";
 
     if (!leadSNo) {
+      logWarn("Lead activity details called without leadSNo");
       return res.json([]);
     }
 
@@ -8343,8 +9952,10 @@ app.post("/api/lead-activity-details", async (req, res) => {
       `);
 
     if (!userInfo.recordset.length) {
+      logWarn("User not found in DB", userId);
       return res.status(403).json([]);
     }
+    logSuccess("User info fetched", userInfo.recordset?.[0] || {});
 
     const { Role, BranchName: userBranch, ClusterName: userCluster } = userInfo.recordset[0];
 
@@ -8419,13 +10030,20 @@ if (isRegionalManager) {
         ORDER BY MAX(AL.CreatedAt) DESC
     `;
 
+logInfo("Executing activity details query", { leadSNo });
+
     const result = await request.query(query);
+
+  logSuccess("Activity details fetched", {
+  count: result.recordset.length,
+  timeTaken: `${Date.now() - startTime}ms`
+});
 
     res.json(result.recordset);
 
   } catch (err) {
 
-    console.error("❌ ACTIVITY DETAILS ERROR:", err);
+    logError("Activity Details API Failed", err);
     res.status(500).json([]);
 
   }
@@ -8437,10 +10055,15 @@ if (isRegionalManager) {
 // ============================================================
 app.post("/api/leads/reactivate", async (req, res) => {
 
+  logInfo("API HIT: POST /api/leads/reactivate", req.body);
+  const startTime = Date.now();
+
   const userId = req.headers["x-user-id"];
   const { leadIds } = req.body;
 
+  // 🔐 Validation
   if (!userId || !leadIds || leadIds.length === 0) {
+    logWarn("Invalid reactivate request", { userId, leadIds });
     return res.status(400).json({ message: "Invalid request" });
   }
 
@@ -8451,17 +10074,31 @@ app.post("/api/leads/reactivate", async (req, res) => {
     // ✅ Get username
     const userInfo = await pool.request()
       .input("userId", sql.VarChar, userId)
-      .query(`SELECT UserName FROM UsersInfo WHERE UserId = @userId`);
+      .query(`
+        SELECT UserName 
+        FROM UsersInfo 
+        WHERE UserId = @userId
+      `);
 
     const userName = userInfo.recordset[0]?.UserName || "System";
 
+    logSuccess("User fetched for reactivation", {
+      userId,
+      userName
+    });
+
+    // 🔁 Loop through leads
     for (const leadId of leadIds) {
 
-      await pool.request()
-        .input("leadId", sql.BigInt, leadId)
-        .input("userId", sql.VarChar, userId)
-        .input("userName", sql.VarChar, userName)
-        .query(`
+      try {
+
+        logInfo("Reactivating lead", leadId);
+
+        await pool.request()
+          .input("leadId", sql.BigInt, leadId)
+          .input("userId", sql.VarChar, userId)
+          .input("userName", sql.VarChar, userName)
+          .query(`
 
 INSERT INTO smart_call.dbo.Activity_Logs
 (
@@ -8479,8 +10116,8 @@ INSERT INTO smart_call.dbo.Activity_Logs
 )
 
 SELECT
-  AL.SessionId,                 -- ✅ SAME SESSION
-  AL.LogId,                     -- ✅ LINK TO PREVIOUS LOG
+  AL.SessionId,
+  AL.LogId,
 
   'LEAD_REACTIVATED',
   'Lead Reactivated',
@@ -8505,18 +10142,52 @@ FROM (
   ORDER BY LogId DESC
 ) AL
 
-        `);
+          `);
+
+        logSuccess("Lead reactivated", leadId);
+
+      } catch (err) {
+
+        logError("Lead reactivation failed", {
+          leadId,
+          error: err.message
+        });
+
+      }
+
     }
 
-    res.json({ message: "Leads reactivated successfully" });
+    // ✅ Final success log
+    logSuccess("Reactivation completed", {
+      total: leadIds.length,
+      timeTaken: `${Date.now() - startTime}ms`
+    });
+
+    res.json({
+      message: "Leads reactivated successfully"
+    });
 
   } catch (err) {
-    console.error("❌ REACTIVATE ERROR:", err);
-    res.status(500).json({ message: "Reactivation failed" });
+
+    logError("Lead Reactivation Failed", {
+      error: err.message,
+      stack: err.stack,
+      userId
+    });
+
+    res.status(500).json({
+      message: "Reactivation failed"
+    });
+
   }
 
 });
 
+
+
+// ======================================================================
+// SMA REPORT UPLOAD (STORE VALUES EXACTLY AS IN EXCEL)
+// ======================================================================
 
 function convertExcelDate(value) {
 
@@ -8538,9 +10209,6 @@ function convertExcelDate(value) {
   return value;
 }
 
-// ======================================================================
-// SMA REPORT UPLOAD (STORE VALUES EXACTLY AS IN EXCEL)
-// ======================================================================
 
 const multer = require("multer");
 const XLSX = require("xlsx");
@@ -8564,10 +10232,13 @@ function safeString(value, maxLength = 255) {
 }
 
 app.post("/api/sma/upload", upload.single("file"), async (req, res) => {
+  logInfo("SMA Upload API called");
 	
 	const userId = req.headers["x-user-id"];
+  logInfo("User ID received", userId);
 
   if (!userId) {
+  logWarn("Unauthorized request - No userId");
     return res.status(401).json({ message: "Unauthorized" });
   }
   
@@ -8583,24 +10254,40 @@ app.post("/api/sma/upload", upload.single("file"), async (req, res) => {
     `);
 
   if (!userInfo.recordset.length) {
-    return res.status(403).json({ message: "User not found" });
-  }
+  logWarn("User not found in DB");
+  return res.status(403).json({ message: "User not found" });
+}
+  logInfo("User info fetched");
 
   const { Role } = userInfo.recordset[0];
+  logInfo("User role", Role);
 
   const isAdmin =
     Role === "Admin" || Role === "Super Admin";
 
+    if (isAdmin) {
+  logSuccess("Authorized user for upload");
+}
+
   if (!isAdmin) {
+  logWarn("Unauthorized upload attempt", Role);
     return res.status(403).json({
       message: "Only Admin can upload SMA file"
     });
   }
 
   try {
+    logInfo("File processing started");
+
+    if (!req.file) {
+  logWarn("No file uploaded");
+  return res.status(400).json({ message: "No file uploaded" });
+}
 
     const fileBuffer = req.file.buffer;
+    logInfo("File buffer received");
     const extension = path.extname(req.file.originalname).toLowerCase();
+    logInfo("File extension detected", extension);
 
     let rows = [];
 
@@ -8608,21 +10295,27 @@ app.post("/api/sma/upload", upload.single("file"), async (req, res) => {
 // ================= READ EXCEL =================
 
     if (extension === ".xlsx" || extension === ".xls") {
+      logInfo("Processing Excel file");
 
       const workbook = XLSX.read(fileBuffer, { type: "buffer" });
+      logSuccess("Excel workbook read");
 
       const sheetName = workbook.SheetNames[0];
       const sheet = workbook.Sheets[sheetName];
 
       rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+      logSuccess("Excel converted to JSON", { count: rows.length });
 
       rows = rows.filter(r => r["Account Name"] && r["Account No."]);
+logInfo("Filtered valid Excel rows", { count: rows.length });
     }
 
 
 // ================= READ CSV =================
 
+
     else if (extension === ".csv") {
+      logInfo("Processing CSV file");
 
       const csvText = fileBuffer.toString("utf8");
 
@@ -8642,21 +10335,21 @@ app.post("/api/sma/upload", upload.single("file"), async (req, res) => {
 
         return obj;
       });
+      logSuccess("CSV parsed to JSON", { count: rows.length });
 
       rows = rows.filter(r => r["Account Name"] && r["Account No."]);
+      logInfo("Filtered valid CSV rows", { count: rows.length });
     }
 
     else {
-      return res.status(400).json({ message: "Invalid file format" });
+      logWarn("Invalid file format uploaded");
+return res.status(400).json({ message: "Invalid file format" });
     }
 
-
-    const pool = await poolPromise;
-
-
 // ================= CLEAR OLD DATA =================
-
+logWarn("Deleting old SMA data");
     await pool.request().query(`DELETE FROM dbo.SMA_Report`);
+    logSuccess("Old SMA data cleared");
 
 
 // ================= CREATE BULK TABLE =================
@@ -8705,6 +10398,7 @@ app.post("/api/sma/upload", upload.single("file"), async (req, res) => {
 
 // ================= ADD ROWS =================
 
+logInfo("Preparing bulk insert", { totalRows: rows.length });
     rows.forEach((row, index) => {
 
       table.rows.add(
@@ -8752,11 +10446,11 @@ app.post("/api/sma/upload", upload.single("file"), async (req, res) => {
     });
 
 
-// ================= BULK INSERT =================
-
     // ================= BULK INSERT =================
+    logInfo("Starting bulk insert");
 
 await pool.request().bulk(table);
+logSuccess("Bulk insert completed");
 
 
 // ============================================================
@@ -8770,6 +10464,7 @@ const todayCount = rows.length;
 // STEP 2 — Insert Upload Log
 // ============================================================
 
+logInfo("Saving upload log");
 await pool.request()
   .input("cnt", sql.Int, todayCount)
   .query(`
@@ -8778,12 +10473,14 @@ await pool.request()
     VALUES
     (CAST(GETDATE() AS DATE), @cnt, GETDATE())
   `);
+  logSuccess("Upload log saved");
 
 
 // ============================================================
 // STEP 3 — Get LAST upload BEFORE today (NOT today)
 // ============================================================
 
+logInfo("Fetching previous upload data");
 const prevRes = await pool.request().query(`
   SELECT TOP 1 record_count
   FROM SMA_Upload_Log
@@ -8795,6 +10492,8 @@ const previousCount =
   prevRes.recordset.length
     ? prevRes.recordset[0].record_count
     : 0;
+
+logInfo("Previous count", previousCount);
 
 
 // ============================================================
@@ -8816,6 +10515,11 @@ const newRecords =
 // FINAL RESPONSE
 // ============================================================
 
+logSuccess("Upload completed", {
+  total: todayCount,
+  newRecords,
+  archived
+});
 res.json({
   message: `${rows.length} records uploaded successfully`,
   archived,
@@ -8827,7 +10531,7 @@ res.json({
 
   catch (error) {
 
-    console.error("SMA Upload Error:", error);
+    logError("SMA Upload Error", error);
 
     res.status(500).json({
       message: "Upload failed"
@@ -8842,8 +10546,10 @@ res.json({
 // ============================================================
 
 app.get("/api/sma/upload-status", async (req, res) => {
+  logInfo("SMA Status API called");
 	
   const userId = req.headers["x-user-id"];
+  logInfo("User ID received", userId);
 
   if (!userId) {
     return res.status(401).json({ message: "Unauthorized" });
@@ -8860,12 +10566,15 @@ app.get("/api/sma/upload-status", async (req, res) => {
     `);
 
   if (!userInfo.recordset.length) {
+  logWarn("User not found in DB");
     return res.status(403).json({ message: "User not found" });
   }
 
   const { Role } = userInfo.recordset[0];
+  logInfo("User role", Role);
 
   if (Role !== "Admin" && Role !== "Super Admin") {
+    logWarn("Unauthorized status access", Role);
     return res.status(403).json({
       message: "Only Admin can view upload status"
     });
@@ -8918,6 +10627,12 @@ app.get("/api/sma/upload-status", async (req, res) => {
     // ============================================================
     // 🔹 RESPONSE
     // ============================================================
+logSuccess("Status response sent", {
+  archived,
+  uploaded,
+  history_total: today
+});
+
     res.json({
       archived,
       uploaded,
@@ -8926,7 +10641,7 @@ app.get("/api/sma/upload-status", async (req, res) => {
 
   } catch (err) {
 
-    console.error("SMA STATUS ERROR:", err);
+    logError("SMA STATUS ERROR", err);
 
     res.status(500).json({
       message: "Internal Server Error"
@@ -8954,9 +10669,12 @@ const CLUSTER_MAP = {
 // ============================================================
 app.get("/api/sma/filters", async (req, res) => {
 
+  logInfo("SMA Filters API called");
+
   try {
 
     const pool = await sql.connect(dbConfig);
+logSuccess("DB connected for filters");
 
     const clusters = await pool.request().query(`
       SELECT DISTINCT [Cluster Code] as cluster
@@ -8964,6 +10682,7 @@ app.get("/api/sma/filters", async (req, res) => {
       WHERE [Cluster Code] IS NOT NULL
 	  ORDER BY [Cluster Code]
     `);
+    logInfo("Clusters fetched", clusters.recordset.length);
 
     const branches = await pool.request().query(`
       SELECT DISTINCT [Branch Name] as branch
@@ -8971,6 +10690,7 @@ app.get("/api/sma/filters", async (req, res) => {
       WHERE [Branch Name] IS NOT NULL
 	  ORDER BY [Branch Name]
     `);
+    logInfo("Branches fetched", branches.recordset.length);
 
     const products = await pool.request().query(`
       SELECT DISTINCT [Account Type Description] as product
@@ -8978,6 +10698,7 @@ app.get("/api/sma/filters", async (req, res) => {
       WHERE [Account Type Description] IS NOT NULL
 	  ORDER BY [Account Type Description]
     `);
+    logInfo("Products fetched", products.recordset.length);
 
     const productGroup = await pool.request().query(`
       SELECT DISTINCT [Product Group] as productGroup
@@ -8985,6 +10706,7 @@ app.get("/api/sma/filters", async (req, res) => {
       WHERE [Product Group] IS NOT NULL
 	  ORDER BY [Product Group]
     `);
+    logInfo("Product Groups fetched", productGroup.recordset.length);
 
     const loanType = await pool.request().query(`
       SELECT DISTINCT [Loan Type] as loanType
@@ -8992,6 +10714,7 @@ app.get("/api/sma/filters", async (req, res) => {
       WHERE [Loan Type] IS NOT NULL
 	  ORDER BY [Loan Type]
     `);
+    logInfo("Loan Types fetched", loanType.recordset.length);
 
     const newIrac = [
   { newIrac: "00" },
@@ -9010,6 +10733,7 @@ app.get("/api/sma/filters", async (req, res) => {
       name: CLUSTER_MAP[c.cluster] || c.cluster
     }));
 
+    logSuccess("Filters response sent");
     res.json({
       clusters: clusterData,
       branches: branches.recordset,
@@ -9021,7 +10745,7 @@ app.get("/api/sma/filters", async (req, res) => {
 
   } catch (err) {
 
-    console.error("SMA filters error:", err);
+    logError("SMA filters error", err);
     res.status(500).json({ message: "Server error" });
 
   }
@@ -9033,10 +10757,13 @@ app.get("/api/sma/filters", async (req, res) => {
 // SMA SEARCH
 // ============================================================
 app.post("/api/sma/search", async (req, res) => {
+  logInfo("SMA Search API called");
 	
 	const userId = req.headers["x-user-id"];
+logInfo("User ID received", userId);
 
 if (!userId) {
+  logWarn("Unauthorized request");
   return res.status(401).json({ message: "Unauthorized" });
 }
 
@@ -9051,10 +10778,14 @@ const userInfo = await pool.request()
   `);
 
 if (!userInfo.recordset.length) {
+  logWarn("User not found in DB");
   return res.status(403).json({ message: "User not found" });
 }
 
+logInfo("User info fetched", userInfo.recordset[0]);
+
 const { Role } = userInfo.recordset[0];
+logInfo("User role", Role);
 
 const isRegionalManager = Role?.startsWith("Regional Manager");
 
@@ -9076,6 +10807,7 @@ const CLUSTER_CODE_MAP = {
 };
 
 const userClusterCode = CLUSTER_CODE_MAP[userCluster];
+logInfo("User cluster code", userClusterCode);
 
   const {
   mobileNumber,
@@ -9090,9 +10822,10 @@ const userClusterCode = CLUSTER_CODE_MAP[userCluster];
   newIrac
 } = req.body;
 
+logInfo("Search filters received", req.body);
+
   try {
     const request = pool.request();
-
     let query = `
 SELECT
   s.[Account No.] as accountNumber,
@@ -9116,48 +10849,55 @@ WHERE 1=1
 
 
 if (mobileNumber) {
+  logInfo("Filter applied: mobileNumber", mobileNumber);
   query += " AND COALESCE(r.mobileNumber, a.AlternateNumber) LIKE @mobileNumber";
   request.input("mobileNumber", sql.VarChar, `%${mobileNumber}%`);
 }
 
  if (isRegionalManager) {
-
+  logInfo("Filter applied: restricted cluster", userClusterCode);
   query += " AND s.[Cluster Code] = @restrictedCluster";
   request.input("restrictedCluster", sql.VarChar, userClusterCode);
 
 } else if (cluster) {
-
+logInfo("Filter applied: cluster", cluster);
   query += " AND s.[Cluster Code] = @cluster";
   request.input("cluster", sql.VarChar, cluster);
 
 }
 
     if (branch) {
+      logInfo("Filter applied: branch", branch);
       query += " AND [Branch Name] = @branch";
       request.input("branch", sql.VarChar, branch);
     }
 
     if (accountNumber) {
+      logInfo("Filter applied: accountNumber", accountNumber);
       query += " AND [Account No.] = @accountNumber";
       request.input("accountNumber", sql.VarChar, accountNumber);
     }
 
     if (customerName) {
+      logInfo("Filter applied: customerName", customerName);
       query += " AND [Account Name] LIKE @customerName";
       request.input("customerName", sql.VarChar, `%${customerName}%`);
     }
 
     if (product) {
+      logInfo("Filter applied: product", product);
       query += " AND [Account Type Description] = @product";
       request.input("product", sql.VarChar, product);
     }
 
     if (productGroup) {
+      logInfo("Filter applied: productGroup", productGroup);
       query += " AND [Product Group] = @productGroup";
       request.input("productGroup", sql.VarChar, productGroup);
     }
 
     if (loanType) {
+      logInfo("Filter applied: loanType", loanType);
       query += " AND [Loan Type] = @loanType";
       request.input("loanType", sql.VarChar, loanType);
     }
@@ -9167,15 +10907,15 @@ if (mobileNumber) {
 // ============================================================
 
 if (dataType === "SMA") {
-
+logInfo("Filter applied: dataType SMA");
   query += `
-AND s.[NEW IRAC] IN (0,1,2,3,4)
+AND s.[NEW IRAC] IN (0,1,2,3)
 `;
 
 }
 
 if (dataType === "NPA") {
-
+logInfo("Filter applied: dataType NPA");
   query += `
 AND s.[NEW IRAC] IN (4,5,6,7)
 `;
@@ -9183,7 +10923,7 @@ AND s.[NEW IRAC] IN (4,5,6,7)
 }
 
     if (newIrac) {
-
+logInfo("Filter applied: newIrac", newIrac);
   const iracValue = parseInt(newIrac); // converts "00" → 0
 
   query += " AND [NEW IRAC] = @newIrac";
@@ -9191,13 +10931,16 @@ AND s.[NEW IRAC] IN (4,5,6,7)
 
 }
 
+logInfo("Executing search query");
     const result = await request.query(query);
+    logSuccess("Search results fetched", result.recordset.length);
 
+    logInfo("Sending search response");
     res.json(result.recordset);
 
   } catch (err) {
 
-    console.error("SMA search error:", err);
+    logError("SMA search error", err);
     res.status(500).json({ message: "Server error" });
 
   }
@@ -9209,10 +10952,13 @@ AND s.[NEW IRAC] IN (4,5,6,7)
 // SMA VIEW DETAILS
 // ============================================================
 app.get("/api/sma/details/:accountNumber", async (req, res) => {
+  logInfo("SMA Details API called");
 	
 	const userId = req.headers["x-user-id"];
+logInfo("User ID received", userId);
 
 if (!userId) {
+  logWarn("Unauthorized request");
   return res.status(401).json({ message: "Unauthorized" });
 }
 
@@ -9226,11 +10972,13 @@ const userInfo = await pool.request()
     WHERE UserId = @userId
   `);
   
-  if (!userInfo.recordset.length) {
+ if (!userInfo.recordset.length) {
+  logWarn("User not found in DB");
   return res.status(403).json({ message: "User not found" });
 }
 
 const { Role } = userInfo.recordset[0];
+logInfo("User role", Role);
 
 let userCluster = null;
 
@@ -9249,13 +10997,16 @@ const CLUSTER_CODE_MAP = {
 };
 
 const userClusterCode = CLUSTER_CODE_MAP[userCluster];
+logInfo("Cluster restriction", userClusterCode);
 
 const isRegionalManager = Role?.startsWith("Regional Manager");
 
   const { accountNumber } = req.params;
+  logInfo("Fetching details for account", accountNumber);
 
   try {
 
+    logInfo("Executing details query");
     const result = await pool.request()
   .input("accountNumber", sql.VarChar, accountNumber)
   .input("isRegionalManager", sql.Bit, isRegionalManager ? 1 : 0)
@@ -9290,12 +11041,13 @@ AND (
   OR [Cluster Code] = @restrictedCluster
 )
       `);
-
+      logSuccess("Details fetched", result.recordset[0]);
+logInfo("Sending details response");
     res.json(result.recordset[0]);
 
   } catch (err) {
 
-    console.error("SMA details error:", err);
+    logError("SMA details error", err);
     res.status(500).json({ message: "Server error" });
 
   }
@@ -9307,12 +11059,15 @@ AND (
 // =======================================
 
 app.get("/api/sma/branches/:cluster", async (req, res) => {
+  logInfo("Branches API called");
 
   const { cluster } = req.params;
+logInfo("Cluster received", cluster);
 
   try {
 
     const pool = await sql.connect(dbConfig);
+logSuccess("DB connected for branches");
 
     const result = await pool.request()
       .input("cluster", sql.VarChar, cluster)
@@ -9322,12 +11077,14 @@ FROM SMA_Report
 WHERE (@cluster = '' OR [Cluster Code] = @cluster)
 ORDER BY [Branch Name]
       `);
+      logSuccess("Branches fetched", result.recordset.length);
 
+      logInfo("Sending branches response");
     res.json(result.recordset);
 
   } catch (err) {
 
-    console.error("Branch fetch error:", err);
+    logError("Branch fetch error", err);
     res.status(500).json({ message: "Server error" });
 
   }
@@ -9341,6 +11098,8 @@ ORDER BY [Branch Name]
 
 app.post("/api/sma/activity/search", async (req,res)=>{
 
+  logInfo("SMA Activity Search API called");
+
 const {
 mobileNumber,
 cluster,
@@ -9353,14 +11112,31 @@ loanType,
 newIrac
 } = req.body;
 
+logInfo("Search filters received", req.body);
+
+const hasFilter = Object.values(req.body).some(v => v !== "" && v !== null && v !== undefined);
+
+if (!hasFilter) {
+  logWarn("Search executed without any filters");
+}
+
 try{
 
+  logInfo("Connecting to DB for activity search");
 const pool = await sql.connect(dbConfig);
+logSuccess("DB connected for activity search");
 const request = pool.request();
 
 const userId = req.headers["x-user-id"];
+logInfo("Request headers", {
+  role: req.headers["x-user-role"],
+  branch: req.headers["x-user-branch"],
+  cluster: req.headers["x-user-cluster"]
+});
+logInfo("User ID received", userId);
 
 if (!userId) {
+  logWarn("Unauthorized request");
   return res.status(401).json({ message: "Unauthorized" });
 }
 
@@ -9373,12 +11149,15 @@ const roleResult = await pool.request()
   `);
 
 if (!roleResult.recordset.length) {
+  logWarn("User not found in DB");
   return res.status(403).json({ message: "User not found" });
 }
 
 const userRole = roleResult.recordset[0].Role;
+logInfo("User role", userRole);
 
 if (userRole === "Branch Manager") {
+  logWarn("Access denied for Branch Manager");
   return res.status(403).json({
     message: "Access Denied. Please Contact Admin."
   });
@@ -9418,6 +11197,7 @@ WHERE 1=1
 `;
 
 if(mobileNumber){
+  logInfo("Filter applied: mobileNumber", mobileNumber);
 query += " AND COALESCE(r.mobileNumber,a.AlternateNumber) LIKE @mobileNumber";
 request.input("mobileNumber",sql.VarChar,`%${mobileNumber}%`);
 }
@@ -9440,49 +11220,60 @@ const CLUSTER_CODE_MAP = {
 
 const userClusterCode = CLUSTER_CODE_MAP[userCluster];
 
-if (isRegionalManager) {
+if (isRegionalManager && !userClusterCode) {
+  logWarn("Cluster mapping failed", userCluster);
+}
 
+if (isRegionalManager) {
+logInfo("Filter applied: restricted cluster", userClusterCode);
   query += " AND s.[Cluster Code] = @restrictedCluster";
   request.input("restrictedCluster", sql.VarChar, userClusterCode);
 
 } else if (cluster) {
-
+logInfo("Filter applied: cluster", cluster);
   query += " AND s.[Cluster Code] = @cluster";
   request.input("cluster", sql.VarChar, cluster);
 
 }
 
 if(branch){
+  logInfo("Filter applied: branch", branch);
 query += " AND s.[Branch Name] = @branch";
 request.input("branch",sql.VarChar,branch);
 }
 
 if(accountNumber){
+  logInfo("Filter applied: accountNumber", accountNumber);
 query += " AND s.[Account No.] = @accountNumber";
 request.input("accountNumber",sql.VarChar,accountNumber);
 }
 
 if(customerName){
+  logInfo("Filter applied: customerName", customerName);
 query += " AND s.[Account Name] LIKE '%' + @customerName + '%'";
 request.input("customerName",sql.VarChar,customerName);
 }
 
 if(product){
+  logInfo("Filter applied: product", product);
 query += " AND s.[Account Type Description] = @product";
 request.input("product",sql.VarChar,product);
 }
 
 if(productGroup){
+  logInfo("Filter applied: productGroup", productGroup);
 query += " AND s.[Product Group] = @productGroup";
 request.input("productGroup",sql.VarChar,productGroup);
 }
 
 if(loanType){
+  logInfo("Filter applied: loanType", loanType);
 query += " AND s.[Loan Type] = @loanType";
 request.input("loanType",sql.VarChar,loanType);
 }
 
-if(newIrac !== ""){
+if (newIrac !== undefined && newIrac !== "") {
+  logInfo("Filter applied: newIrac", newIrac);
 query += " AND s.[NEW IRAC] = @newIrac";
 request.input("newIrac",sql.Int,parseInt(newIrac));
 }
@@ -9496,14 +11287,22 @@ s.[Branch Name],
 COALESCE(r.mobileNumber,a.AlternateNumber)
 `;
 
+logInfo("Final query ready");
+logInfo("Executing activity search query");
 const result = await request.query(query);
+logSuccess("Search results fetched", result.recordset.length);
 
+logInfo("Sending search response");
 res.json(result.recordset);
 
 }
 catch(err){
 
-console.error("SMA activity search error:",err);
+logError("SMA activity search error", {
+  error: err.message,
+  filters: req.body,
+  userId
+});
 res.status(500).json({message:"Server error"});
 
 }
@@ -9516,23 +11315,33 @@ res.status(500).json({message:"Server error"});
 
 app.post("/api/sma-activity-details", async (req, res) => {
 
+  logInfo("SMA Activity Details API called");
+
   const { accountNumber } = req.body;
+  logInfo("Account number received", accountNumber);
 
   if (!accountNumber) {
+  logWarn("Account number missing");
     return res.status(400).json([]);
   }
 
   try {
 
     const userId = req.headers["x-user-id"];
+    logInfo("User ID received", userId);
+
     if (!userId) {
+  logWarn("Unauthorized request");
       return res.status(401).json({ message: "Unauthorized" });
     }
 
+    logInfo("Connecting to DB for activity details");
     const pool = await poolPromise;
+    logSuccess("DB connected for activity details");
 
     // ================= FETCH SESSIONS =================
 
+logInfo("Fetching activity sessions");
     const sessionsResult = await pool.request()
       .input("accountNumber", sql.VarChar, accountNumber)
       .query(`
@@ -9555,13 +11364,16 @@ app.post("/api/sma-activity-details", async (req, res) => {
       `);
 
     const sessions = sessionsResult.recordset;
+    logSuccess("Sessions fetched", sessions.length);
 
     if (sessions.length === 0) {
+  logWarn("No sessions found");
       return res.json([]);
     }
 
     // ================= FETCH LOGS =================
 
+    logInfo("Fetching activity logs");
     const logsResult = await pool.request()
       .input("accountNumber", sql.VarChar, accountNumber)
       .query(`
@@ -9581,6 +11393,7 @@ app.post("/api/sma-activity-details", async (req, res) => {
       `);
 
     const logs = logsResult.recordset;
+    logSuccess("Logs fetched", logs.length);
 
     // ================= GROUP LOGS =================
 
@@ -9618,11 +11431,17 @@ app.post("/api/sma-activity-details", async (req, res) => {
 
     });
 
+logSuccess("Activity details response sent", response.length);
+logInfo("Sending activity details response");
     res.json(response);
 
   } catch (err) {
 
-    console.error("SMA ACTIVITY DETAILS ERROR:", err);
+    logError("SMA activity details error", {
+  error: err.message,
+  accountNumber,
+  userId
+});
     res.status(500).json([]);
 
   }
@@ -9640,15 +11459,22 @@ app.post("/api/field-visit-summary", async (req, res) => {
   try {
 
     const { user, cluster, branch, fromDate, toDate } = req.body;
+    logInfo("FIELD VISIT SUMMARY API HIT", {
+  user, cluster, branch, fromDate, toDate
+});
 
     const pool = await sql.connect(dbConfig);
 	
 	const userId = req.headers["x-user-id"];
 
+logInfo("User ID received", userId);
+
 if (!userId) {
+  logError("Unauthorized request - missing userId");
   return res.status(401).json({ message: "Unauthorized" });
 }
 
+logInfo("Fetching user role from DB");
 // Fetch user role
 const roleResult = await pool.request()
   .input("userId", sql.VarChar(50), userId)
@@ -9659,12 +11485,15 @@ const roleResult = await pool.request()
   `);
 
 if (!roleResult.recordset.length) {
+  logWarn("User not found in DB", userId);
   return res.status(403).json({ message: "User not found" });
 }
 
 const userRole = roleResult.recordset[0].Role;	
+logSuccess("User role fetched", userRole);
     const request = pool.request();
 
+    logInfo("Building SQL query");
     let query = `
 SELECT 
     F.UserName,
@@ -9683,6 +11512,7 @@ WHERE 1=1
     // ================= FILTERS =================
 	
 	if (userRole === "Branch Manager") {
+    logInfo("Applying Branch Manager filter");
 
   const branchResult = await pool.request()
     .input("userId", sql.VarChar(50), userId)
@@ -9693,6 +11523,7 @@ WHERE 1=1
     `);
 
   const userBranch = branchResult.recordset[0].BranchName;
+  logInfo("Branch Manager branch", userBranch);
 
   query += " AND U.BranchName = @userBranch";
   request.input("userBranch", sql.VarChar, userBranch);
@@ -9700,9 +11531,11 @@ WHERE 1=1
 }
 
 if (userRole.startsWith("Regional Manager")) {
+  logInfo("Applying Regional Manager filter", userRole);
 
   const match = userRole.match(/\((.*?)\)/);
   const rmCluster = match ? match[1] : "";
+  logInfo("RM Cluster extracted", rmCluster);
 
   query += " AND U.ClusterName = @rmCluster";
   request.input("rmCluster", sql.VarChar, rmCluster);
@@ -9711,26 +11544,31 @@ if (userRole.startsWith("Regional Manager")) {
 	
 
     if (user) {
+  logInfo("Filter applied: user", user);
       query += " AND F.UserID = @UserID";
       request.input("UserID", sql.VarChar, user);
     }
 
     if (cluster && cluster !== "Corporate Office") {
+  logInfo("Filter applied: cluster", cluster);
   query += " AND U.ClusterName = @Cluster";
   request.input("Cluster", sql.VarChar, cluster);
 }
 
     if (branch) {
+  logInfo("Filter applied: branch", branch);
       query += " AND U.BranchName = @Branch";
       request.input("Branch", sql.VarChar, branch);
     }
 
     if (fromDate) {
+  logInfo("Filter applied: fromDate", fromDate);
       query += " AND CAST(F.MeetingDate AS DATE) >= @FromDate";
       request.input("FromDate", sql.Date, fromDate);
     }
 
     if (toDate) {
+  logInfo("Filter applied: toDate", toDate);
       query += " AND CAST(F.MeetingDate AS DATE) <= @ToDate";
       request.input("ToDate", sql.Date, toDate);
     }
@@ -9746,13 +11584,26 @@ ORDER BY
     F.UserName
 `;
 
+logInfo("Executing SQL query");
     const result = await request.query(query);
+    logSuccess("Query executed", {
+  rowCount: result.recordset?.length || 0
+});
 
-    res.json(result.recordset);
+const finalData = result.recordset || [];
+
+logSuccess("FIELD VISIT SUMMARY API SUCCESS", {
+  count: finalData.length
+});
+
+res.json(finalData);   // ✅ ONLY THIS
 
   } catch (error) {
 
-    console.error("Field Visit Summary Error:", error);
+    logError("FIELD VISIT SUMMARY ERROR", {
+  message: error.message,
+  stack: error.stack
+});
     res.status(500).json({ error: "Internal Server Error" });
 
   }
@@ -9770,7 +11621,13 @@ app.post("/api/field-visit-summary/export-excel", async (req, res) => {
 
     const { columns, data } = req.body;
 
+    logInfo("SUMMARY EXCEL EXPORT API HIT", {
+  columns: columns?.length,
+  rows: data?.length
+});
+
     if (!data || data.length === 0) {
+      logWarn("No data to export");
       return res.status(400).json({ error: "No data to export" });
     }
 
@@ -9830,13 +11687,18 @@ app.post("/api/field-visit-summary/export-excel", async (req, res) => {
       "attachment; filename=Field_Visit_Summary.xlsx"
     );
 
+    logInfo("Writing Excel file");
     await workbook.xlsx.write(res);
+    logSuccess("Excel generated successfully");
 
     res.end();
 
   } catch (error) {
 
-    console.error("Export Excel Error:", error);
+    logError("SUMMARY EXCEL EXPORT ERROR", {
+  message: error.message,
+  stack: error.stack
+});
 
     res.status(500).json({ error: "Excel export failed" });
 
@@ -9844,35 +11706,100 @@ app.post("/api/field-visit-summary/export-excel", async (req, res) => {
 
 });
 
+
 // =============================
 // LOGIN API
 // =============================
 
 app.post("/api/login", async (req, res) => {
   const { userId, password } = req.body;
+  logInfo("Login API hit", { userId: req.body.userId });
 
   if (!userId || !password) {
+    logWarn("Login validation failed - missing fields", { userId });
     return res.status(400).json({ message: "User ID and Password are required" });
   }
 
   try {
     const pool = await poolPromise;
 
-    // 1️⃣ Check credentials
-    const authQuery = await pool.request()
+    // 1️⃣ Check credentials with lock system
+logInfo("Checking user credentials", { userId });
+
+const authQuery = await pool.request()
+  .input("userId", userId)
+  .query(`
+    SELECT UserId, AppPassword, FailedAttempts, IsLocked
+    FROM UserAuth
+    WHERE UserId = @userId
+  `);
+
+if (authQuery.recordset.length === 0) {
+  logWarn("Invalid login attempt", { userId });
+  return res.status(401).json({
+    message: "Invalid User ID or Password"
+  });
+}
+
+const authUser = authQuery.recordset[0];
+
+// Account already locked
+if (authUser.IsLocked === true) {
+  return res.status(403).json({
+    message: "Account locked. Contact Administrator."
+  });
+}
+
+// Wrong password
+if (authUser.AppPassword !== password) {
+
+  const attempts = authUser.FailedAttempts + 1;
+  const remaining = 3 - attempts;
+
+  // Lock account after 3 tries
+  if (attempts >= 3) {
+
+    await pool.request()
       .input("userId", userId)
-      .input("password", password)
       .query(`
-        SELECT UserId 
-        FROM UserAuth
-        WHERE UserId = @userId AND AppPassword = @password
+        UPDATE UserAuth
+        SET FailedAttempts = 3,
+            IsLocked = 1
+        WHERE UserId = @userId
       `);
 
-    if (authQuery.recordset.length === 0) {
-      return res.status(401).json({ message: "Invalid User ID or Password" });
-    }
+    return res.status(403).json({
+      message: "Account locked after 3 failed attempts"
+    });
+  }
+
+  // Update failed attempts
+  await pool.request()
+    .input("userId", userId)
+    .input("attempts", attempts)
+    .query(`
+      UPDATE UserAuth
+      SET FailedAttempts = @attempts
+      WHERE UserId = @userId
+    `);
+
+  return res.status(401).json({
+    message: `Invalid Password. ${remaining} attempts remaining`
+  });
+}
+
+// Correct password → reset attempts
+await pool.request()
+  .input("userId", userId)
+  .query(`
+    UPDATE UserAuth
+    SET FailedAttempts = 0,
+        IsLocked = 0
+    WHERE UserId = @userId
+  `);
 
     // 2️⃣ Get user info
+    logInfo("Fetching user info", { userId });
     const infoQuery = await pool.request()
       .input("userId", userId)
       .query(`
@@ -9888,6 +11815,7 @@ app.post("/api/login", async (req, res) => {
       `);
 
     if (infoQuery.recordset.length === 0) {
+      logWarn("User not registered for dashboard", { userId });
       return res.status(401).json({ message: "User not registered for dashboard access" });
     }
 
@@ -9896,6 +11824,11 @@ app.post("/api/login", async (req, res) => {
 
     // 3️⃣ Validity Check
     if (new Date(user.ValidFrom) > today || new Date(user.ValidUntil) < today) {
+      logWarn("User validity expired or not active", {
+  userId,
+  validFrom: user.ValidFrom,
+  validUntil: user.ValidUntil
+});
       return res.status(403).json({ message: "User access expired or not yet active" });
     }
 
@@ -9927,10 +11860,12 @@ else if (
   );
 }
 else if (roles.length === 1 && roles.includes("Calling Agent")) {
+  logWarn("Unauthorized role - Calling Agent", { userId });
   return res.status(403).json({ message: "Calling Agent cannot access dashboard" });
 }
 
 if (!finalRole) {
+  logWarn("User role not authorized", { userId, roles });
   return res.status(403).json({ message: "User role not authorized for dashboard" });
 }
 
@@ -9944,7 +11879,15 @@ if (finalRole.startsWith("Regional Manager")) {
   }
 }
 
+logSuccess("Login successful", {
+  userId,
+  role: finalRole,
+  branch: user.BranchName,
+  branchCode: user.BranchCode,
+  cluster: clusterName
+});
 // 5️⃣ SUCCESS
+logInfo("Sending login response", { userId, role: finalRole });
 return res.json({
   message: "Login successful",
   userId: userId,
@@ -9955,7 +11898,8 @@ return res.json({
 });
 
   } catch (err) {
-    console.error("LOGIN ERROR:", err);
+    logError("Login API error", { userId, err });
+    logInfo("Login error response sent", { userId });
     return res.status(500).json({ message: "Internal server error" });
   }
 });
@@ -9967,8 +11911,10 @@ return res.json({
 
 app.post("/api/forgot-password/validate-user", async (req, res) => {
   const { userId } = req.body;
+  logInfo("Validate-user API hit", { userId: req.body.userId });
 
-  if (!userId) {
+ if (!userId) {
+  logWarn("Validate-user missing userId");
     return res.status(400).json({ message: "UserId is required" });
   }
 
@@ -9978,6 +11924,7 @@ app.post("/api/forgot-password/validate-user", async (req, res) => {
 
     request.input("UserId", sql.VarChar(50), String(userId).trim());
 
+    logInfo("Checking user for forgot password", { userId });
     const result = await request.query(`
       SELECT TOP 1 SecurityQuestion
       FROM UserAuth
@@ -9985,6 +11932,7 @@ app.post("/api/forgot-password/validate-user", async (req, res) => {
     `);
 
     if (result.recordset.length === 0) {
+      logWarn("Forgot password user not found", { userId });
       return res.status(401).json({
         message: "User not authorized"
       });
@@ -10007,13 +11955,15 @@ app.post("/api/forgot-password/validate-user", async (req, res) => {
     const storedValue = result.recordset[0].SecurityQuestion; // ex: "q1"
     const fullQuestion = questionMap[storedValue] || storedValue;
 
+    logSuccess("User validated for forgot password", { userId });
+    logInfo("Validate-user response sent", { userId });
     return res.status(200).json({
       securityQuestion: fullQuestion,   // ✅ now frontend gets full sentence
       securityKey: storedValue          // ✅ optional: keep original also
     });
 
   } catch (err) {
-    console.error("Validate User Error:", err);
+    logError("Validate-user API error", { userId, err });
     return res.status(500).json({
       message: "Internal server error"
     });
@@ -10029,8 +11979,10 @@ app.post("/api/forgot-password/validate-user", async (req, res) => {
 
 app.post("/api/forgot-password/reset-password", async (req, res) => {
   const { userId, securityAnswer, newPassword } = req.body;
+  logInfo("Reset-password API hit", { userId: req.body.userId });
 
   if (!userId || !securityAnswer || !newPassword) {
+    logWarn("Reset password validation failed", { userId });
     return res.status(400).json({
       message: "UserId, security answer and new password are required"
     });
@@ -10051,12 +12003,14 @@ app.post("/api/forgot-password/reset-password", async (req, res) => {
       `);
 
     if (verifyRes.recordset.length === 0) {
+      logWarn("Invalid security answer during reset", { userId });
       return res.status(401).json({
         message: "Invalid security answer"
       });
     }
 
     // 2️⃣ Update password
+    logInfo("Updating password", { userId });
     await pool.request()
       .input("UserId", sql.VarChar(50), String(userId).trim())
       .input("NewPassword", sql.VarChar(255), String(newPassword))
@@ -10066,12 +12020,14 @@ app.post("/api/forgot-password/reset-password", async (req, res) => {
         WHERE UserId = @UserId
       `);
 
+      logSuccess("Password reset successful", { userId });
+      logInfo("Password reset response sent", { userId });
     return res.status(200).json({
       message: "Password updated successfully"
     });
 
   } catch (err) {
-    console.error("RESET PASSWORD ERROR:", err);
+    logError("Reset-password API error", { userId, err });
     return res.status(500).json({
       message: "Internal server error"
     });
@@ -10085,8 +12041,10 @@ app.post("/api/forgot-password/reset-password", async (req, res) => {
 
 app.post("/api/forgot-password/verify-answer", async (req, res) => {
   const { userId, securityAnswer } = req.body;
+  logInfo("Verify-answer API hit", { userId: req.body.userId });
 
   if (!userId || !securityAnswer) {
+    logWarn("Verify-answer validation failed", { userId });
     return res.status(400).json({
       message: "UserId and security answer are required"
     });
@@ -10106,23 +12064,134 @@ app.post("/api/forgot-password/verify-answer", async (req, res) => {
       `);
 
     if (result.recordset.length === 0) {
+      logWarn("Security answer incorrect", { userId });
       return res.status(401).json({
         message: "Invalid security answer"
       });
     }
 
     // ✅ Answer is correct
+    logSuccess("Security answer verified", { userId });
+    logInfo("Verify-answer response sent", { userId });
     return res.status(200).json({
       message: "Security answer verified"
     });
 
   } catch (err) {
-    console.error("VERIFY ANSWER ERROR:", err);
+    logError("Verify-answer API error", { userId, err });
     return res.status(500).json({
       message: "Internal server error"
     });
   }
 });
+
+
+// ======================
+// Accounts Unlock
+// ======================
+
+app.get("/api/locked-users", async (req, res) => {
+  const userId = req.headers.userid;
+
+  const allowedUsers = [
+    "IT_099_1011",
+    "IT_099_1009",
+    "IT_099_866"
+  ];
+
+  if (!allowedUsers.includes(userId)) {
+    return res.status(403).json({
+      message: "Access denied"
+    });
+  }
+  
+  try {
+    const pool = await poolPromise;
+
+    const result = await pool.request().query(`
+      SELECT
+        UA.UserId,
+        ISNULL(UI.UserName, '') AS UserName,
+        UA.FailedAttempts,
+        UA.IsLocked
+      FROM UserAuth UA
+      LEFT JOIN UsersInfo UI
+        ON UA.UserId = UI.UserId
+      WHERE UA.IsLocked = 1
+      ORDER BY UA.UserId
+    `);
+
+    return res.status(200).json(
+      result.recordset.map(row => ({
+        userId: row.UserId,
+        userName: row.UserName,
+        failedAttempts: row.FailedAttempts,
+        isLocked: row.IsLocked
+      }))
+    );
+
+  } catch (err) {
+    console.error("Locked users error:", err);
+    return res.status(500).json({
+      message: "Internal server error"
+    });
+  }
+});
+
+
+app.post("/api/unlock-user", async (req, res) => {
+  const loginUserId = req.headers.userid;
+
+  const allowedUsers = [
+    "IT_099_1011",
+    "IT_099_1009",
+    "IT_099_866"
+  ];
+
+  if (!allowedUsers.includes(loginUserId)) {
+    return res.status(403).json({
+      message: "Access denied"
+    });
+  }
+
+  const { userId, newPassword } = req.body;
+
+  if (!userId || !newPassword) {
+    return res.status(400).json({
+      message: "User ID and Password required"
+    });
+  }
+
+  try {
+    const pool = await poolPromise;
+
+    await pool.request()
+      .input("userId", sql.VarChar(50), userId)
+      .input("newPassword", sql.VarChar(255), newPassword)
+      .query(`
+        UPDATE UserAuth
+        SET
+          AppPassword = @newPassword,
+          FailedAttempts = 0,
+          IsLocked = 0,
+          LastLoginAt = GETDATE()
+        WHERE UserId = @userId
+      `);
+
+    return res.status(200).json({
+      message: "Account unlocked successfully"
+    });
+
+  } catch (err) {
+    console.error("Unlock user error:", err);
+
+    return res.status(500).json({
+      message: "Internal server error"
+    });
+  }
+});
+
+
 
 // ======================
 // HOME USER DETAILS
@@ -10141,7 +12210,8 @@ app.get("/api/user/:userId", async (req, res) => {
           ClusterName,
           BranchCode,
           BranchName,
-          Role
+          Role,
+		  Designation
         FROM UsersInfo
         WHERE UserId = @UserId
       `);
@@ -10157,10 +12227,21 @@ app.get("/api/user/:userId", async (req, res) => {
 });
 
 
+
 // ===============================================================================================================================================================================================
 //                           ACTIVITY LOGGING APIs
 // ==================================================================================================================================================================================================
+
+// =============================== ACTIVITY START ===========================================
+
 app.post("/api/activity/session/start", async (req, res) => {
+console.log("📥 [SESSION_START_API] request", {
+  userId: req.body?.userId,
+  userName: req.body?.userName,
+  sourceType: req.body?.sourceType,
+  sourceId: req.body?.sourceId,
+  sessionType: req.body?.sessionType
+});
   const {
     loanAccountNumber,
     sessionType,
@@ -10171,19 +12252,34 @@ app.post("/api/activity/session/start", async (req, res) => {
   } = req.body;
 
   if (!sessionType || !userId || !userName || !sourceType) {
+	  console.log("⚠️ [SESSION_START_API] missing required fields", {
+  userId,
+  sourceType,
+  sessionType
+});
     return res.status(400).json({ message: "Missing required fields" });
   }
 
   if (sourceType === "NPA" && !loanAccountNumber) {
+	  console.log("⚠️ [SESSION_START_API] NPA without loanAccountNumber", {
+  userId
+});
     return res.status(400).json({ message: "LoanAccountNumber required for NPA" });
   }
 
   try {
     const pool = await poolPromise;
-
+console.log("📊 [SESSION_START_API] creating session", {
+  userId,
+  sourceType
+});
     let assignmentId = null;
 
     if (sourceType === "NPA") {
+		console.log("📊 [SESSION_START_API] fetching assignment", {
+  loanAccountNumber,
+  userId
+});
       const assignRes = await pool.request()
         .input("LoanAccountNumber", sql.VarChar(50), loanAccountNumber)
         .input("UserId", sql.VarChar(50), String(userId))
@@ -10197,7 +12293,12 @@ app.post("/api/activity/session/start", async (req, res) => {
         `);
 
       if (assignRes.recordset.length === 0) {
+		  			console.log("⚠️ [SESSION_START_API] assignment not found", {
+  loanAccountNumber,
+  userId
+});
         return res.status(404).json({
+
           message: "Assignment not found for this loan and user",
         });
       }
@@ -10206,44 +12307,49 @@ app.post("/api/activity/session/start", async (req, res) => {
     }
 
     const result = await pool.request()
-      .input("AssignmentId", sql.BigInt, assignmentId || null)
-      .input(
-  "LoanAccountNumber",
-  sql.VarChar(50),
-  sourceType === "LEAD"
-    ? `LEAD-${sourceId}`
-    : loanAccountNumber
-)
-      .input("SessionType", sql.VarChar(20), sessionType)
-      .input("StartedByUserId", sql.VarChar(50), String(userId))
-      .input("StartedByUserName", sql.VarChar(100), userName)
-      .input("SourceType", sql.VarChar(20), sourceType || null)
-.input("SourceId", sql.VarChar(50), sourceId ? String(sourceId) : null)
-      .query(`
-INSERT INTO Activity_Sessions (
-  AssignmentId,
-  LoanAccountNumber,
-  SessionType,
-  SessionStatus,
-  StartedByUserId,
-  StartedByUserName,
-  SourceType,
-  SourceId,
-  IsActive
-)
-OUTPUT INSERTED.SessionId
-VALUES (
-  @AssignmentId,
-  @LoanAccountNumber,
-  @SessionType,
-  'ACTIVE',
-  @StartedByUserId,
-  @StartedByUserName,
-  @SourceType,
-  @SourceId,
-  1
-)
-      `);
+  .input("AssignmentId", sql.BigInt, assignmentId || null)
+  .input(
+    "LoanAccountNumber",
+    sql.VarChar(50),
+    sourceType === "LEAD"
+      ? `LEAD-${sourceId}`
+      : loanAccountNumber
+  )
+  .input("SessionType", sql.VarChar(20), sessionType)
+  .input("StartedByUserId", sql.VarChar(50), String(userId))
+  .input("StartedByUserName", sql.VarChar(100), userName)
+  .input("SourceType", sql.VarChar(20), sourceType || null)
+  .input("SourceId", sql.VarChar(50), sourceId ? String(sourceId) : null)
+  .query(`
+    INSERT INTO Activity_Sessions (
+      AssignmentId,
+      LoanAccountNumber,
+      SessionType,
+      SessionStatus,
+      StartedByUserId,
+      StartedByUserName,
+      SourceType,
+      SourceId,
+      IsActive
+    )
+    OUTPUT INSERTED.SessionId
+    VALUES (
+      @AssignmentId,
+      @LoanAccountNumber,
+      @SessionType,
+      'ACTIVE',
+      @StartedByUserId,
+      @StartedByUserName,
+      @SourceType,
+      @SourceId,
+      1
+    )
+  `);
+
+console.log("✅ [SESSION_START_API] session created", {
+  sessionId: result.recordset[0].SessionId,
+  sourceType
+});
 
     return res.status(200).json({
       sessionId: result.recordset[0].SessionId,
@@ -10251,13 +12357,26 @@ VALUES (
     });
 
   } catch (err) {
-    console.error("❌ START SESSION ERROR:", err);
+    console.error("❌ [SESSION_START_API] error:", {
+  message: err.message,
+  stack: err.stack,
+  userId: req.body?.userId,
+  sourceType: req.body?.sourceType
+});
     return res.status(500).json({ message: "Failed to start session" });
   }
 });
+
+//============================================= ACTIVITY LOGS =======================================================
+
 app.post("/api/activity/log", async (req, res) => {
 
-  console.log("📥 ACTIVITY LOG REQUEST:", req.body);
+  console.log("📥 [ACTIVITY_LOG_API] request", {
+  sessionId: req.body?.sessionId,
+  actionCode: req.body?.actionCode,
+  sourceType: req.body?.sourceType,
+  sourceId: req.body?.sourceId
+});
 
   const {
     sessionId,
@@ -10280,7 +12399,10 @@ app.post("/api/activity/log", async (req, res) => {
 
     // ⭐ Recover session if mobile lost it
     if (!sessionIdToUse) {
-
+console.log("🔄 [ACTIVITY_LOG_API] session recovering", {
+  userId,
+  sourceId
+});
       const result = await pool.request()
         .input("userId", sql.VarChar(50), String(userId))
         .input("loanAccountNumber", sql.VarChar(50), String(sourceId))
@@ -10293,17 +12415,27 @@ app.post("/api/activity/log", async (req, res) => {
           ORDER BY StartedAt DESC
         `);
 
-      if (result.recordset.length > 0) {
-        sessionIdToUse = result.recordset[0].SessionId;
-      }
-    }
+if (result.recordset.length > 0) {
+  sessionIdToUse = result.recordset[0].SessionId;
 
+  console.log("✅ [ACTIVITY_LOG_API] session recovered", {
+    sessionId: sessionIdToUse
+  });
+}
+}
     // validation
     if (!Number(sessionIdToUse)) {
+console.log("⚠️ [ACTIVITY_LOG_API] invalid sessionId", {
+  sessionId: sessionIdToUse
+});
       return res.status(400).json({ message: "Invalid sessionId" });
     }
 
     if (!sessionIdToUse || !actionCode || !actionLabel || !userId) {
+console.log("⚠️ [ACTIVITY_LOG_API] missing fields", {
+  actionCode,
+  sessionId: sessionIdToUse
+});
       return res.status(400).json({ message: "Missing required fields" });
     }
 
@@ -10322,7 +12454,10 @@ app.post("/api/activity/log", async (req, res) => {
       parentResult.recordset.length > 0
         ? parentResult.recordset[0].LogId
         : null;
-
+console.log("📊 [ACTIVITY_LOG_API] inserting log", {
+  sessionId: sessionIdToUse,
+  actionCode
+});
     // 2️⃣ Insert Activity Log
     const logResult = await pool
       .request()
@@ -10369,7 +12504,12 @@ app.post("/api/activity/log", async (req, res) => {
       `);
 
     const logId = logResult.recordset[0].LogId;
-
+console.log("✅ [ACTIVITY_LOG_API] log inserted", {
+  logId,
+  actionCode,
+  userId,
+  userName
+});
     // ✅ Only these actions should affect status table + schedule flags
     const statusActionCodes = [
       "CALL_BUSY",
@@ -10498,6 +12638,10 @@ app.post("/api/activity/log", async (req, res) => {
 
         // ✅ 1) Update CallRecovery_Status main flags + timestamps
         try {
+console.log("📊 [ACTIVITY_LOG_API] updating recovery status", {
+  actionCode,
+  LoanAccountNumber
+});
           await pool
             .request()
             .input("LoanAccountNumber", sql.VarChar(50), LoanAccountNumber)
@@ -10527,7 +12671,10 @@ app.post("/api/activity/log", async (req, res) => {
             metadata?.mode ||
             metadata?.type ||
             "CALL";
-
+console.log("📊 [ACTIVITY_LOG_API] updating schedule flags", {
+  actionCode,
+  mode: derivedMode
+});
           await pool
             .request()
             .input("LoanAccountNumber", sql.VarChar(50), LoanAccountNumber)
@@ -10543,6 +12690,9 @@ app.post("/api/activity/log", async (req, res) => {
 
     // 3️⃣ Insert note ONLY if provided
     if (noteText && noteText.trim() !== "") {
+console.log("📝 [ACTIVITY_LOG_API] inserting note", {
+  logId
+});
       await pool
         .request()
         .input("LogId", sql.BigInt, logId)
@@ -10564,29 +12714,48 @@ app.post("/api/activity/log", async (req, res) => {
           )
         `);
     }
-
+console.log("📤 [ACTIVITY_LOG_API] response sent", {
+  logId
+});
     return res.status(200).json({
       success: true,
       logId,
       message: "Activity log saved + status updated",
     });
   } catch (err) {
-    console.error("❌ INSERT LOG ERROR:", err);
+    console.error("❌ [ACTIVITY_LOG_API] error:", {
+  message: err.message,
+  stack: err.stack,
+  actionCode: req.body?.actionCode,
+  sessionId: req.body?.sessionId
+});
     return res.status(500).json({ message: "Failed to insert activity log" });
   }
 });
 
-
+//======================== ACTIVITY END ================================================
 
 app.post("/api/activity/session/end", async (req, res) => {
+
+console.log("📥 [SESSION_END_API] request", {
+  sessionId: req.body?.sessionId,
+  userId: req.body?.userId,
+  userName: req.body?.userName
+});
+
   const { sessionId } = req.body;
 
   if (!sessionId) {
+    console.log("⚠️ [SESSION_END_API] missing sessionId");
     return res.status(400).json({ message: "SessionId is required" });
   }
 
   try {
     const pool = await poolPromise;
+
+    console.log("📊 [SESSION_END_API] ending session", {
+      sessionId
+    });
 
     await pool.request()
       .input("SessionId", sql.BigInt, parseInt(sessionId))
@@ -10597,20 +12766,28 @@ app.post("/api/activity/session/end", async (req, res) => {
         WHERE SessionId = @SessionId
       `);
 
+    console.log("✅ [SESSION_END_API] session ended", {
+      sessionId
+    });
+
     return res.status(200).json({ success: true });
 
   } catch (err) {
-    console.error("❌ END SESSION ERROR:", err);
+    console.error("❌ [SESSION_END_API] error:", {
+      message: err.message,
+      stack: err.stack,
+      sessionId: req.body?.sessionId
+    });
     return res.status(500).json({ message: "Failed to end session" });
   }
 });
-
 
 // ======================
 // Activity Status
 // ======================
 
 app.post("/api/activity-status/search", async (req, res) => {
+
   const {
     mobileNumber = "",
     pincode = "",
@@ -10623,11 +12800,28 @@ app.post("/api/activity-status/search", async (req, res) => {
 	queue = "",
     dpdQueue = ""
   } = req.body;
+  
+   logInfo("SEARCH API HIT", {
+  mobileNumber,
+  pincode,
+  branchName,
+  product,
+  assignedTo,
+  loanAccount,
+  memberName,
+  cluster,
+  queue,
+  dpdQueue
+});
 
   try {
 	  
 	const userId = req.headers["x-user-id"];
-if (!userId) return res.status(401).json({ message: "Unauthorized" });
+  logInfo("User ID received", userId);
+if (!userId) {
+  logWarn("Unauthorized access attempt");
+  return res.status(401).json({ message: "Unauthorized" });
+}
 
 const pool = await poolPromise;
 
@@ -10640,6 +12834,7 @@ const roleResult = await pool.request()
   `);
 
 const userInfo = roleResult.recordset[0];
+logSuccess("User info fetched", userInfo);
     const request = pool.request();
 
     let query = `
@@ -10753,11 +12948,21 @@ if (dpdQueue) {
   request.input("cluster", cluster);
 }
 
+logInfo("Executing search query with filters", {
+  mobileNumber,
+  branchName,
+  product,
+  assignedTo,
+  cluster,
+  queue,
+  dpdQueue
+});
     const result = await request.query(query);
+    logSuccess("Search result count", result.recordset.length);
     return res.json(result.recordset);
 
   } catch (err) {
-    console.error("ACTIVITY STATUS SEARCH ERROR:", err);
+    logError("ACTIVITY STATUS SEARCH ERROR", err);
     return res.status(500).json({ message: "Search failed" });
   }
 });
@@ -10768,18 +12973,23 @@ if (dpdQueue) {
 
 app.post("/api/npa-activity-details", async (req, res) => {
 
+  logInfo("ACTIVITY DETAILS API HIT", req.body);
+
   const { loanAccountNumber } = req.body;
 
   if (!loanAccountNumber) {
+    logWarn("Loan account number missing");
     return res.status(400).json([]);
   }
 
   try {
 
     const userId = req.headers["x-user-id"];
+    logInfo("User ID received", userId);
     if (!userId) {
-      return res.status(401).json({ message: "Unauthorized" });
-    }
+  logWarn("Unauthorized access - search API");
+  return res.status(401).json({ message: "Unauthorized" });
+}
 
     const pool = await poolPromise;
 
@@ -10808,6 +13018,7 @@ if (userInfo.Role === "Branch Manager") {
     `);
 
   if (check.recordset.length === 0) {
+    logWarn("Access denied for Branch Manager", loanAccountNumber);
     return res.status(403).json({ message: "Access denied" });
   }
 }
@@ -10833,6 +13044,7 @@ if (isRegionalManager) {
     `);
 
   if (check.recordset.length === 0) {
+    logWarn("Access denied for Regional Manager", loanAccountNumber);
     return res.status(403).json({ message: "Access denied" });
   }
 }
@@ -10857,10 +13069,12 @@ if (isRegionalManager) {
     `);
 
     const sessions = sessionsResult.recordset;
+    logSuccess("Sessions fetched", sessions.length);
 
     if (sessions.length === 0) {
-      return res.json([]);
-    }
+  logWarn("No sessions found", loanAccountNumber);
+  return res.json([]);
+}
 
     // ================= FETCH LOGS =================
 
@@ -10886,6 +13100,7 @@ const logsResult = await requestLogs.query(`
 `);
 
 const logs = logsResult.recordset;
+logSuccess("Logs fetched", logs.length);
 
     // ================= GROUP LOGS =================
 
@@ -10915,11 +13130,12 @@ const logs = logsResult.recordset;
 
 });
 
+logSuccess("Activity details response sent");
     res.json(response);
 
   } catch (err) {
 
-    console.error("ACTIVITY DETAILS ERROR:", err);
+    logError("ACTIVITY DETAILS ERROR", err);
     res.status(500).json([]);
 
   }
@@ -10930,9 +13146,11 @@ const logs = logsResult.recordset;
 // ============================================================
 
 app.post("/api/activity-status/export-pdf", async (req, res) => {
+  logInfo("EXPORT PDF API HIT", req.body);
   const { selectedIds, columns, fileName, serialData } = req.body;
 
   if (!selectedIds || selectedIds.length === 0) {
+    logWarn("No records selected for PDF");
     return res.status(400).json({ message: "No records selected" });
   }
 
@@ -10943,6 +13161,7 @@ app.post("/api/activity-status/export-pdf", async (req, res) => {
   try {
     
 	const userId = req.headers["x-user-id"];
+  logInfo("User ID received", userId);
 if (!userId) return res.status(401).json({ message: "Unauthorized" });
 
 const pool = await poolPromise;
@@ -10967,6 +13186,7 @@ const userInfo = roleResult.recordset[0];
       .map((id, index) => `WHEN R.loanAccountNumber = @id${index} THEN ${index}`)
       .join(" ");
 
+      logInfo("Executing PDF query", selectedIds);
     const result = await request.query(`
       SELECT 
         R.firstname AS memberName,
@@ -10995,10 +13215,11 @@ const userInfo = roleResult.recordset[0];
   query += ` AND R.branchName = @userBranch`;
   request.input("userBranch", userInfo.BranchName);
 }
-
-    if (!result.recordset.length) {
-      return res.status(400).json({ message: "No records found for PDF" });
-    }
+ 
+if (!result.recordset.length) {
+  logWarn("No data found for PDF");
+  return res.status(400).json({ message: "No records found for PDF" });
+}
 
     // ================= GROUP DATA =================
 
@@ -11205,10 +13426,11 @@ ${logs}`;
       y += dynamicHeight;
     });
 
+    logSuccess("PDF generated successfully");
     doc.end();
 
   } catch (err) {
-    console.error("❌ ACTIVITY PDF ERROR:", err);
+    logError("ACTIVITY PDF ERROR", err);
     res.status(500).json({ message: "Failed to generate PDF" });
   }
 });
@@ -11217,6 +13439,8 @@ ${logs}`;
 // ACTIVITY STATUS ACTION API (Past / Future / Completed / Reactivate)
 // ==========================================================
 app.post("/api/activity-status/action", async (req, res) => {
+
+  logInfo("ACTION API HIT", req.body);
 
   const {
     actionType,
@@ -11234,12 +13458,14 @@ app.post("/api/activity-status/action", async (req, res) => {
   } = req.body;
 
   if (!actionType) {
+    logWarn("Action type missing");
     return res.status(400).json({ message: "actionType is required" });
   }
 
   try {
 	  
 	const userId = req.headers["x-user-id"];
+  logInfo("User ID received", userId);
 
 if (!userId) {
   return res.status(401).json({ message: "Unauthorized" });
@@ -11371,7 +13597,9 @@ AND ISNULL(CRS.CompleteFlag,0) = 0
 AND ISNULL(CRS.Submitted,0) = 0
       `;
 
+      logInfo("Executing PAST action");
       const result = await request.query(query);
+      
       return res.json(result.recordset);
     }
 
@@ -11379,6 +13607,7 @@ AND ISNULL(CRS.Submitted,0) = 0
     // 2️⃣ FUTURE SCHEDULE
     // ======================================================
     if (actionType === "future") {
+      logInfo("Executing FUTURE action");
 
       const query = `
         SELECT DISTINCT
@@ -11407,6 +13636,8 @@ AND ISNULL(CRS.Submitted,0) = 0
 // 3️⃣ COMPLETED ACTIVITIES (FINAL FIXED)
 // ======================================================
 if (actionType === "completed") {
+
+  logInfo("Executing COMPLETED action");
 
   let query = `
     SELECT DISTINCT
@@ -11573,6 +13804,7 @@ if (actionType === "reactivate") {
   }
 
   for (const loanAccount of selectedIds) {
+    logInfo("Reactivating account", loanAccount);
 
     // ✅ Update CallRecovery_Status (Update Only Existing Timestamp Column)
 await pool.request()
@@ -11643,12 +13875,13 @@ await pool.request()
       `);
   }
 
+logSuccess("Reactivation completed");
   return res.json({ message: "Accounts reactivated successfully" });
 }
     return res.status(400).json({ message: "Invalid actionType" });
 
   } catch (err) {
-    console.error("ACTIVITY STATUS ACTION ERROR:", err);
+    logError("ACTIVITY STATUS ACTION ERROR", err);
     res.status(500).json({ message: "Server error" });
   }
 });
@@ -11861,7 +14094,7 @@ app.put("/api/roles/:id", async (req, res) => {
 });
 
 // ======================
-// GET ROLES - POST
+// ROLES - POST
 // ======================
 app.post("/api/roles/list", async (req, res) => {
   try {
@@ -12316,9 +14549,48 @@ app.delete("/api/product-master/:code", async (req, res) => {
   }
 });
 
+//=============== FRONTEND LOGGING ========================
+app.post("/api/frontend-log", (req, res) => {
+  try {
+    const writeDailyLog = require("./logger");
+
+    const { source, message, data } = req.body;
+
+    if (!source || !message) {
+      return res.status(400).json({ success: false });
+    }
+
+    const logMessage =
+      message + (data ? " " + JSON.stringify(data) : "");
+
+    writeDailyLog(`frontend/${source}`, logMessage);
+
+    res.json({ success: true });
+
+  } catch (err) {
+    console.error("❌ FRONTEND LOG ERROR:", err);
+    res.status(500).json({ success: false });
+  }
+});
+
+//=============== Failure LOGGING ========================
+app.post("/api/log/client-failure", (req, res) => {
+
+  const { type, message, userId, userName, extra } = req.body;
+
+  writeDailyLog(
+    "client_failures",
+    `${type} | userId=${userId} | userName=${userName} | message=${message} | extra=${JSON.stringify(extra || {})}`
+  );
+
+  res.json({ success: true });
+});
 // ======================
 // START SERVER
 // ======================
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Backend running on port ${PORT}`);
+//app.listen(PORT, "0.0.0.0", () => {
+  //console.log(`🚀 Backend running on port ${PORT}`);
+//});
+https.createServer(httpsOptions, app).listen(PORT, () => {
+  console.log(`🚀 HTTPS Server running on port ${PORT}`);
 });

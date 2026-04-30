@@ -14,7 +14,7 @@
     "body-parser": "^2.2.1",
     "cors": "^2.8.5",
     "csv-parser": "^3.2.0",
-    "dotenv": "^17.2.3",
+    "dotenv": "^17.4.1",
     "exceljs": "^4.4.0",
     "express": "^5.2.1",
     "mssql": "^12.2.0",
